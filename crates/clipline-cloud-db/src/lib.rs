@@ -1250,6 +1250,14 @@ mod tests {
         assert_eq!(
             repos
                 .upload_parts
+                .sum_size_for_session(&upload_session.id)
+                .await
+                .expect("sum part sizes"),
+            512
+        );
+        assert_eq!(
+            repos
+                .upload_parts
                 .list_for_session(&upload_session.id)
                 .await
                 .expect("parts")

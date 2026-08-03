@@ -2473,7 +2473,8 @@ impl UploadPartRepository {
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM upload_parts WHERE upload_session_id = ?",
+            "SELECT CAST(COALESCE(SUM(size_bytes), 0) AS BIGINT)
+             FROM upload_parts WHERE upload_session_id = ?",
             [upload_session_id]
         )?
         .map(|row| row.0)
