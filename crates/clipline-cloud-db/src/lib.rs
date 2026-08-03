@@ -1269,6 +1269,65 @@ mod tests {
             .complete(&upload_session.id)
             .await
             .expect("complete upload"));
+        let missing_source_reason = "ready clip source object is missing";
+        repos
+            .clips
+            .update_status(&clip.id, "failed")
+            .await
+            .expect("fail clip for recovery");
+        repos
+            .upload_sessions
+            .fail(&upload_session.id, missing_source_reason)
+            .await
+            .expect("fail upload for recovery");
+        assert_eq!(
+            repos
+                .upload_sessions
+                .list_failed_with_reason(missing_source_reason, 10)
+                .await
+                .expect("list failed uploads by reason")
+                .iter()
+                .filter(|session| session.id == upload_session.id)
+                .count(),
+            1
+        );
+        assert!(!repos
+            .restore_failed_upload_bundle(&upload_session.id, &clip.id, "different reason")
+            .await
+            .expect("reject mismatched recovery reason"));
+        assert_eq!(
+            repos
+                .clips
+                .get(&clip.id)
+                .await
+                .expect("get clip after rolled-back recovery")
+                .expect("failed clip")
+                .status,
+            "failed"
+        );
+        assert!(repos
+            .restore_failed_upload_bundle(&upload_session.id, &clip.id, missing_source_reason)
+            .await
+            .expect("restore upload bundle"));
+        assert_eq!(
+            repos
+                .clips
+                .get(&clip.id)
+                .await
+                .expect("get restored clip")
+                .expect("restored clip")
+                .status,
+            "ready"
+        );
+        let restored_upload = repos
+            .upload_sessions
+            .get(&upload_session.id)
+            .await
+            .expect("get restored upload")
+            .expect("restored upload");
+        assert_eq!(restored_upload.status, "completed");
+        assert_eq!(restored_upload.failure_reason, None);
+        assert_eq!(restored_upload.failed_at, None);
 
         let job = repos
             .jobs

@@ -1,9 +1,13 @@
-use std::{collections::HashSet, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    time::Duration,
+};
 
 use chrono::Duration as ChronoDuration;
 use clipline_cloud_db::{now_utc, Clip, Job, NewJob, Repositories, UploadSession};
 use clipline_cloud_storage::{
-    ByteRange, ObjectKey, PutObjectMetadata, SharedStorageBackend, StorageError,
+    ByteRange, ObjectKey, ObjectSummary, PutObjectMetadata, SharedStorageBackend, StorageError,
 };
 use rand::{rngs::OsRng, Rng};
 use sha2::{Digest, Sha256};
@@ -33,6 +37,7 @@ const CLEANUP_CLIP_BATCH_SIZE: i64 = 100;
 const CLEANUP_CLIP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CLEANUP_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 const MEDIA_OBJECT_PREFIX: &str = "objects/media/";
+const MISSING_SOURCE_FAILURE_REASON: &str = "ready clip source object is missing";
 
 #[derive(Debug, Clone)]
 pub struct JobRunnerConfig {
@@ -930,8 +935,17 @@ impl JobRunner {
 
         let now = now_utc();
         self.cleanup_deleted_clips().await?;
-        self.mark_ready_clips_with_missing_source().await?;
-        self.delete_orphan_media_objects(now).await?;
+        let media_objects = self.storage.list_objects(MEDIA_OBJECT_PREFIX).await?;
+        let object_sizes = media_objects
+            .iter()
+            .map(|object| (object.key.as_str().to_string(), object.size_bytes))
+            .collect::<HashMap<_, _>>();
+        self.restore_clips_with_reappeared_source(&object_sizes)
+            .await?;
+        self.mark_ready_clips_with_missing_source(&object_sizes)
+            .await?;
+        self.delete_orphan_media_objects(now, &media_objects)
+            .await?;
         self.abort_orphan_multipart_uploads(now).await?;
 
         self.enqueue_next_cleanup_sweep_for_kind(CLEANUP_CLIP_KIND, now)
@@ -990,7 +1004,81 @@ impl JobRunner {
         Ok(())
     }
 
-    async fn mark_ready_clips_with_missing_source(&self) -> Result<(), JobRunnerError> {
+    async fn restore_clips_with_reappeared_source(
+        &self,
+        object_sizes: &HashMap<String, u64>,
+    ) -> Result<(), JobRunnerError> {
+        let failed_uploads = self
+            .repositories
+            .upload_sessions
+            .list_failed_with_reason(MISSING_SOURCE_FAILURE_REASON, CLEANUP_CLIP_BATCH_SIZE)
+            .await?;
+        for session in failed_uploads {
+            let Some(inventory_size) = object_sizes.get(&session.storage_key).copied() else {
+                continue;
+            };
+            let Some(clip) = self.repositories.clips.get(&session.clip_id).await? else {
+                continue;
+            };
+            if clip.status != "failed"
+                || clip.storage_key.as_deref() != Some(session.storage_key.as_str())
+            {
+                continue;
+            }
+            let Some(expected_size) = clip
+                .file_size_bytes
+                .and_then(|size| u64::try_from(size).ok())
+            else {
+                continue;
+            };
+            if inventory_size != expected_size {
+                warn!(
+                    event = "jobs.cleanup_clip.restore_size_mismatch",
+                    clip_id = %clip.id,
+                    storage_key = %session.storage_key,
+                    expected_size_bytes = expected_size,
+                    inventory_size_bytes = inventory_size,
+                );
+                continue;
+            }
+
+            let source_key = ObjectKey::parse(&session.storage_key)?;
+            let metadata = match self.storage.head_object(&source_key).await {
+                Ok(metadata) => metadata,
+                Err(StorageError::NotFound(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.size_bytes != expected_size {
+                warn!(
+                    event = "jobs.cleanup_clip.restore_head_size_mismatch",
+                    clip_id = %clip.id,
+                    storage_key = %session.storage_key,
+                    expected_size_bytes = expected_size,
+                    head_size_bytes = metadata.size_bytes,
+                );
+                continue;
+            }
+
+            if self
+                .repositories
+                .restore_failed_upload_bundle(&session.id, &clip.id, MISSING_SOURCE_FAILURE_REASON)
+                .await?
+            {
+                info!(
+                    event = "jobs.cleanup_clip.restored_reappeared_source",
+                    clip_id = %clip.id,
+                    upload_id = %session.id,
+                    storage_key = %session.storage_key,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_ready_clips_with_missing_source(
+        &self,
+        object_sizes: &HashMap<String, u64>,
+    ) -> Result<(), JobRunnerError> {
         let ready_clips = self
             .repositories
             .clips
@@ -998,12 +1086,9 @@ impl JobRunner {
             .await?;
         for clip in ready_clips {
             let source_key = clip_source_key(&clip)?;
-            if !self.storage.object_exists(&source_key).await? {
-                self.mark_clip_failed_with_upload_reason(
-                    &clip.id,
-                    "ready clip source object is missing",
-                )
-                .await?;
+            if source_is_confirmed_missing(&self.storage, &source_key, object_sizes).await? {
+                self.mark_clip_failed_with_upload_reason(&clip.id, MISSING_SOURCE_FAILURE_REASON)
+                    .await?;
             }
         }
         Ok(())
@@ -1037,6 +1122,7 @@ impl JobRunner {
     async fn delete_orphan_media_objects(
         &self,
         now: chrono::DateTime<chrono::Utc>,
+        objects: &[ObjectSummary],
     ) -> Result<(), JobRunnerError> {
         let active_references = self
             .repositories
@@ -1055,7 +1141,6 @@ impl JobRunner {
                 }
             }
         }
-        let objects = self.storage.list_objects(MEDIA_OBJECT_PREFIX).await?;
         for object in objects {
             if active_references.contains(object.key.as_str()) {
                 continue;
@@ -1146,6 +1231,17 @@ async fn delete_if_present(
         Ok(()) | Err(StorageError::NotFound(_)) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn source_is_confirmed_missing(
+    storage: &SharedStorageBackend,
+    key: &ObjectKey,
+    object_sizes: &HashMap<String, u64>,
+) -> Result<bool, StorageError> {
+    if object_sizes.contains_key(key.as_str()) {
+        return Ok(false);
+    }
+    storage.object_exists(key).await.map(|exists| !exists)
 }
 
 async fn run_with_heartbeat<F, T>(
@@ -1931,6 +2027,43 @@ mod tests {
             .await
             .expect("missing upload session");
 
+        let recovered_bytes = bytes::Bytes::from_static(b"reappeared source");
+        let recovered_keys = MediaObjectKeys::generate().expect("recovered keys");
+        storage
+            .put_object(
+                &recovered_keys.source,
+                recovered_bytes.clone(),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .expect("put recovered object");
+        let mut recovered_clip = NewClip::new(&user.id, "reappeared source", "local");
+        recovered_clip.status = "failed".to_string();
+        recovered_clip.file_size_bytes = Some(recovered_bytes.len() as i64);
+        recovered_clip.storage_key = Some(recovered_keys.source.as_str().to_string());
+        let recovered_clip = repositories
+            .clips
+            .create(&recovered_clip)
+            .await
+            .expect("recovered clip");
+        let mut recovered_session = NewUploadSession::new(
+            &recovered_clip.id,
+            &user.id,
+            recovered_bytes.len() as i64,
+            recovered_keys.source.as_str(),
+            now_utc() + chrono::Duration::hours(1),
+        );
+        recovered_session.status = "failed".to_string();
+        recovered_session.received_size_bytes = recovered_bytes.len() as i64;
+        recovered_session.completed_at = Some(now_utc() - chrono::Duration::minutes(5));
+        recovered_session.failed_at = Some(now_utc());
+        recovered_session.failure_reason = Some(MISSING_SOURCE_FAILURE_REASON.to_string());
+        let recovered_session = repositories
+            .upload_sessions
+            .create(&recovered_session)
+            .await
+            .expect("recovered upload session");
+
         let orphan_keys = MediaObjectKeys::generate().expect("orphan keys");
         let orphan_upload_id = storage
             .create_multipart_upload(&orphan_keys.source)
@@ -2006,8 +2139,25 @@ mod tests {
         assert_eq!(missing_session.status, "failed");
         assert_eq!(
             missing_session.failure_reason.as_deref(),
-            Some("ready clip source object is missing")
+            Some(MISSING_SOURCE_FAILURE_REASON)
         );
+
+        let recovered_clip = repositories
+            .clips
+            .get(&recovered_clip.id)
+            .await
+            .expect("get recovered clip")
+            .expect("recovered clip still exists");
+        assert_eq!(recovered_clip.status, "ready");
+        let recovered_session = repositories
+            .upload_sessions
+            .get(&recovered_session.id)
+            .await
+            .expect("get recovered upload session")
+            .expect("recovered upload session");
+        assert_eq!(recovered_session.status, "completed");
+        assert_eq!(recovered_session.failure_reason, None);
+        assert_eq!(recovered_session.failed_at, None);
 
         let uploads = storage
             .list_multipart_uploads(MEDIA_OBJECT_PREFIX)
@@ -2024,6 +2174,20 @@ mod tests {
             .expect("get job")
             .expect("job exists");
         assert_eq!(job.status, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn listed_source_is_not_missing_when_head_lookup_would_miss() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage: SharedStorageBackend =
+            Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
+        let key = MediaObjectKeys::generate().expect("keys").source;
+        let object_sizes = HashMap::from([(key.as_str().to_string(), 42)]);
+
+        assert!(!storage.object_exists(&key).await.expect("head is missing"));
+        assert!(!source_is_confirmed_missing(&storage, &key, &object_sizes)
+            .await
+            .expect("inventory confirms object"));
     }
 
     #[test]
