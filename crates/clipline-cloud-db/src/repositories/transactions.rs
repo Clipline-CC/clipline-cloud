@@ -607,6 +607,81 @@ impl Repositories {
         }
     }
 
+    pub async fn restore_failed_upload_bundle(
+        &self,
+        session_id: &str,
+        clip_id: &str,
+        failure_reason: &str,
+    ) -> DbResult<bool> {
+        let now = now_utc();
+        match &self.upload_sessions.database {
+            Database::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let clip_rows = sqlx::query(
+                    "UPDATE clips
+                     SET status = 'ready', updated_at = ?
+                     WHERE id = ? AND status = 'failed' AND deleted_at IS NULL",
+                )
+                .bind(now)
+                .bind(clip_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                let upload_rows = sqlx::query(
+                    "UPDATE upload_sessions
+                     SET status = 'completed', failure_reason = NULL, failed_at = NULL, updated_at = ?
+                     WHERE id = ? AND clip_id = ? AND status = 'failed' AND failure_reason = ?",
+                )
+                .bind(now)
+                .bind(session_id)
+                .bind(clip_id)
+                .bind(failure_reason)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                if clip_rows == 1 && upload_rows == 1 {
+                    transaction.commit().await?;
+                    Ok(true)
+                } else {
+                    transaction.rollback().await?;
+                    Ok(false)
+                }
+            }
+            Database::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let clip_rows = sqlx::query(
+                    "UPDATE clips
+                     SET status = 'ready', updated_at = $1
+                     WHERE id = $2 AND status = 'failed' AND deleted_at IS NULL",
+                )
+                .bind(now)
+                .bind(clip_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                let upload_rows = sqlx::query(
+                    "UPDATE upload_sessions
+                     SET status = 'completed', failure_reason = NULL, failed_at = NULL, updated_at = $1
+                     WHERE id = $2 AND clip_id = $3 AND status = 'failed' AND failure_reason = $4",
+                )
+                .bind(now)
+                .bind(session_id)
+                .bind(clip_id)
+                .bind(failure_reason)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                if clip_rows == 1 && upload_rows == 1 {
+                    transaction.commit().await?;
+                    Ok(true)
+                } else {
+                    transaction.rollback().await?;
+                    Ok(false)
+                }
+            }
+        }
+    }
+
     pub async fn delete_upload_bundle(&self, session_id: &str, clip_id: &str) -> DbResult<()> {
         match &self.upload_sessions.database {
             Database::Sqlite(pool) => {
