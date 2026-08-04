@@ -80,7 +80,7 @@ export function AdminPage({ route }) {
       : tab === "categories"
       ? html`<${AdminCategories} data=${data.categories} reload=${reload} categoryId=${route.categoryId} />`
       : tab === "jobs"
-      ? html`<${AdminJobs} failedUploads=${data.failedUploads} deadJobs=${data.deadJobs} recentErrors=${data.recentErrors} />`
+      ? html`<${AdminJobs} failedUploads=${data.failedUploads} deadJobs=${data.deadJobs} recentErrors=${data.recentErrors} reload=${reload} />`
       : html`<${AdminOverview} overview=${data.overview} deadJobs=${data.deadJobs} failedUploads=${data.failedUploads} />`}
   </main>`;
 }

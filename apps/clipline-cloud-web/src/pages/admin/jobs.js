@@ -1,5 +1,10 @@
 import { html } from "../../lib/html.js";
+import { useState } from "preact/hooks";
 import { formatBytes, formatDate } from "../../lib/format.js";
+import { api, ApiError } from "../../lib/api.js";
+import { toast } from "../../lib/store.js";
+import { icon } from "../../lib/icons.js";
+import { ConfirmDialog } from "../../components/ConfirmDialog.js";
 
 // Job progress is represented as basis points by the API.
 function formatProgress(basisPoints) {
@@ -41,11 +46,12 @@ function JobItem({ job }) {
   </div>`;
 }
 
-function JobPanel({ title, items, renderItem, emptyLabel }) {
+export function JobPanel({ title, items, renderItem, emptyLabel, action }) {
   return html`<div class="panel">
     <div class="section-header">
       <h2>${title}</h2>
       <span class="muted">${items.length}</span>
+      ${action}
     </div>
     ${items.length
       ? html`<div class="job-list">${items.map(renderItem)}</div>`
@@ -53,15 +59,51 @@ function JobPanel({ title, items, renderItem, emptyLabel }) {
   </div>`;
 }
 
-export function AdminJobs({ failedUploads, deadJobs, recentErrors }) {
-  // Jobs are read-only here because the server exposes diagnostics, not a
-  // retry mutation endpoint.
+export function AdminJobs({ failedUploads, deadJobs, recentErrors, reload }) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const clearErrors = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await api("/api/v1/admin/jobs/recent-errors", { method: "DELETE" });
+      const parts = [];
+      if (result.terminal_jobs_deleted > 0) {
+        parts.push(`${result.terminal_jobs_deleted} terminal job${result.terminal_jobs_deleted === 1 ? "" : "s"} removed`);
+      }
+      if (result.errors_cleared > 0) {
+        parts.push(`${result.errors_cleared} error${result.errors_cleared === 1 ? "" : "s"} cleared`);
+      }
+      toast(parts.length ? `${parts.join(", ")}.` : "No job errors to clear.");
+      reload();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : "Couldn't clear job errors.");
+    } finally {
+      setBusy(false);
+      setConfirmOpen(false);
+    }
+  };
+
+  const clearAction = (items) =>
+    items.length
+      ? html`<button class="btn btn-danger" type="button" disabled=${busy}
+          onClick=${() => setConfirmOpen(true)}>${icon("trash", { size: 14 })} Clear errors</button>`
+      : null;
+
+  // Jobs are otherwise read-only here because the server exposes diagnostics,
+  // not a retry mutation endpoint.
   return html`<div class="section">
     <${JobPanel} title="Failed uploads" items=${failedUploads} emptyLabel="No failed uploads."
       renderItem=${(upload) => html`<${UploadItem} key=${upload.id} upload=${upload} />`} />
     <${JobPanel} title="Dead jobs" items=${deadJobs} emptyLabel="No dead jobs."
+      action=${clearAction(deadJobs)}
       renderItem=${(job) => html`<${JobItem} key=${job.id} job=${job} />`} />
     <${JobPanel} title="Recent job errors" items=${recentErrors} emptyLabel="No recent job errors."
+      action=${clearAction(recentErrors)}
       renderItem=${(job) => html`<${JobItem} key=${job.id} job=${job} />`} />
+    <${ConfirmDialog} open=${confirmOpen} title="Clear job errors?"
+      body="Dead jobs are removed and error messages are cleared from the diagnostics lists. Clips and jobs that are still retrying are not affected; new failures will reappear."
+      confirmLabel="Clear errors" danger confirmDisabled=${busy} onCancel=${() => setConfirmOpen(false)} onConfirm=${clearErrors} />
   </div>`;
 }
