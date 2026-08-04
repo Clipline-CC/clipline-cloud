@@ -61,7 +61,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/v1/admin/uploads/failed", get(failed_uploads))
         .route("/api/v1/admin/jobs/dead", get(dead_jobs))
-        .route("/api/v1/admin/jobs/recent-errors", get(recent_job_errors))
+        .route(
+            "/api/v1/admin/jobs/recent-errors",
+            get(recent_job_errors).delete(clear_job_errors),
+        )
         .route("/api/v1/admin/audit/recent", get(recent_audit_log))
 }
 
@@ -966,6 +969,29 @@ async fn recent_job_errors(
         .map(JobResponse::from)
         .collect();
     Ok(Json(jobs))
+}
+
+#[derive(Debug, Serialize)]
+struct ClearJobErrorsResponse {
+    terminal_jobs_deleted: u64,
+    errors_cleared: u64,
+}
+
+async fn clear_job_errors(
+    State(state): State<AppState>,
+    Extension(client_ip): Extension<ClientIp>,
+    headers: HeaderMap,
+) -> Result<Json<ClearJobErrorsResponse>, ApiError> {
+    let auth = auth::require_admin(&state, &headers).await?;
+    auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    let (terminal_jobs_deleted, errors_cleared) = state
+        .repositories
+        .clear_job_errors_with_audit(Some(&auth.user.id), Some(client_ip.as_str()))
+        .await?;
+    Ok(Json(ClearJobErrorsResponse {
+        terminal_jobs_deleted,
+        errors_cleared,
+    }))
 }
 
 async fn recent_audit_log(

@@ -580,6 +580,202 @@ mod tests {
         );
     }
 
+    async fn assert_clear_job_errors_removes_terminal_jobs_and_clears_stale_errors(
+        database: &Database,
+    ) {
+        let repositories = Repositories::new(database.clone());
+        let cutoff = now_utc();
+        let old = cutoff - ChronoDuration::minutes(5);
+        let fresh = cutoff + ChronoDuration::minutes(5);
+        let actor = repositories
+            .users
+            .create(&NewUser::new(
+                format!("clear-actor-{}", new_ulid()),
+                "hash",
+                "user",
+            ))
+            .await
+            .expect("create actor");
+
+        let mut dead = NewJob::new("validate_object", cutoff);
+        dead.status = "dead".to_string();
+        dead.last_error = Some("permanent failure".to_string());
+        dead.updated_at = old;
+        let dead = repositories
+            .jobs
+            .create(&dead)
+            .await
+            .expect("create dead job");
+
+        let mut failed = NewJob::new("cleanup_clip", cutoff);
+        failed.status = "failed".to_string();
+        failed.last_error = Some("deduplicated while enforcing active job uniqueness".to_string());
+        failed.updated_at = old;
+        let failed = repositories
+            .jobs
+            .create(&failed)
+            .await
+            .expect("create failed job");
+
+        let mut retrying = NewJob::new("cleanup_session", cutoff);
+        retrying.last_error = Some("transient failure".to_string());
+        retrying.updated_at = old;
+        let retrying = repositories
+            .jobs
+            .create(&retrying)
+            .await
+            .expect("create retrying job");
+
+        let mut running = NewJob::new("thumbnail_sweep", cutoff);
+        running.status = "running".to_string();
+        running.locked_by = Some("worker-1".to_string());
+        running.locked_at = Some(old);
+        running.last_error = Some("stale attempt failure".to_string());
+        running.updated_at = old;
+        let running = repositories
+            .jobs
+            .create(&running)
+            .await
+            .expect("create running job");
+
+        let mut fresh_error = NewJob::new("probe_media", cutoff);
+        fresh_error.last_error = Some("recorded during clear".to_string());
+        fresh_error.updated_at = fresh;
+        let fresh_error = repositories
+            .jobs
+            .create(&fresh_error)
+            .await
+            .expect("create fresh error job");
+
+        let mut succeeded = NewJob::new("cleanup_session", cutoff);
+        succeeded.status = "succeeded".to_string();
+        succeeded.updated_at = old;
+        let succeeded = repositories
+            .jobs
+            .create(&succeeded)
+            .await
+            .expect("create succeeded job");
+
+        let (deleted, cleared) = repositories
+            .clear_job_errors_with_audit(Some(&actor.id), Some("127.0.0.1"))
+            .await
+            .expect("clear job errors");
+        assert_eq!(deleted, 2, "dead and failed jobs are deleted");
+        assert_eq!(cleared, 2, "only stale pending/running errors are cleared");
+
+        assert!(
+            repositories
+                .jobs
+                .get(&dead.id)
+                .await
+                .expect("load dead job")
+                .is_none(),
+            "dead job is deleted"
+        );
+        assert!(
+            repositories
+                .jobs
+                .get(&failed.id)
+                .await
+                .expect("load failed job")
+                .is_none(),
+            "terminal failed job is deleted"
+        );
+        let retrying = repositories
+            .jobs
+            .get(&retrying.id)
+            .await
+            .expect("load retrying job")
+            .expect("retrying job still exists");
+        assert_eq!(retrying.last_error, None, "stale retrying error is cleared");
+        let running = repositories
+            .jobs
+            .get(&running.id)
+            .await
+            .expect("load running job")
+            .expect("running job still exists");
+        assert_eq!(running.last_error, None, "stale running error is cleared");
+        let fresh_error = repositories
+            .jobs
+            .get(&fresh_error.id)
+            .await
+            .expect("load fresh error job")
+            .expect("fresh error job still exists");
+        assert_eq!(
+            fresh_error.last_error.as_deref(),
+            Some("recorded during clear"),
+            "errors recorded during the clear survive"
+        );
+        let succeeded = repositories
+            .jobs
+            .get(&succeeded.id)
+            .await
+            .expect("load succeeded job")
+            .expect("succeeded job still exists");
+        assert_eq!(succeeded.last_error, None);
+
+        let audit = repositories
+            .audit_log
+            .list_recent(5)
+            .await
+            .expect("list audit entries");
+        assert!(
+            audit.iter().any(|entry| {
+                entry.action == "jobs.errors_cleared"
+                    && entry.metadata_json.as_ref().is_some_and(|metadata| {
+                        metadata.0.get("terminal_jobs_deleted") == Some(&serde_json::json!(2))
+                            && metadata.0.get("errors_cleared") == Some(&serde_json::json!(2))
+                    })
+            }),
+            "audit entry records the committed counts"
+        );
+    }
+
+    async fn assert_clear_job_errors_rolls_back_when_audit_fails(database: &Database) {
+        let repositories = Repositories::new(database.clone());
+        let old = now_utc() - ChronoDuration::minutes(5);
+
+        let mut dead = NewJob::new("validate_object", now_utc());
+        dead.status = "dead".to_string();
+        dead.last_error = Some("permanent failure".to_string());
+        dead.updated_at = old;
+        let dead = repositories
+            .jobs
+            .create(&dead)
+            .await
+            .expect("create dead job");
+
+        let mut retrying = NewJob::new("cleanup_session", now_utc());
+        retrying.last_error = Some("transient failure".to_string());
+        retrying.updated_at = old;
+        let retrying = repositories
+            .jobs
+            .create(&retrying)
+            .await
+            .expect("create retrying job");
+
+        let error = repositories
+            .clear_job_errors_with_audit(Some("missing-actor"), Some("127.0.0.1"))
+            .await
+            .expect_err("invalid audit actor should fail the whole clear");
+        assert!(matches!(error, DbError::Sqlx(sqlx::Error::Database(_))));
+
+        let dead = repositories
+            .jobs
+            .get(&dead.id)
+            .await
+            .expect("load dead job")
+            .expect("dead job survives the rollback");
+        assert_eq!(dead.last_error.as_deref(), Some("permanent failure"));
+        let retrying = repositories
+            .jobs
+            .get(&retrying.id)
+            .await
+            .expect("load retrying job")
+            .expect("retrying job survives the rollback");
+        assert_eq!(retrying.last_error.as_deref(), Some("transient failure"));
+    }
+
     async fn assert_game_category_lifecycle(database: Database) {
         let raw_database = database.clone();
         let repos = Repositories::new(database);
@@ -842,6 +1038,7 @@ mod tests {
                     .is_err()
             }
         };
+
         assert!(immutable_update_rejected);
         assert_eq!(
             repos
@@ -854,6 +1051,34 @@ mod tests {
                 .as_deref(),
             Some("GTA5_Enhanced")
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_clear_job_errors_removes_terminal_jobs_and_clears_stale_errors() {
+        let (_temp_dir, database) = sqlite_test_database().await;
+        assert_clear_job_errors_removes_terminal_jobs_and_clears_stale_errors(&database).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_clear_job_errors_rolls_back_when_audit_fails() {
+        let (_temp_dir, database) = sqlite_test_database().await;
+        assert_clear_job_errors_rolls_back_when_audit_fails(&database).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_clear_job_errors_removes_terminal_jobs_and_clears_stale_errors() {
+        let Some(database) = postgres_test_database().await else {
+            return;
+        };
+        assert_clear_job_errors_removes_terminal_jobs_and_clears_stale_errors(&database).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_clear_job_errors_rolls_back_when_audit_fails() {
+        let Some(database) = postgres_test_database().await else {
+            return;
+        };
+        assert_clear_job_errors_rolls_back_when_audit_fails(&database).await;
     }
 
     #[tokio::test]

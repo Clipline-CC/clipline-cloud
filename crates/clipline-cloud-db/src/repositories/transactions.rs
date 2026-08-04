@@ -116,6 +116,70 @@ impl Repositories {
         Ok(true)
     }
 
+    /// Deletes terminal jobs (`dead`/`failed`) and clears `last_error` on jobs
+    /// that are still pending or running, atomically with the audit entry.
+    /// Only errors recorded before the request cutoff are cleared, so a
+    /// failure a worker records while the clear is running survives. Returns
+    /// (terminal jobs deleted, error messages cleared).
+    pub async fn clear_job_errors_with_audit(
+        &self,
+        actor_user_id: Option<&str>,
+        ip_address: Option<&str>,
+    ) -> DbResult<(u64, u64)> {
+        match &self.jobs.database {
+            Database::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let cutoff = now_utc();
+                let deleted = sqlx::query("DELETE FROM jobs WHERE status IN ('dead', 'failed')")
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                let cleared = sqlx::query(
+                    "UPDATE jobs
+                     SET last_error = NULL, updated_at = ?
+                     WHERE last_error IS NOT NULL
+                       AND status IN ('pending', 'running')
+                       AND updated_at < ?",
+                )
+                .bind(cutoff)
+                .bind(cutoff)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                let entry =
+                    clear_job_errors_audit_entry(actor_user_id, ip_address, deleted, cleared);
+                insert_audit_sqlite(&mut transaction, &entry).await?;
+                transaction.commit().await?;
+                Ok((deleted, cleared))
+            }
+            Database::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                let cutoff = now_utc();
+                let deleted = sqlx::query("DELETE FROM jobs WHERE status IN ('dead', 'failed')")
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                let cleared = sqlx::query(&crate::postgres_placeholders(
+                    "UPDATE jobs
+                     SET last_error = NULL, updated_at = ?
+                     WHERE last_error IS NOT NULL
+                       AND status IN ('pending', 'running')
+                       AND updated_at < ?",
+                ))
+                .bind(cutoff)
+                .bind(cutoff)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                let entry =
+                    clear_job_errors_audit_entry(actor_user_id, ip_address, deleted, cleared);
+                insert_audit_postgres(&mut transaction, &entry).await?;
+                transaction.commit().await?;
+                Ok((deleted, cleared))
+            }
+        }
+    }
+
     pub async fn merge_game_categories(
         &self,
         source_id: &str,
@@ -1621,6 +1685,23 @@ fn bulk_audit_entry(
     entry.target_id = Some(target_id.to_string());
     entry.ip_address = ip_address.map(ToOwned::to_owned);
     entry.metadata_json = Some(metadata);
+    entry
+}
+
+fn clear_job_errors_audit_entry(
+    actor_user_id: Option<&str>,
+    ip_address: Option<&str>,
+    deleted: u64,
+    cleared: u64,
+) -> NewAuditLogEntry {
+    let mut entry = NewAuditLogEntry::new("jobs.errors_cleared");
+    entry.actor_user_id = actor_user_id.map(ToOwned::to_owned);
+    entry.target_type = Some("jobs".to_string());
+    entry.ip_address = ip_address.map(ToOwned::to_owned);
+    entry.metadata_json = Some(Json(json!({
+        "terminal_jobs_deleted": deleted,
+        "errors_cleared": cleared,
+    })));
     entry
 }
 
