@@ -432,13 +432,13 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/me/change-password", post(change_password))
 }
 
-async fn discovery(State(state): State<AppState>) -> Json<DiscoveryResponse> {
+async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> Json<DiscoveryResponse> {
     Json(DiscoveryResponse {
         name: "Clipline Cloud".to_string(),
         api_version: "v1".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         min_client_version: "0.1.0".to_string(),
-        public_url: state.config.public_url.to_string(),
+        public_url: crate::request_public_url(&state.config, &headers).to_string(),
         features: DiscoveryFeatures {
             single_put_upload: true,
             chunked_upload: true,
@@ -868,7 +868,13 @@ async fn create_invite_link(
         None
     };
 
-    let link = create_invite_setup_link(&state, &role, &auth.user.id).await?;
+    let link = create_invite_setup_link(
+        &state,
+        &role,
+        &auth.user.id,
+        &crate::request_public_url(&state.config, &headers),
+    )
+    .await?;
     if let (Some(config), Some(email)) = (smtp_config.as_ref(), email.as_ref()) {
         if let Err(error) = mail::send_invite(
             config,
@@ -1512,9 +1518,12 @@ async fn reset_password(
     )
     .await?;
 
-    let reset_url = mail::reset_url(&state.config.public_url, &raw_token)
-        .map_err(|_| ApiError::internal("failed to build reset URL"))?
-        .to_string();
+    let reset_url = mail::reset_url(
+        &crate::request_public_url(&state.config, &headers),
+        &raw_token,
+    )
+    .map_err(|_| ApiError::internal("failed to build reset URL"))?
+    .to_string();
     Ok(Json(ResetPasswordResponse {
         reset_token: raw_token,
         reset_url,
@@ -1526,6 +1535,7 @@ async fn create_invite_setup_link(
     state: &AppState,
     role: &str,
     created_by_user_id: &str,
+    public_url: &url::Url,
 ) -> Result<CreatedSetupLink, ApiError> {
     let raw_token = generate_prefixed_token("clp_inv_");
     let expires_at = now_utc() + ChronoDuration::hours(RESET_TOKEN_TTL_HOURS);
@@ -1539,7 +1549,7 @@ async fn create_invite_setup_link(
     Ok(CreatedSetupLink {
         token_id: invitation.id,
         response: PasswordSetupLinkResponse {
-            reset_url: mail::invite_url(&state.config.public_url, &raw_token)
+            reset_url: mail::invite_url(public_url, &raw_token)
                 .map_err(|_| ApiError::internal("failed to build invite URL"))?
                 .to_string(),
             reset_token: raw_token,
@@ -1931,7 +1941,7 @@ pub(crate) fn require_csrf_for_cookie(
         return Ok(());
     };
 
-    validate_origin(headers, &state.config.public_url)?;
+    validate_origin(headers, &state.config)?;
 
     let Some(token) = header_to_string(headers, CSRF_HEADER) else {
         return Err(ApiError::forbidden("CSRF token is required"));
@@ -2012,24 +2022,19 @@ pub(crate) async fn audit_with_ip(
     Ok(())
 }
 
-fn validate_origin(headers: &HeaderMap, public_url: &url::Url) -> Result<(), ApiError> {
-    let expected = origin(public_url);
+fn validate_origin(headers: &HeaderMap, config: &Config) -> Result<(), ApiError> {
     let actual = header_to_string(headers, header::ORIGIN.as_str()).or_else(|| {
-        header_to_string(headers, header::REFERER.as_str())
-            .and_then(|value| url::Url::parse(&value).ok().map(|parsed| origin(&parsed)))
+        header_to_string(headers, header::REFERER.as_str()).and_then(|value| {
+            url::Url::parse(&value)
+                .ok()
+                .map(|parsed| crate::config::public_origin(&parsed))
+        })
     });
 
+    let request_origin = crate::config::public_origin(&crate::request_public_url(config, headers));
     match actual {
-        Some(actual) if actual == expected => Ok(()),
+        Some(actual) if config.allows_origin(&actual) || actual == request_origin => Ok(()),
         _ => Err(ApiError::forbidden("request origin is not allowed")),
-    }
-}
-
-fn origin(url: &url::Url) -> String {
-    let host = url.host_str().unwrap_or_default();
-    match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-        None => format!("{}://{}", url.scheme(), host),
     }
 }
 
@@ -2571,6 +2576,68 @@ mod tests {
         assert!(!insecure_cookie.contains("Secure"));
         assert!(clear_session_cookie(true).contains("Secure"));
         assert!(!clear_session_cookie(false).contains("Secure"));
+    }
+
+    #[test]
+    fn csrf_origin_allows_canonical_and_additional_public_urls() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut config = Config::for_tests("sqlite://:memory:", temp_dir.path());
+        config.public_url = url::Url::parse("https://clips.petrichor.one").expect("canonical");
+        config.additional_public_urls =
+            vec![url::Url::parse("https://watch.clipline.cc").expect("additional")];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://watch.clipline.cc"),
+        );
+        validate_origin(&headers, &config).expect("additional origin");
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://clips.petrichor.one"),
+        );
+        validate_origin(&headers, &config).expect("canonical origin");
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        let error = validate_origin(&headers, &config).expect_err("unknown origin");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn csrf_origin_accepts_referer_when_origin_is_absent() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut config = Config::for_tests("sqlite://:memory:", temp_dir.path());
+        config.public_url = url::Url::parse("https://watch.clipline.cc").expect("canonical");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::REFERER,
+            HeaderValue::from_static("https://watch.clipline.cc/library"),
+        );
+        validate_origin(&headers, &config).expect("referer origin");
+    }
+
+    #[test]
+    fn csrf_origin_allows_same_origin_request_host() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let mut config = Config::for_tests("sqlite://:memory:", temp_dir.path());
+        config.public_url = url::Url::parse("https://clips.petrichor.one").expect("canonical");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("watch.clipline.cc"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://watch.clipline.cc"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        validate_origin(&headers, &config).expect("request host origin");
     }
 
     #[test]
@@ -3166,9 +3233,10 @@ mod tests {
     async fn invitation_token_creates_user_with_claimed_profile() {
         let app = test_app().await;
         let admin = insert_user_with_role(&app.state, "invite-admin", "admin").await;
-        let link = create_invite_setup_link(&app.state, "user", &admin.id)
-            .await
-            .expect("invite link");
+        let link =
+            create_invite_setup_link(&app.state, "user", &admin.id, &app.state.config.public_url)
+                .await
+                .expect("invite link");
         let invite_token = link.response.reset_token.clone();
         let claimed = claim_invite_link(
             State(app.state.clone()),
@@ -3257,9 +3325,10 @@ mod tests {
             .create(&NewUser::new(&taken_username, "argon2id-hash", "user"))
             .await
             .expect("seed taken username");
-        let link = create_invite_setup_link(&app.state, "user", &admin.id)
-            .await
-            .expect("invite link");
+        let link =
+            create_invite_setup_link(&app.state, "user", &admin.id, &app.state.config.public_url)
+                .await
+                .expect("invite link");
         let invite_token = link.response.reset_token.clone();
         let reset_token = claim_invite_link(
             State(app.state.clone()),
@@ -3342,9 +3411,10 @@ mod tests {
     async fn invitation_can_be_redeemed_directly_without_preflight_claim() {
         let app = test_app().await;
         let admin = insert_user_with_role(&app.state, "direct-invite-admin", "admin").await;
-        let link = create_invite_setup_link(&app.state, "user", &admin.id)
-            .await
-            .expect("invite link");
+        let link =
+            create_invite_setup_link(&app.state, "user", &admin.id, &app.state.config.public_url)
+                .await
+                .expect("invite link");
 
         let _ = redeem_reset_password(
             State(app.state.clone()),
@@ -3384,9 +3454,10 @@ mod tests {
     async fn concurrent_invitation_redemption_creates_exactly_one_user() {
         let app = test_app().await;
         let admin = insert_user_with_role(&app.state, "invite-race-admin", "admin").await;
-        let link = create_invite_setup_link(&app.state, "user", &admin.id)
-            .await
-            .expect("invite link");
+        let link =
+            create_invite_setup_link(&app.state, "user", &admin.id, &app.state.config.public_url)
+                .await
+                .expect("invite link");
         let initial_user_count = app
             .state
             .repositories
@@ -3530,7 +3601,8 @@ mod tests {
         );
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_str(&origin(&state.config.public_url)).expect("origin"),
+            HeaderValue::from_str(&crate::config::public_origin(&state.config.public_url))
+                .expect("origin"),
         );
         (headers, session)
     }

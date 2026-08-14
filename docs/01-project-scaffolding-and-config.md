@@ -52,7 +52,8 @@ goes here so it is type-checked on both ends.
 ### Configuration surface (§23)
 
 ```
-CLIPLINE_PUBLIC_URL                 # required for share links; warns if not HTTPS
+CLIPLINE_PUBLIC_URL                 # required fallback origin; warns if not HTTPS
+CLIPLINE_ADDITIONAL_PUBLIC_URLS     # optional extra CSRF origins when Origin ≠ request Host
 CLIPLINE_BIND_ADDR
 CLIPLINE_PROCESS_ROLE               # all (default) | web | worker
 CLIPLINE_DATABASE_URL[_FILE]        # sqlite:///data/clipline.db (default) | postgres://...
@@ -97,7 +98,14 @@ CLIPLINE_LOG_LEVEL
 
 **Validation rules (fail loudly at startup):**
 
-- `CLIPLINE_PUBLIC_URL` is required (needed for share links).
+- `CLIPLINE_PUBLIC_URL` is required. It is the fallback origin when a request has no usable `Host`
+  header (and cookie `Secure` still follows this URL's scheme). Generated share links, discovery,
+  invite/reset URLs, and public media URLs otherwise use the request `Host` (plus `X-Forwarded-Proto`
+  or a matching `Origin` for the scheme).
+- `CLIPLINE_ADDITIONAL_PUBLIC_URLS` is optional. Comma-separated extra origins allowed for browser
+  CSRF `Origin`/`Referer` checks when they do not match the request `Host`. Same-origin login on a
+  second hostname does not require this list. Each URL is validated the same way as
+  `CLIPLINE_PUBLIC_URL`. Duplicates of the canonical origin are ignored.
 - `CLIPLINE_PROCESS_ROLE` must be `all`, `web`, or `worker`; `all` preserves the default combined
   HTTP + job-runner process.
 - `local` backend requires `CLIPLINE_DATA_DIR`.
@@ -108,8 +116,8 @@ CLIPLINE_LOG_LEVEL
 - `CLIPLINE_PUBLIC_MEDIA_MODE` must be `presigned` or `proxy`; public read URL TTL must be positive.
 - `_FILE` variants (Docker secrets) are supported for every secret and **preferred** over inline
   values — read the file contents at startup.
-- If `CLIPLINE_PUBLIC_URL` is not HTTPS, **emit a clear startup warning** (§21). The app still works
-  over HTTP for LAN testing, but it must warn.
+- If `CLIPLINE_PUBLIC_URL` or an additional public URL is not HTTPS, **emit a clear startup warning**
+  (§21). The app still works over HTTP for LAN testing, but it must warn.
 
 ### Health endpoints (§28)
 

@@ -45,6 +45,7 @@ const S3_MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 pub struct Config {
     pub process_role: ProcessRole,
     pub public_url: Url,
+    pub additional_public_urls: Vec<Url>,
     pub bind_addr: SocketAddr,
     pub database_url: String,
     pub bootstrap_admin_username: Option<String>,
@@ -209,6 +210,52 @@ impl Config {
         }
     }
 
+    pub fn allowed_public_urls(&self) -> impl Iterator<Item = &Url> {
+        std::iter::once(&self.public_url).chain(self.additional_public_urls.iter())
+    }
+
+    pub fn allows_origin(&self, origin: &str) -> bool {
+        self.allowed_public_urls()
+            .any(|url| public_origin(url) == origin)
+    }
+
+    /// Build the public base URL for this request.
+    ///
+    /// A safe `Host` value wins so generated share/discovery/invite URLs match the hostname the
+    /// client used. `CLIPLINE_PUBLIC_URL` is the fallback when `Host` is missing or invalid.
+    /// `X-Forwarded-Host` is ignored; scheme comes from a matching `Origin`, then
+    /// `X-Forwarded-Proto`, then the configured public URL.
+    pub fn public_url_for_parts(
+        &self,
+        origin: Option<&str>,
+        host: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> Url {
+        let origin = origin.and_then(parse_origin_header);
+        let host = host.and_then(parse_request_host);
+        if let Some(host) = host.as_deref() {
+            let scheme = origin
+                .as_deref()
+                .and_then(|origin| {
+                    origin_matches_host(origin, host).then_some(origin_scheme(origin))
+                })
+                .flatten()
+                .or_else(|| parse_forwarded_proto(forwarded_proto))
+                .unwrap_or_else(|| self.public_url.scheme());
+            if let Some(url) = url_from_scheme_and_host(scheme, host, self.public_url.path()) {
+                return url;
+            }
+        }
+        if let Some(origin) = origin.as_deref() {
+            if self.allows_origin(origin) {
+                if let Some(url) = url_from_origin(origin, self.public_url.path()) {
+                    return url;
+                }
+            }
+        }
+        self.public_url.clone()
+    }
+
     fn from_source(source: &impl EnvSource) -> Result<Self, ConfigError> {
         let process_role = parse_process_role(
             optional(source, "CLIPLINE_PROCESS_ROLE")
@@ -219,6 +266,11 @@ impl Config {
             "CLIPLINE_ALLOW_INSECURE_PUBLIC_URL",
             optional(source, "CLIPLINE_ALLOW_INSECURE_PUBLIC_URL"),
             false,
+        )?;
+        let additional_public_urls = parse_additional_public_urls(
+            optional(source, "CLIPLINE_ADDITIONAL_PUBLIC_URLS"),
+            &public_url,
+            allow_insecure_public_url,
         )?;
         let bind_addr = bind_addr_from_source(source)?;
         let explicit_database_url = secret(source, "CLIPLINE_DATABASE_URL")?;
@@ -360,16 +412,20 @@ impl Config {
         let static_dir = default_static_dir();
         let mut startup_warnings = Vec::new();
 
-        validate_public_url_security(&public_url, allow_insecure_public_url)?;
-        if public_url.scheme() != "https" {
-            startup_warnings.push(StartupWarning::NonHttpsPublicUrl {
-                url: public_url.as_str().to_string(),
-            });
+        validate_public_url_security(
+            "CLIPLINE_PUBLIC_URL",
+            &public_url,
+            allow_insecure_public_url,
+        )?;
+        push_non_https_public_url_warning(&mut startup_warnings, &public_url);
+        for url in &additional_public_urls {
+            push_non_https_public_url_warning(&mut startup_warnings, url);
         }
 
         Ok(Self {
             process_role,
             public_url,
+            additional_public_urls,
             bind_addr,
             database_url,
             bootstrap_admin_username,
@@ -449,7 +505,43 @@ fn required_url(source: &impl EnvSource, name: &'static str) -> Result<Url, Conf
     Url::parse(&value).map_err(|_| ConfigError::InvalidUrl { name, value })
 }
 
+fn parse_additional_public_urls(
+    value: Option<String>,
+    canonical: &Url,
+    allow_insecure_public_url: bool,
+) -> Result<Vec<Url>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    let mut urls = Vec::new();
+    let mut seen = vec![public_origin(canonical)];
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let url = Url::parse(part).map_err(|_| ConfigError::InvalidUrl {
+            name: "CLIPLINE_ADDITIONAL_PUBLIC_URLS",
+            value: part.to_string(),
+        })?;
+        validate_public_url_security(
+            "CLIPLINE_ADDITIONAL_PUBLIC_URLS",
+            &url,
+            allow_insecure_public_url,
+        )?;
+        let origin = public_origin(&url);
+        if seen.iter().any(|existing| existing == &origin) {
+            continue;
+        }
+        seen.push(origin);
+        urls.push(url);
+    }
+    Ok(urls)
+}
+
 fn validate_public_url_security(
+    name: &'static str,
     public_url: &Url,
     allow_insecure_public_url: bool,
 ) -> Result<(), ConfigError> {
@@ -458,13 +550,104 @@ fn validate_public_url_security(
         "http" if is_loopback_public_url(public_url) => Ok(()),
         "http" if allow_insecure_public_url => Ok(()),
         "http" => Err(ConfigError::Validation(
-            "CLIPLINE_PUBLIC_URL must use https for non-local hosts; set CLIPLINE_ALLOW_INSECURE_PUBLIC_URL=true only for intentional insecure development or trusted LAN deployments".to_string(),
+            format!("{name} must use https for non-local hosts; set CLIPLINE_ALLOW_INSECURE_PUBLIC_URL=true only for intentional insecure development or trusted LAN deployments"),
         )),
         _ => Err(ConfigError::Validation(
-            "CLIPLINE_PUBLIC_URL must use https, or http only for localhost/development"
-                .to_string(),
+            format!("{name} must use https, or http only for localhost/development"),
         )),
     }
+}
+
+fn push_non_https_public_url_warning(warnings: &mut Vec<StartupWarning>, url: &Url) {
+    if url.scheme() != "https" {
+        warnings.push(StartupWarning::NonHttpsPublicUrl {
+            url: url.as_str().to_string(),
+        });
+    }
+}
+
+pub(crate) fn public_origin(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    }
+}
+
+pub(crate) fn join_public_path(base: &Url, path: &str) -> String {
+    base.join(path.trim_start_matches('/'))
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("/{}", path.trim_start_matches('/')))
+}
+
+fn parse_origin_header(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(public_origin(&url))
+}
+
+fn parse_request_host(value: &str) -> Option<String> {
+    let host = value.trim();
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b' ' | b'\t' | b'\r' | b'\n' | b'@' | 0))
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn parse_forwarded_proto(value: Option<&str>) -> Option<&'static str> {
+    let proto = value?.split(',').next()?.trim();
+    match proto.to_ascii_lowercase().as_str() {
+        "https" => Some("https"),
+        "http" => Some("http"),
+        _ => None,
+    }
+}
+
+fn origin_scheme(origin: &str) -> Option<&'static str> {
+    if origin.starts_with("https://") {
+        Some("https")
+    } else if origin.starts_with("http://") {
+        Some("http")
+    } else {
+        None
+    }
+}
+
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let Ok(origin_url) = Url::parse(origin) else {
+        return false;
+    };
+    let scheme = origin_url.scheme();
+    url_from_scheme_and_host(scheme, host, "/")
+        .is_some_and(|host_url| public_origin(&host_url) == public_origin(&origin_url))
+}
+
+fn url_from_origin(origin: &str, path: &str) -> Option<Url> {
+    let origin_url = Url::parse(origin).ok()?;
+    url_from_scheme_and_host(origin_url.scheme(), origin_url.host_str()?, path).and_then(
+        |mut url| {
+            if let Some(port) = origin_url.port() {
+                url.set_port(Some(port)).ok()?;
+            }
+            Some(url)
+        },
+    )
+}
+
+fn url_from_scheme_and_host(scheme: &str, host: &str, path: &str) -> Option<Url> {
+    let mut url = Url::parse(&format!("{scheme}://{host}")).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let path = if path.is_empty() { "/" } else { path };
+    url.set_path(path);
+    Some(url)
 }
 
 fn is_loopback_public_url(public_url: &Url) -> bool {
@@ -878,6 +1061,7 @@ mod tests {
 
         assert_eq!(config.bind_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.process_role, ProcessRole::All);
+        assert!(config.additional_public_urls.is_empty());
         assert_eq!(config.database_url, DEFAULT_DATABASE_URL);
         assert_eq!(config.storage_backend_name(), "local");
         assert_eq!(config.max_upload_size_bytes, DEFAULT_MAX_UPLOAD_SIZE_BYTES);
@@ -938,6 +1122,102 @@ mod tests {
         let config = Config::from_source(&env).expect("config");
         assert_eq!(config.public_url.as_str(), "http://192.168.1.10:8080/");
         assert_eq!(config.startup_warnings().len(), 1);
+    }
+
+    #[test]
+    fn additional_public_urls_are_parsed_deduped_and_origin_checked() {
+        let mut env = valid_local_env();
+        env.insert(
+            "CLIPLINE_PUBLIC_URL",
+            "https://watch.clipline.cc".to_string(),
+        );
+        env.insert(
+            "CLIPLINE_ADDITIONAL_PUBLIC_URLS",
+            "https://clips.petrichor.one, https://watch.clipline.cc, https://clips.petrichor.one/"
+                .to_string(),
+        );
+
+        let config = Config::from_source(&env).expect("config");
+        assert_eq!(config.public_url.as_str(), "https://watch.clipline.cc/");
+        assert_eq!(
+            config
+                .additional_public_urls
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            vec!["https://clips.petrichor.one/"]
+        );
+        assert!(config.allows_origin("https://watch.clipline.cc"));
+        assert!(config.allows_origin("https://clips.petrichor.one"));
+        assert!(!config.allows_origin("https://evil.example"));
+        assert!(config.startup_warnings().is_empty());
+    }
+
+    #[test]
+    fn public_url_for_parts_follows_request_host() {
+        let mut env = valid_local_env();
+        env.insert(
+            "CLIPLINE_PUBLIC_URL",
+            "https://clips.petrichor.one".to_string(),
+        );
+        let config = Config::from_source(&env).expect("config");
+
+        assert_eq!(
+            config
+                .public_url_for_parts(None, Some("watch.clipline.cc"), Some("https"))
+                .as_str(),
+            "https://watch.clipline.cc/"
+        );
+        assert_eq!(
+            config
+                .public_url_for_parts(
+                    Some("https://watch.clipline.cc"),
+                    Some("watch.clipline.cc"),
+                    None
+                )
+                .as_str(),
+            "https://watch.clipline.cc/"
+        );
+        assert_eq!(
+            config
+                .public_url_for_parts(
+                    Some("https://evil.example"),
+                    Some("watch.clipline.cc"),
+                    None
+                )
+                .as_str(),
+            "https://watch.clipline.cc/"
+        );
+        assert_eq!(
+            config.public_url_for_parts(None, None, None).as_str(),
+            "https://clips.petrichor.one/"
+        );
+        assert_eq!(
+            config
+                .public_url_for_parts(None, Some("watch.clipline.cc/evil"), None)
+                .as_str(),
+            "https://clips.petrichor.one/"
+        );
+    }
+
+    #[test]
+    fn additional_public_urls_reject_invalid_and_insecure_values() {
+        let mut env = valid_local_env();
+        env.insert("CLIPLINE_ADDITIONAL_PUBLIC_URLS", "not-a-url".to_string());
+        let error = Config::from_source(&env).expect_err("invalid additional URL");
+        assert!(
+            matches!(error, ConfigError::InvalidUrl { name, value } if name == "CLIPLINE_ADDITIONAL_PUBLIC_URLS" && value == "not-a-url")
+        );
+
+        env.insert(
+            "CLIPLINE_ADDITIONAL_PUBLIC_URLS",
+            "http://clips.example.com".to_string(),
+        );
+        let error = Config::from_source(&env).expect_err("insecure additional URL");
+        assert!(error
+            .to_string()
+            .contains("CLIPLINE_ADDITIONAL_PUBLIC_URLS"));
+        assert!(error.to_string().contains("must use https"));
     }
 
     #[test]

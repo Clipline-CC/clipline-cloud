@@ -173,7 +173,8 @@ otherwise. (Reinforced in the admin model: no casual "view everyone's private cl
 The complete env surface. Authoritative loading/validation rules live in doc 01.
 
 ```
-CLIPLINE_PUBLIC_URL                 # required for share links; warns if not HTTPS
+CLIPLINE_PUBLIC_URL                 # required fallback origin; warns if not HTTPS
+CLIPLINE_ADDITIONAL_PUBLIC_URLS     # optional extra CSRF origins when Origin ≠ request Host
 CLIPLINE_BIND_ADDR
 CLIPLINE_DATABASE_URL[_FILE]        # sqlite:///data/clipline.db (default) | postgres://...
 
@@ -217,7 +218,10 @@ CLIPLINE_LOG_LEVEL
 
 Config is validated at startup; the app fails loudly on invalid storage/DB settings. `local`
 requires `CLIPLINE_DATA_DIR`; `s3` requires endpoint, bucket, access key, secret key;
-`CLIPLINE_PUBLIC_URL` is required for share links.
+`CLIPLINE_PUBLIC_URL` is required as the fallback origin when a request has no usable `Host`. Generated
+share, invite, reset, discovery, and public media URLs follow the request `Host`. Optional
+`CLIPLINE_ADDITIONAL_PUBLIC_URLS` lists extra origins allowed for browser CSRF checks when `Origin`
+does not match that Host.
 
 ## 29. Repository Layout
 

@@ -248,20 +248,22 @@ enum CacheScope {
 
 async fn get_public_share_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(share_id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let public_base = state.request_public_url(&headers);
     let Some(clip) = state
         .repositories
         .clips
         .get_by_public_share_id(&share_id)
         .await?
     else {
-        return Ok(public_share_unavailable_response(&state, &share_id));
+        return Ok(public_share_unavailable_response(&public_base, &share_id));
     };
 
-    let author_name = public_clip_author_name(&state, &clip).await?;
+    let author_name = public_clip_author_name(&state, &clip, &public_base).await?;
     Ok(public_share_page_response(
-        &state,
+        &public_base,
         &share_id,
         &clip,
         &author_name,
@@ -270,6 +272,7 @@ async fn get_public_share_page(
 
 async fn list_public_clips(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<PublicClipListQuery>,
 ) -> Result<Json<PublicClipListResponse>, ApiError> {
     let page = query.page.unwrap_or(DEFAULT_PUBLIC_PAGE).max(1);
@@ -296,7 +299,8 @@ async fn list_public_clips(
     };
     let clips = state.repositories.clips.list_public(&params).await?;
     let has_more = clips.len() as i64 > page_size;
-    let authors = public_authors_for_clips(&state, &clips).await?;
+    let public_base = state.request_public_url(&headers);
+    let authors = public_authors_for_clips(&state, &clips, &public_base).await?;
     let display_names = game_display_name_map(&state).await?;
     let mut public_clips = Vec::with_capacity(clips.len());
     for clip in clips.into_iter().take(page_size as usize) {
@@ -304,9 +308,9 @@ async fn list_public_clips(
             let author = authors
                 .get(&clip.owner_user_id)
                 .cloned()
-                .unwrap_or_else(|| public_author_from_user(&state, None));
+                .unwrap_or_else(|| public_author_from_user(&public_base, None));
             if let Some(response) =
-                public_clip_summary_response(&state, clip, author, &display_names)
+                public_clip_summary_response(&public_base, clip, author, &display_names)
             {
                 public_clips.push(response);
             }
@@ -323,6 +327,7 @@ async fn list_public_clips(
 
 async fn list_public_recommendations(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<PublicRecommendationQuery>,
 ) -> Result<Json<PublicRecommendationResponse>, ApiError> {
     let limit = query
@@ -345,7 +350,8 @@ async fn list_public_recommendations(
     };
     let candidates = state.repositories.clips.list_public(&params).await?;
     let clips = recommend_public_clips(candidates, source.as_ref(), limit as usize);
-    let authors = public_authors_for_clips(&state, &clips).await?;
+    let public_base = state.request_public_url(&headers);
+    let authors = public_authors_for_clips(&state, &clips, &public_base).await?;
     let display_names = game_display_name_map(&state).await?;
 
     let mut public_clips = Vec::with_capacity(clips.len());
@@ -353,8 +359,10 @@ async fn list_public_recommendations(
         let author = authors
             .get(&clip.owner_user_id)
             .cloned()
-            .unwrap_or_else(|| public_author_from_user(&state, None));
-        if let Some(response) = public_clip_summary_response(&state, clip, author, &display_names) {
+            .unwrap_or_else(|| public_author_from_user(&public_base, None));
+        if let Some(response) =
+            public_clip_summary_response(&public_base, clip, author, &display_names)
+        {
             public_clips.push(response);
         }
     }
@@ -573,6 +581,7 @@ fn game_category_artwork_key(
 
 async fn get_public_user(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(username): Path<String>,
 ) -> Result<Json<PublicUserProfileResponse>, ApiError> {
     let Some(user) = state.repositories.users.get_by_username(&username).await? else {
@@ -596,12 +605,13 @@ async fn get_public_user(
         .clips
         .count_public_for_owner(&user.id)
         .await?;
-    let author = public_author_from_user(&state, Some(&user));
+    let public_base = state.request_public_url(&headers);
+    let author = public_author_from_user(&public_base, Some(&user));
     let display_names = game_display_name_map(&state).await?;
     let public_clips = clips
         .into_iter()
         .filter_map(|clip| {
-            public_clip_summary_response(&state, clip, author.clone(), &display_names)
+            public_clip_summary_response(&public_base, clip, author.clone(), &display_names)
         })
         .collect::<Vec<_>>();
 
@@ -717,7 +727,8 @@ async fn get_public_clip(
         .as_ref()
         .is_some_and(|auth| auth.user.id == clip.owner_user_id);
     let viewer_clip_id = viewer_can_edit.then(|| clip.id.clone());
-    let author = public_clip_author(&state, &clip).await?;
+    let public_base = state.request_public_url(&headers);
+    let author = public_clip_author(&state, &clip, &public_base).await?;
     let display_names = game_display_name_map(&state).await?;
     let game_display_name = game_display_name(clip.game_name.as_deref(), &display_names);
     let game_category_id = crate::game_category_id(clip.game_name.as_deref(), &display_names);
@@ -742,10 +753,19 @@ async fn get_public_clip(
         uploaded_at: clip.uploaded_at,
         duration_ms: clip.duration_ms,
         view_count: clip.view_count,
-        media_url: absolute_url(&state, &format!("api/v1/public/clips/{share_id}/media")),
-        thumbnail_url: absolute_url(&state, &format!("api/v1/public/clips/{share_id}/thumbnail")),
-        poster_url: absolute_url(&state, &format!("api/v1/public/clips/{share_id}/poster")),
-        share_url: absolute_url(&state, &format!("c/{share_id}")),
+        media_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/media"),
+        ),
+        thumbnail_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/thumbnail"),
+        ),
+        poster_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/poster"),
+        ),
+        share_url: absolute_url(&public_base, &format!("c/{share_id}")),
         copy_notice: COPY_NOTICE,
     }))
 }
@@ -774,10 +794,11 @@ async fn list_public_comments(
         Some(viewer) => auth::user_is_owner(&state, &viewer.user).await?,
         None => false,
     };
+    let public_base = state.request_public_url(&headers);
     let mut responses = Vec::with_capacity(comments.len());
     for comment in comments {
         responses.push(public_comment_response_with_context(
-            &state,
+            &public_base,
             &clip,
             comment,
             auth.as_ref(),
@@ -838,7 +859,14 @@ async fn create_public_comment(
     )
     .await?;
     Ok(Json(
-        public_comment_response(&state, &clip, comment, Some(&auth)).await?,
+        public_comment_response(
+            &state,
+            &clip,
+            comment,
+            Some(&auth),
+            &state.request_public_url(&headers),
+        )
+        .await?,
     ))
 }
 
@@ -924,7 +952,7 @@ fn public_view_allowed(client_ip: &str, clip_id: &str) -> bool {
 }
 
 fn public_clip_summary_response(
-    state: &AppState,
+    public_base: &Url,
     clip: Clip,
     author: PublicAuthor,
     display_names: &HashMap<String, crate::ResolvedGameCategory>,
@@ -935,8 +963,11 @@ fn public_clip_summary_response(
     let game_icon_url = game_icon_url(clip.game_name.as_deref(), display_names);
     let game_video_art_url = game_video_art_url(clip.game_name.as_deref(), display_names);
     Some(PublicClipSummaryResponse {
-        thumbnail_url: absolute_url(state, &format!("api/v1/public/clips/{share_id}/thumbnail")),
-        share_url: absolute_url(state, &format!("c/{share_id}")),
+        thumbnail_url: absolute_url(
+            public_base,
+            &format!("api/v1/public/clips/{share_id}/thumbnail"),
+        ),
+        share_url: absolute_url(public_base, &format!("c/{share_id}")),
         share_id,
         title: clip.title,
         description: clip.description,
@@ -1374,16 +1405,22 @@ fn insert_header_str(headers: &mut HeaderMap, name: HeaderName, value: impl AsRe
 }
 
 fn public_share_page_response(
-    state: &AppState,
+    public_base: &Url,
     share_id: &str,
     clip: &Clip,
     author_name: &str,
 ) -> Response {
     let title = public_share_title(clip);
     let description = public_share_description(clip, Some(author_name));
-    let share_url = absolute_url(state, &format!("c/{share_id}"));
-    let media_url = absolute_url(state, &format!("api/v1/public/clips/{share_id}/media"));
-    let poster_url = absolute_url(state, &format!("api/v1/public/clips/{share_id}/poster"));
+    let share_url = absolute_url(public_base, &format!("c/{share_id}"));
+    let media_url = absolute_url(
+        public_base,
+        &format!("api/v1/public/clips/{share_id}/media"),
+    );
+    let poster_url = absolute_url(
+        public_base,
+        &format!("api/v1/public/clips/{share_id}/poster"),
+    );
     let (image_width, image_height) = public_embed_image_dimensions(clip);
     let html = public_share_html(PublicShareHtml {
         title: &title,
@@ -1400,10 +1437,10 @@ fn public_share_page_response(
     html_response(StatusCode::OK, html)
 }
 
-fn public_share_unavailable_response(state: &AppState, share_id: &str) -> Response {
+fn public_share_unavailable_response(public_base: &Url, share_id: &str) -> Response {
     let title = "Clip unavailable";
     let description = "This Clipline public link is no longer active.";
-    let share_url = absolute_url(state, &format!("c/{share_id}"));
+    let share_url = absolute_url(public_base, &format!("c/{share_id}"));
     let html = public_share_html(PublicShareHtml {
         title,
         description,
@@ -1554,18 +1591,27 @@ fn public_share_title(clip: &Clip) -> String {
     }
 }
 
-async fn public_clip_author_name(state: &AppState, clip: &Clip) -> Result<String, ApiError> {
-    Ok(public_clip_author(state, clip).await?.name)
+async fn public_clip_author_name(
+    state: &AppState,
+    clip: &Clip,
+    public_base: &Url,
+) -> Result<String, ApiError> {
+    Ok(public_clip_author(state, clip, public_base).await?.name)
 }
 
-async fn public_clip_author(state: &AppState, clip: &Clip) -> Result<PublicAuthor, ApiError> {
+async fn public_clip_author(
+    state: &AppState,
+    clip: &Clip,
+    public_base: &Url,
+) -> Result<PublicAuthor, ApiError> {
     let user = state.repositories.users.get(&clip.owner_user_id).await?;
-    Ok(public_author_from_user(state, user.as_ref()))
+    Ok(public_author_from_user(public_base, user.as_ref()))
 }
 
 async fn public_authors_for_clips(
     state: &AppState,
     clips: &[Clip],
+    public_base: &Url,
 ) -> Result<HashMap<String, PublicAuthor>, ApiError> {
     let users = public_users_by_id(
         state,
@@ -1577,7 +1623,7 @@ async fn public_authors_for_clips(
     .await?;
     Ok(users
         .into_iter()
-        .map(|(id, user)| (id, public_author_from_user(state, Some(&user))))
+        .map(|(id, user)| (id, public_author_from_user(public_base, Some(&user))))
         .collect())
 }
 
@@ -1602,6 +1648,7 @@ async fn public_comment_response(
     clip: &Clip,
     comment: ClipComment,
     viewer: Option<&auth::AuthenticatedUser>,
+    public_base: &Url,
 ) -> Result<PublicCommentResponse, ApiError> {
     let user = state.repositories.users.get(&comment.user_id).await?;
     let viewer_is_owner = match viewer {
@@ -1612,7 +1659,7 @@ async fn public_comment_response(
         .map(|user| HashMap::from([(user.id.clone(), user)]))
         .unwrap_or_default();
     Ok(public_comment_response_with_context(
-        state,
+        public_base,
         clip,
         comment,
         viewer,
@@ -1622,14 +1669,14 @@ async fn public_comment_response(
 }
 
 fn public_comment_response_with_context(
-    state: &AppState,
+    public_base: &Url,
     clip: &Clip,
     comment: ClipComment,
     viewer: Option<&auth::AuthenticatedUser>,
     viewer_is_owner: bool,
     users: &HashMap<String, User>,
 ) -> PublicCommentResponse {
-    let author = public_author_from_user(state, users.get(&comment.user_id));
+    let author = public_author_from_user(public_base, users.get(&comment.user_id));
     let is_uploader = comment.user_id == clip.owner_user_id;
     let viewer_can_delete = viewer.is_some_and(|viewer| {
         viewer_can_delete_comment_with_owner_flag(
@@ -1680,7 +1727,7 @@ fn viewer_can_delete_comment_with_owner_flag(
         || matches!(viewer.role.as_str(), "admin" | "owner")
 }
 
-fn public_author_from_user(state: &AppState, user: Option<&User>) -> PublicAuthor {
+fn public_author_from_user(public_base: &Url, user: Option<&User>) -> PublicAuthor {
     let Some(user) = user else {
         return PublicAuthor {
             name: "Unknown creator".to_string(),
@@ -1693,7 +1740,7 @@ fn public_author_from_user(state: &AppState, user: Option<&User>) -> PublicAutho
         username: Some(user.username.clone()),
         avatar_url: user.avatar_key.as_ref().map(|_| {
             absolute_url(
-                state,
+                public_base,
                 &format!(
                     "api/v1/public/users/{}/avatar",
                     path_segment(&user.username)
@@ -1939,13 +1986,8 @@ fn public_page_offset(page: i64, page_size: i64) -> Result<i64, ApiError> {
         .ok_or_else(|| ApiError::bad_request("page is too large"))
 }
 
-fn absolute_url(state: &AppState, path: &str) -> String {
-    state
-        .config
-        .public_url
-        .join(path.trim_start_matches('/'))
-        .map(|url| url.to_string())
-        .unwrap_or_else(|_| format!("/{}", path.trim_start_matches('/')))
+fn absolute_url(public_base: &Url, path: &str) -> String {
+    crate::config::join_public_path(public_base, path)
 }
 
 fn storage_error(error: StorageError) -> ApiError {

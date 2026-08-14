@@ -86,7 +86,8 @@ presigned URL already handed out **stays valid until its TTL expires.** Keep tha
 through the backend proxy instead of presigned URLs.
 
 For browser `<video>` playback against a cross-origin S3 host, the bucket needs **CORS** allowing
-`GET`/`HEAD` and the `Range` request header from the public origin, and the presigned response
+`GET`/`HEAD` and the `Range` request header from every origin browsers will use to open the app
+(`CLIPLINE_PUBLIC_URL` and any other public hostnames), and the presigned response
 should carry `Content-Type: video/mp4`, `Accept-Ranges: bytes`, and cache headers. Same-origin
 backend-proxied media avoids the CORS surface entirely.
 
@@ -102,7 +103,7 @@ Minimal S3 bucket CORS for presigned cross-origin playback:
 ```json
 [
   {
-    "AllowedOrigins": ["https://clips.example.com"],
+    "AllowedOrigins": ["https://clips.example.com", "https://watch.example.com"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["Range"],
     "ExposeHeaders": ["Accept-Ranges", "Content-Range", "Content-Length", "Content-Type", "ETag"],

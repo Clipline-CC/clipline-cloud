@@ -204,6 +204,7 @@ struct AdminOverviewResponse {
     server_version: &'static str,
     api_version: &'static str,
     public_url: String,
+    additional_public_urls: Vec<String>,
     storage_backend: &'static str,
     storage_summary: String,
     database_backend: &'static str,
@@ -894,6 +895,12 @@ async fn overview(
         server_version: env!("CARGO_PKG_VERSION"),
         api_version: "v1",
         public_url: state.config.public_url.to_string(),
+        additional_public_urls: state
+            .config
+            .additional_public_urls
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         storage_backend: state.config.storage_backend_name(),
         storage_summary: storage_summary(&state.config.storage),
         database_backend: database_kind_name(state.database.kind()),
