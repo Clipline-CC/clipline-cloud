@@ -175,9 +175,10 @@ async fn list_clips(
     clips.truncate(page_size as usize);
     let stats = state.repositories.clips.stats_for_owner(&params).await?;
     let display_names = game_display_name_map(&state).await?;
+    let public_base = state.request_public_url(&headers);
     let clips = clips
         .into_iter()
-        .map(|clip| clip_summary_response(clip, &state, &display_names))
+        .map(|clip| clip_summary_response(clip, &public_base, &display_names))
         .collect();
 
     Ok(Json(ClipListResponse {
@@ -204,7 +205,7 @@ async fn get_clip(
     else {
         return Err(ApiError::not_found("clip not found"));
     };
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
 }
 
 async fn update_clip(
@@ -294,7 +295,7 @@ async fn update_clip(
         .get_owned_non_deleted(&auth.user.id, &id)
         .await?
         .ok_or_else(|| ApiError::conflict("clip was deleted before the update completed"))?;
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
 }
 
 fn validate_update_clip_request(request: &UpdateClipRequest) -> Result<(), ApiError> {
@@ -432,7 +433,7 @@ async fn update_visibility(
         .get_owned_ready(&auth.user.id, &id)
         .await?
         .ok_or_else(|| ApiError::conflict("clip was deleted before the update completed"))?;
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
 }
 
 async fn bulk_update_visibility(
@@ -480,7 +481,11 @@ async fn bulk_update_visibility(
     }))
 }
 
-async fn detail_response(state: &AppState, clip: Clip) -> Result<ClipDetailResponse, ApiError> {
+async fn detail_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    clip: Clip,
+) -> Result<ClipDetailResponse, ApiError> {
     let markers = state
         .repositories
         .clip_markers
@@ -490,12 +495,17 @@ async fn detail_response(state: &AppState, clip: Clip) -> Result<ClipDetailRespo
         .map(clip_marker_response)
         .collect();
     let display_names = game_display_name_map(state).await?;
-    Ok(clip_detail_response(clip, markers, state, &display_names))
+    Ok(clip_detail_response(
+        clip,
+        markers,
+        &state.request_public_url(headers),
+        &display_names,
+    ))
 }
 
 fn clip_summary_response(
     clip: Clip,
-    state: &AppState,
+    public_base: &url::Url,
     display_names: &HashMap<String, crate::ResolvedGameCategory>,
 ) -> ClipSummaryResponse {
     let game_display_name = game_display_name(clip.game_name.as_deref(), display_names);
@@ -526,7 +536,7 @@ fn clip_summary_response(
         public_url: clip
             .public_share_id
             .as_deref()
-            .and_then(|share_id| public_url(state, share_id)),
+            .and_then(|share_id| public_url(public_base, share_id)),
         view_count: clip.view_count,
         created_at: clip.created_at,
         updated_at: clip.updated_at,
@@ -536,13 +546,13 @@ fn clip_summary_response(
 fn clip_detail_response(
     clip: Clip,
     markers: Vec<ClipMarkerResponse>,
-    state: &AppState,
+    public_base: &url::Url,
     display_names: &HashMap<String, crate::ResolvedGameCategory>,
 ) -> ClipDetailResponse {
     let public_url = clip
         .public_share_id
         .as_deref()
-        .and_then(|share_id| public_url(state, share_id));
+        .and_then(|share_id| public_url(public_base, share_id));
     let game_display_name = game_display_name(clip.game_name.as_deref(), display_names);
     let game_category_id = game_category_id(clip.game_name.as_deref(), display_names);
     let game_icon_url = game_icon_url(clip.game_name.as_deref(), display_names);
@@ -716,13 +726,11 @@ fn random_base62_char() -> char {
     }
 }
 
-fn public_url(state: &AppState, share_id: &str) -> Option<String> {
-    state
-        .config
-        .public_url
-        .join(&format!("c/{share_id}"))
-        .ok()
-        .map(|url| url.to_string())
+fn public_url(public_base: &url::Url, share_id: &str) -> Option<String> {
+    Some(crate::config::join_public_path(
+        public_base,
+        &format!("c/{share_id}"),
+    ))
 }
 
 #[cfg(test)]
@@ -991,6 +999,53 @@ mod tests {
             Some("local-ready")
         );
         assert_eq!(response.clips[1].source_type.as_deref(), Some("replay"));
+    }
+
+    #[tokio::test]
+    async fn clip_public_url_follows_request_host() {
+        let app = test_app().await;
+        let owner = insert_user(&app.state, "owner").await;
+        let mut clip = NewClip::new(&owner.id, "Public clip", "local");
+        clip.status = "ready".to_string();
+        clip.visibility = "public".to_string();
+        clip.public_share_id = Some("c_testhostshareid123456".to_string());
+        let clip = app
+            .state
+            .repositories
+            .clips
+            .create(&clip)
+            .await
+            .expect("clip");
+
+        let headers = auth_headers(&app.state, &owner.id).await;
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .expect("authorization header")
+            .clone();
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/clips/{}", clip.id))
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::HOST, "watch.clipline.cc")
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = routes()
+            .with_state(app.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let detail: ClipDetailResponse = serde_json::from_slice(&body).expect("clip detail");
+        assert_eq!(
+            detail.public_url.as_deref(),
+            Some("https://watch.clipline.cc/c/c_testhostshareid123456")
+        );
     }
 
     async fn test_app() -> TestApp {

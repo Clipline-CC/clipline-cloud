@@ -1,6 +1,6 @@
 # Clipline Cloud Deployment Guide
 
-This is the friendly, step-by-step guide to deploying Clipline Cloud v1.3.4 with Docker Compose. For the
+This is the friendly, step-by-step guide to deploying Clipline Cloud v1.3.5 with Docker Compose. For the
 deep operational runbook — operator limits, backup/restore details, migration, and failure-mode checks —
 see [`deployment-operations.md`](deployment-operations.md).
 
@@ -10,7 +10,7 @@ button in the project README instead of Docker Compose and host-mounted storage.
 All commands run from `deploy/compose/` unless noted. Pin the image to the release tag:
 
 ```text
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5
 ```
 
 Do not run `latest` in production.
@@ -22,10 +22,15 @@ Do not run `latest` in production.
   of the app, or the bundled Caddy profile, which gets certificates automatically.
 - **A storage choice:** local disk (default) or an S3-compatible bucket.
 - **A database choice:** SQLite (default) or Postgres.
-- **A public URL.** Set `CLIPLINE_PUBLIC_URL` to the `https://` address users and the desktop app will use.
-  It defaults to `http://localhost:8080`, which is fine only for local testing. Non-local `http://`
-  URLs fail startup unless `CLIPLINE_ALLOW_INSECURE_PUBLIC_URL=true` is set intentionally for an
-  insecure development or trusted-LAN deployment.
+- **A public URL.** Set `CLIPLINE_PUBLIC_URL` to the `https://` fallback origin (used when a request
+  has no usable `Host`, and for the cookie `Secure` flag). Copied share links, invite/reset emails,
+  discovery, and public media URLs otherwise use the hostname the client requested. It defaults to
+  `http://localhost:8080`, which is fine only for local testing. Non-local `http://` URLs fail
+  startup unless `CLIPLINE_ALLOW_INSECURE_PUBLIC_URL=true` is set intentionally for an insecure
+  development or trusted-LAN deployment. Extra hostnames on the same instance (for example a Railway
+  custom domain plus an older alias) do not need extra config for generated links or same-origin
+  browser login. Set `CLIPLINE_ADDITIONAL_PUBLIC_URLS` only if browser CSRF must allow an `Origin`
+  that does not match the request `Host`.
 - **A stable session secret.** The Compose profiles mount `CLIPLINE_SESSION_SECRET_FILE`. For bare,
   split-web, or HA deployments, set `CLIPLINE_SESSION_SECRET` or `CLIPLINE_SESSION_SECRET_FILE` to
   the same high-entropy value on every web replica so browser CSRF tokens survive restarts and route
@@ -58,7 +63,7 @@ To split processing into a second container, set the web container role to `web`
 Compose `worker` profile:
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 CLIPLINE_WEB_PROCESS_ROLE=web \
 docker compose --profile worker up -d
 ```
@@ -66,7 +71,7 @@ docker compose --profile worker up -d
 Use the same pattern with any profile file, for example:
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 CLIPLINE_WEB_PROCESS_ROLE=web \
 docker compose -f docker-compose.postgres.yml --profile worker up -d
 ```
@@ -84,7 +89,7 @@ file on NFS/SMB or another network filesystem, and expect writes to serialize un
 ```sh
 git clone https://github.com/dain98/clipline-cloud.git
 cd clipline-cloud/deploy/compose
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 docker compose up -d
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 docker compose up -d
 docker compose logs clipline-cloud
 ```
 
@@ -147,6 +152,7 @@ Edit `.env` before starting:
 
 ```text
 CLIPLINE_PUBLIC_URL=https://clips.example.com
+CLIPLINE_ADDITIONAL_PUBLIC_URLS=
 CLIPLINE_HTTP_PORT=8080
 CLIPLINE_TRUSTED_PROXY_HOPS=
 CLIPLINE_VIDEO_OPTIMIZATION=off
@@ -174,7 +180,7 @@ Use the default or Postgres/S3 profile, publish port `8080` on the host, and put
 1. Start the app, setting the public URL to your domain:
 
    ```sh
-   CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+   CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
    CLIPLINE_PUBLIC_URL=https://clips.example.com \
    docker compose up -d
    ```
@@ -189,7 +195,7 @@ Use the default or Postgres/S3 profile, publish port `8080` on the host, and put
    the socket peer is a configured trusted proxy.
 
    ```sh
-   CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+   CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
    CLIPLINE_PUBLIC_URL=https://clips.example.com \
    CLIPLINE_TRUSTED_PROXY_HOPS=<proxy-ip> \
    docker compose up -d
@@ -201,7 +207,7 @@ If you don't already run a reverse proxy, the Caddy profile terminates HTTPS and
 ACME. It binds host ports `80`/`443`, so point your domain's DNS at the host first.
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 CLIPLINE_DOMAIN=clips.example.com \
 CLIPLINE_ACME_EMAIL=you@example.com \
 docker compose -f docker-compose.caddy.yml up -d
@@ -246,7 +252,7 @@ postgres://clipline:replace-with-postgres-password@postgres:5432/clipline
 Then:
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 CLIPLINE_PUBLIC_URL=https://clips.example.com \
 docker compose -f docker-compose.postgres.yml up -d
 ```
@@ -278,7 +284,7 @@ Configure the bucket via environment variables:
 | `CLIPLINE_DIRECT_S3_UPLOADS` | Optional Phase-4 direct client-to-S3 uploads; defaults to `false` and requires client support |
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 CLIPLINE_PUBLIC_URL=https://clips.example.com \
 CLIPLINE_S3_ENDPOINT=https://s3.example.com \
 CLIPLINE_S3_BUCKET=clipline \
@@ -327,7 +333,7 @@ clip. Object cleanup is asynchronous, so keep the prefix easy to remove manually
 interrupted.
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 BUILD_IMAGE=0 \
 RUN_PROFILES=s3 \
 RUN_EXTERNAL_S3=1 \
@@ -358,14 +364,14 @@ After the app reports healthy, run the end-to-end flow:
 The repository includes a Docker-only smoke runner. Against the released image:
 
 ```sh
-BUILD_IMAGE=0 CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 deploy/compose/smoke.sh
+BUILD_IMAGE=0 CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 deploy/compose/smoke.sh
 ```
 
 To include the opt-in video optimization path:
 
 ```sh
 BUILD_IMAGE=0 \
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.4 \
+CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.5 \
 RUN_VIDEO_OPTIMIZATION=1 \
 deploy/compose/smoke.sh
 ```

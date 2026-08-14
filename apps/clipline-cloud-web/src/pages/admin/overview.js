@@ -53,6 +53,9 @@ export function AdminOverview({ overview, deadJobs, failedUploads }) {
         ${kv("Server version", overview.server_version)}
         ${kv("API version", overview.api_version)}
         ${kv("Public URL", overview.public_url)}
+        ${overview.additional_public_urls?.length
+          ? kv("Additional public URLs", overview.additional_public_urls.join(", "))
+          : null}
         ${kv("Database", overview.database_backend)}
         ${kv("Storage", `${overview.storage_backend} — ${overview.storage_summary}`)}
         ${kv("Stored clips", `${overview.total_clips} clips — ${formatBytes(overview.total_storage_bytes)}`)}

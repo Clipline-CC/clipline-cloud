@@ -69,6 +69,22 @@ impl AppState {
     pub(crate) async fn invalidate_game_category_map(&self) {
         *self.game_category_map_cache.write().await = None;
     }
+
+    pub(crate) fn request_public_url(&self, headers: &HeaderMap) -> url::Url {
+        request_public_url(&self.config, headers)
+    }
+}
+
+pub(crate) fn request_public_url(config: &Config, headers: &HeaderMap) -> url::Url {
+    config.public_url_for_parts(
+        header_opt(headers, header::ORIGIN.as_str()),
+        header_opt(headers, header::HOST.as_str()),
+        header_opt(headers, "x-forwarded-proto"),
+    )
+}
+
+fn header_opt<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +373,11 @@ fn log_config_summary(config: &Config) {
         event = "config.loaded",
         process_role = config.process_role.as_str(),
         public_url = %config.public_url,
+        additional_public_urls = ?config
+            .additional_public_urls
+            .iter()
+            .map(url::Url::as_str)
+            .collect::<Vec<_>>(),
         database_url = %redact_url_credentials(&config.database_url),
         storage_backend = config.storage_backend_name(),
         bootstrap_admin_username_configured = config.bootstrap_admin_username.is_some(),

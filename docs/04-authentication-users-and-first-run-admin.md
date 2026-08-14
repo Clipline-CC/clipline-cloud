@@ -45,7 +45,8 @@ SHA-256 hash persisted.
 - One `HttpOnly`, `SameSite=Lax` session cookie (no split SameSite policy). The cookie is marked
   `Secure` when `CLIPLINE_PUBLIC_URL` is HTTPS; HTTP mode is supported only for local/LAN testing.
 - A **CSRF token** is required on every state-changing browser request, **plus** strict
-  `Origin`/`Referer` validation as defense in depth.
+  `Origin`/`Referer` validation as defense in depth. Allowed origins are `CLIPLINE_PUBLIC_URL`,
+  any extras in `CLIPLINE_ADDITIONAL_PUBLIC_URLS`, and the same-origin request `Host`.
 - Sensitive admin actions (create/disable user, reset password) require **re-authentication**.
 - Sessions revocable from the account page; revocation is immediate (validation is a DB lookup).
 
@@ -76,7 +77,7 @@ GET /.well-known/clipline-cloud
 {
   "name": "Clipline Cloud",
   "api_version": "v1",
-  "server_version": "1.3.4",
+  "server_version": "1.3.5",
   "min_client_version": "0.1.0",
   "public_url": "https://clips.example.com",
   "features": {
@@ -167,7 +168,8 @@ by email when SMTP is enabled.
 - [x] Cookie `Secure` flag follows `CLIPLINE_PUBLIC_URL` scheme so supported HTTP deployments can log in
 - [x] `POST /auth/logout`, `GET /auth/me`
 - [x] CSRF token issuance + verification (HMAC via `CLIPLINE_SESSION_SECRET`) on all state-changing browser requests
-- [x] Strict `Origin`/`Referer` validation as defense in depth
+- [x] Strict `Origin`/`Referer` validation as defense in depth (`CLIPLINE_PUBLIC_URL`, optional
+      `CLIPLINE_ADDITIONAL_PUBLIC_URLS`, and the same-origin request `Host`)
 - [x] `POST /auth/device-token` (validate credentials, create named token, return once); `GET`/`DELETE` device-tokens with `last_used_at`
 - [x] Auth middleware: cookie-session for browser, `Authorization: Bearer` for desktop; updates `last_used_at`; immediate revocation honored
 - [x] First-run owner bootstrap: env password, `_FILE`, or generated-and-printed-once; ignored after an owner exists
