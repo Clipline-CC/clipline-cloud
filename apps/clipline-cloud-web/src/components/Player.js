@@ -72,6 +72,26 @@ export function readStoredVolume() {
   }
 }
 
+export async function startPlayerPlayback(video, { isCancelled, onMuted, onError } = {}) {
+  const cancelled = isCancelled || (() => false);
+  if (cancelled()) return;
+
+  try {
+    await video.play();
+    return;
+  } catch {
+    if (cancelled() || !video.paused) return;
+  }
+
+  video.muted = true;
+  onMuted?.();
+  try {
+    await video.play();
+  } catch (error) {
+    if (!cancelled()) onError?.(error);
+  }
+}
+
 function writeStoredVolume(value) {
   try {
     window.localStorage.setItem(VOLUME_KEY, String(Math.max(0, Math.min(1, value))));
@@ -225,32 +245,18 @@ export function Player({ src, poster, durationMs, markers }) {
 
     let cancelled = false;
 
-    async function startPlayback() {
-      if (cancelled) return;
-      try {
-        await video.play();
-        return;
-      } catch {
-        if (cancelled || !video.paused) return;
-        video.muted = true;
-        setMuted(true);
-        try {
-          await video.play();
-        } catch (error) {
-          setNote(error?.message || "Playback unavailable");
-        }
-      }
-    }
-
-    if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
-      startPlayback();
-    } else {
-      video.addEventListener("canplay", startPlayback, { once: true });
-    }
+    // Calling play() initiates media loading even when the browser honors the
+    // element's metadata-only preload hint. Waiting for canplay here can
+    // deadlock because some browsers do not buffer that far until asked to
+    // start playback.
+    startPlayerPlayback(video, {
+      isCancelled: () => cancelled,
+      onMuted: () => setMuted(true),
+      onError: (error) => setNote(error?.message || "Playback unavailable"),
+    });
 
     return () => {
       cancelled = true;
-      video.removeEventListener("canplay", startPlayback);
     };
   }, [src]);
 

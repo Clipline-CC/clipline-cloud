@@ -14,7 +14,40 @@ function makeMemoryStorage() {
 }
 globalThis.window = { localStorage: makeMemoryStorage() };
 
-const { resolvePlayerKeyIntent, readStoredVolume } = await import("../src/components/Player.js");
+const { resolvePlayerKeyIntent, readStoredVolume, startPlayerPlayback } = await import("../src/components/Player.js");
+
+test("startPlayerPlayback requests playback immediately", async () => {
+  let playCalls = 0;
+  const video = {
+    paused: true,
+    muted: false,
+    play: async () => { playCalls += 1; },
+  };
+
+  await startPlayerPlayback(video);
+
+  assert.equal(playCalls, 1);
+  assert.equal(video.muted, false);
+});
+
+test("startPlayerPlayback retries muted when audible autoplay is blocked", async () => {
+  let playCalls = 0;
+  let mutedNotices = 0;
+  const video = {
+    paused: true,
+    muted: false,
+    play: async () => {
+      playCalls += 1;
+      if (playCalls === 1) throw new Error("autoplay blocked");
+    },
+  };
+
+  await startPlayerPlayback(video, { onMuted: () => { mutedNotices += 1; } });
+
+  assert.equal(playCalls, 2);
+  assert.equal(video.muted, true);
+  assert.equal(mutedNotices, 1);
+});
 
 test("KeyM resolves to toggle-mute", () => {
   assert.deepEqual(resolvePlayerKeyIntent("KeyM", false), { kind: "toggle-mute" });
