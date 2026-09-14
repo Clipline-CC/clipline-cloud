@@ -1,5 +1,6 @@
 /target/
 /external/
+/.clipline-data/
 .superpowers/
 .claude/worktrees/
 .playwright-mcp/
