@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use bytes::Bytes;
@@ -43,19 +44,38 @@ pub enum CloudApiError {
 
 pub type CloudApiResult<T> = Result<T, CloudApiError>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CloudClient {
     base_url: Url,
     http: reqwest::Client,
     device_token: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for CloudClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudClient")
+            .field("origin", &self.base_url.origin().ascii_serialization())
+            .field("authenticated", &self.device_token.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 pub struct ConnectedCloud {
     pub client: CloudClient,
     pub discovery: DiscoveryResponse,
     pub token: String,
     pub user: UserResponse,
+}
+
+impl fmt::Debug for ConnectedCloud {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectedCloud")
+            .field("client", &self.client)
+            .field("user_id", &self.user.id)
+            .field("server_version", &self.discovery.server_version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CloudClient {
@@ -434,6 +454,114 @@ struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_debug_is_redacted_without_changing_wire_format() {
+        let secret = "credential-debug-secret";
+        let request_wire = serde_json::json!({
+            "username": "alice", "password": secret, "name": "desktop"
+        });
+        let request: CreateDeviceTokenRequest =
+            serde_json::from_value(request_wire.clone()).expect("request");
+        let token_wire = serde_json::json!({
+            "token": secret,
+            "device_token": {
+                "id": "device-1", "name": "desktop", "created_at": "2026-09-30T00:00:00Z",
+                "last_used_at": null, "expires_at": null, "revoked_at": null
+            }
+        });
+        let token: CreateDeviceTokenResponse =
+            serde_json::from_value(token_wire.clone()).expect("token response");
+        let user_wire = serde_json::json!({
+            "id": "user-1", "username": "alice", "display_name": null, "email": null,
+            "bio": null, "avatar_url": null, "role": "user", "is_disabled": false,
+            "storage_bytes": 0, "storage_quota_bytes": null,
+            "created_at": "2026-09-30T00:00:00Z", "updated_at": "2026-09-30T00:00:00Z",
+            "last_login_at": null
+        });
+        let me_wire = serde_json::json!({
+            "user": user_wire, "auth_kind": "session", "csrf_token": secret
+        });
+        let me: MeResponse = serde_json::from_value(me_wire.clone()).expect("me response");
+        let connected = ConnectedCloud {
+            client: CloudClient::with_device_token(
+                Url::parse(&format!(
+                    "https://alice:{secret}@clips.example.com/{secret}?token={secret}"
+                ))
+                .expect("url"),
+                secret,
+            ),
+            discovery: serde_json::from_value(serde_json::json!({
+                "name": "Clipline Cloud", "api_version": "v1", "server_version": "1.2.18",
+                "min_client_version": "1.0.0", "public_url": "https://clips.example.com",
+                "features": {
+                    "single_put_upload": true, "chunked_upload": true, "direct_s3_upload": true,
+                    "public_sharing": true, "clip_markers": true, "max_upload_size_bytes": 100
+                }
+            }))
+            .expect("discovery"),
+            token: secret.into(),
+            user: me.user.clone(),
+        };
+        for debug in [
+            format!("{request:?}"),
+            format!("{token:?}"),
+            format!("{me:?}"),
+            format!("{:?}", connected.client),
+            format!("{connected:#?}"),
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+        assert_eq!(
+            serde_json::to_value(request).expect("request JSON"),
+            request_wire
+        );
+        assert_eq!(serde_json::to_value(token).expect("token JSON"), token_wire);
+        assert_eq!(serde_json::to_value(me).expect("me JSON"), me_wire);
+    }
+
+    #[test]
+    fn upload_debug_redacts_urls_and_headers_without_changing_wire_format() {
+        let secret = "upload-debug-secret";
+        let upload_wire = serde_json::json!({
+            "clip_id": "clip-1", "upload_id": "upload-1", "mode": "chunked", "part_size_bytes": 3,
+            "single_put_url": format!("https://objects.example.com/part?signature={secret}"),
+            "parts_url_template": format!("https://objects.example.com/parts/{{part_number}}?token={secret}"),
+            "direct_part_presign_url_template": format!("/presign/{{part_number}}?token={secret}"),
+            "direct_part_ack_url_template": format!("/ack/{{part_number}}?token={secret}")
+        });
+        let upload: CreateUploadResponse =
+            serde_json::from_value(upload_wire.clone()).expect("upload response");
+        let header_wire = serde_json::json!({"name": "authorization", "value": secret});
+        let presign_wire = serde_json::json!({
+            "upload_id": "upload-1", "part_number": 1, "method": "PUT",
+            "url": format!("https://objects.example.com/part?signature={secret}"),
+            "expires_at": "2026-09-30T00:00:00Z", "expected_size_bytes": 3,
+            "headers": [header_wire]
+        });
+        let presign: types::DirectPartUploadUrlResponse =
+            serde_json::from_value(presign_wire.clone()).expect("presign response");
+        for debug in [
+            format!("{upload:?}"),
+            format!("{presign:#?}"),
+            format!("{:?}", presign.headers[0]),
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+        assert!(format!("{presign:?}").contains("upload-1"));
+        assert_eq!(
+            serde_json::to_value(&presign.headers[0]).expect("header JSON"),
+            header_wire
+        );
+        assert_eq!(
+            serde_json::to_value(upload).expect("upload JSON"),
+            upload_wire
+        );
+        assert_eq!(
+            serde_json::to_value(presign).expect("presign JSON"),
+            presign_wire
+        );
+    }
 
     #[test]
     fn transport_guard_accepts_https_without_confirmation() {
