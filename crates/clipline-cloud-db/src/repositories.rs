@@ -1465,8 +1465,8 @@ impl ClipRepository {
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
-             FROM clips WHERE deleted_at IS NULL AND status <> 'deleted'",
+            "SELECT CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
+             FROM clips",
             []
         )?
         .map(|row| row.0)

@@ -156,6 +156,57 @@ async fn backends() -> (tempfile::TempDir, Vec<Database>) {
 }
 
 #[tokio::test]
+async fn storage_totals_release_cleaned_failures_and_count_pending_deletions() {
+    let (_directory, databases) = backends().await;
+    for database in databases {
+        let repos = Repositories::new(database);
+        let user = repos
+            .users
+            .create(&NewUser::new("storage-totals", "hash", "user"))
+            .await
+            .unwrap();
+        let mut clips = Vec::new();
+        for (status, size) in [("failed", 100), ("deleted", 25), ("ready", 10)] {
+            let mut clip = NewClip::new(&user.id, status, "local");
+            clip.status = status.into();
+            clip.file_size_bytes = Some(size);
+            clips.push(repos.clips.create(&clip).await.unwrap());
+        }
+        assert_eq!(repos.clips.total_storage_bytes().await.unwrap(), 135);
+        repos
+            .clips
+            .release_failed_storage_reservation(&clips[0].id)
+            .await
+            .unwrap();
+        assert_eq!(repos.clips.total_storage_bytes().await.unwrap(), 35);
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            35
+        );
+        assert_eq!(
+            repos
+                .clips
+                .get(&clips[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_size_bytes,
+            Some(100)
+        );
+        repos.clips.delete(&clips[1].id).await.unwrap();
+        assert_eq!(repos.clips.total_storage_bytes().await.unwrap(), 10);
+        assert_eq!(
+            repos.clips.active_storage_bytes_by_owner().await.unwrap(),
+            vec![(user.id, 10)]
+        );
+    }
+}
+
+#[tokio::test]
 async fn identities_and_search_share_unicode_case_folding() {
     let (_directory, databases) = backends().await;
     for database in databases {

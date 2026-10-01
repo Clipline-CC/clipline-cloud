@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use argon2::{
     password_hash::{
@@ -119,9 +119,8 @@ impl AuthRuntime {
         }
     }
 
-    async fn hash_password(&self, password: String) -> Result<String, ApiError> {
-        let permit = self
-            .password_workers
+    fn acquire_password_worker(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.password_workers
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
@@ -129,7 +128,11 @@ impl AuthRuntime {
                     "password service is busy; retry shortly",
                     Duration::from_secs(1),
                 )
-            })?;
+            })
+    }
+
+    async fn hash_password(&self, password: String) -> Result<String, ApiError> {
+        let permit = self.acquire_password_worker()?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             hash_password(&password)
@@ -146,16 +149,18 @@ impl AuthRuntime {
         if password.len() > MAX_PASSWORD_LEN {
             return Ok(false);
         }
-        let permit = self
-            .password_workers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                ApiError::too_many_requests_after(
-                    "password service is busy; retry shortly",
-                    Duration::from_secs(1),
-                )
-            })?;
+        let permit = self.acquire_password_worker()?;
+        Self::verify_password_with_worker(password, password_hash, permit).await
+    }
+
+    async fn verify_password_with_worker(
+        password: String,
+        password_hash: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<bool, ApiError> {
+        if password.len() > MAX_PASSWORD_LEN {
+            return Ok(false);
+        }
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             verify_password(&password, &password_hash)
@@ -214,6 +219,10 @@ impl AuthRuntime {
         password: String,
         scope: &str,
     ) -> Result<bool, ApiError> {
+        // Admission failures must not consume an account's password budget.
+        // Keep this permit through reservation and hashing so availability
+        // cannot change between reserving an attempt and starting the worker.
+        let permit = self.acquire_password_worker()?;
         let now = now_utc();
         if let Some(until) = repositories
             .users
@@ -225,9 +234,8 @@ impl AuthRuntime {
                 (until - now).to_std().unwrap_or(Duration::from_secs(1)),
             ));
         }
-        let verified = self
-            .verify_password(password, user.password_hash.clone())
-            .await?;
+        let verified =
+            Self::verify_password_with_worker(password, user.password_hash.clone(), permit).await?;
         if verified {
             repositories
                 .users
@@ -2739,6 +2747,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn busy_password_workers_do_not_consume_account_attempts() {
+        let app = test_app().await;
+        let user = insert_user(&app.state, "worker-budget").await;
+        set_user_password(&app.state, &user.id, "correct-password").await;
+        let user = app
+            .state
+            .repositories
+            .users
+            .get(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let workers = app
+            .state
+            .auth
+            .password_workers
+            .clone()
+            .try_acquire_many_owned(PASSWORD_HASH_CONCURRENCY as u32)
+            .unwrap();
+        for scope in ["login", "reauth"] {
+            for _ in 0..LOGIN_USERNAME_MAX_FAILURES * 2 {
+                let error = app
+                    .state
+                    .auth
+                    .verify_account_password(&app.state.repositories, &user, "wrong".into(), scope)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(error.message(), "password service is busy; retry shortly");
+            }
+        }
+        drop(workers);
+        for scope in ["login", "reauth"] {
+            // Every real attempt remains available after the service recovers.
+            for _ in 0..LOGIN_USERNAME_MAX_FAILURES {
+                assert!(!app
+                    .state
+                    .auth
+                    .verify_account_password(&app.state.repositories, &user, "wrong".into(), scope,)
+                    .await
+                    .unwrap());
+            }
+            let error = app
+                .state
+                .auth
+                .verify_account_password(
+                    &app.state.repositories,
+                    &user,
+                    "correct-password".into(),
+                    scope,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.message(), "too many password attempts");
+        }
     }
 
     #[tokio::test]
