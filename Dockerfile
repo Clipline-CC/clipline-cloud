@@ -31,7 +31,7 @@ RUN test -s apps/clipline-cloud-web/dist/index.html \
   && test -s apps/clipline-cloud-web/dist/main.js \
   && test -s apps/clipline-cloud-web/dist/ui.css \
   && test -s apps/clipline-cloud-web/dist/tokens.css
-RUN cargo build --release -p clipline-cloud-server
+RUN cargo build --locked --release -j 2 -p clipline-cloud-server
 
 FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
 

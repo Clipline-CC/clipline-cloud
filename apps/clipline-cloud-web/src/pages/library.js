@@ -82,8 +82,8 @@ export function libraryParams(query) {
   for (const key of ["source_type", "visibility", "status", "q"]) {
     if (query[key]) params.set(key, query[key]);
   }
-  if (query.from) params.set("from", `${query.from}T00:00:00Z`);
-  if (query.to) params.set("to", `${query.to}T23:59:59Z`);
+  if (query.from) params.set("from", new Date(`${query.from}T00:00:00`).toISOString());
+  if (query.to) params.set("to", new Date(`${query.to}T23:59:59.999`).toISOString());
   const minDurationSeconds = toFiniteNumber(query.min_duration_seconds);
   if (minDurationSeconds != null) params.set("min_duration_ms", String(Math.round(minDurationSeconds * 1000)));
   const maxDurationSeconds = toFiniteNumber(query.max_duration_seconds);

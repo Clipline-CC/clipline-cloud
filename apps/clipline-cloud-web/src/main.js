@@ -52,9 +52,11 @@ function App() {
   const { ready, user } = useStore(session);
   const loginRedirect = ready && shouldRedirectToLogin(route.name, user);
   useEffect(() => {
-    if (loginRedirect) navigate("/login");
+    if (loginRedirect) navigate(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
   }, [loginRedirect]);
-  if ((!ready && !isPublicRouteName(route.name)) || loginRedirect) return html`<div class="boot">Loading…</div>`;
+  const passwordChangeRedirect = ready && user?.password_change_required && route.name !== "account";
+  useEffect(() => { if (passwordChangeRedirect) navigate("/account"); }, [passwordChangeRedirect]);
+  if ((!ready && !isPublicRouteName(route.name)) || loginRedirect || passwordChangeRedirect) return html`<div class="boot">Loading…</div>`;
   const Page = PAGES[route.name];
   const bare = route.name === "login" || route.name === "resetPassword";
   return html`<div class="ui" onClick=${onLinkClick}>
@@ -68,7 +70,7 @@ function App() {
 window.addEventListener("clipline:unauthorized", () => {
   setCsrfToken(null);
   session.set({ user: null, csrfToken: null, ready: true });
-  if (!isPublicRouteName(currentRouteName)) navigate("/login");
+  if (!isPublicRouteName(currentRouteName)) navigate(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
 });
 
 // Clear the static boot screen before mounting public pages immediately.

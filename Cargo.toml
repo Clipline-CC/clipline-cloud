@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/dain98/clipline-cloud"
+repository = "https://github.com/Clipline-CC/clipline-cloud"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -28,6 +28,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 cookie = "0.18"
 hmac = "0.12"
+http-body = "1"
 http-body-util = "0.1"
 lettre = { version = "0.11.22", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1-rustls-tls"] }
 libc = "0.2"

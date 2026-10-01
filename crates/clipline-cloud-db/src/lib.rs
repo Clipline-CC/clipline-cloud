@@ -120,6 +120,26 @@ impl Database {
         Ok(())
     }
 
+    pub async fn ping_writable(&self) -> DbResult<()> {
+        match self {
+            Self::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                sqlx::query("UPDATE app_settings SET id = id")
+                    .execute(&mut *tx)
+                    .await?;
+                tx.rollback().await?;
+            }
+            Self::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                sqlx::query("UPDATE app_settings SET id = id")
+                    .execute(&mut *tx)
+                    .await?;
+                tx.rollback().await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn table_names(&self) -> DbResult<Vec<String>> {
         match self {
             Self::Sqlite(pool) => {
@@ -174,6 +194,31 @@ async fn connect_sqlite(database_url: &str) -> DbResult<Database> {
         .max_connections(5)
         .after_connect(|connection, _metadata| {
             Box::pin(async move {
+                {
+                    let mut handle = connection.lock_handle().await?;
+                    // Register the same Unicode lowercasing Rust uses for category
+                    // names. SQLite's built-in LOWER handles only ASCII.
+                    let result = unsafe {
+                        libsqlite3_sys::sqlite3_create_function_v2(
+                            handle.as_raw_handle().as_ptr(),
+                            c"lower".as_ptr(),
+                            1,
+                            libsqlite3_sys::SQLITE_UTF8
+                                | libsqlite3_sys::SQLITE_DETERMINISTIC
+                                | libsqlite3_sys::SQLITE_INNOCUOUS,
+                            std::ptr::null_mut(),
+                            Some(unicode_lower),
+                            None,
+                            None,
+                            None,
+                        )
+                    };
+                    if result != libsqlite3_sys::SQLITE_OK {
+                        return Err(sqlx::Error::Protocol(
+                            "could not register Unicode LOWER".into(),
+                        ));
+                    }
+                }
                 connection.execute("PRAGMA foreign_keys = ON").await?;
                 connection.execute("PRAGMA busy_timeout = 5000").await?;
                 connection.execute("PRAGMA journal_mode = WAL").await?;
@@ -361,7 +406,7 @@ mod tests {
     use std::env;
     use tempfile::TempDir;
 
-    pub(super) async fn sqlite_test_database() -> (TempDir, Database) {
+    pub(crate) async fn sqlite_test_database() -> (TempDir, Database) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("clipline-test.db");
         let database_url = format!("sqlite://{}", db_path.display());
@@ -371,7 +416,7 @@ mod tests {
         (temp_dir, database)
     }
 
-    pub(super) async fn postgres_test_database() -> Option<Database> {
+    pub(crate) async fn postgres_test_database() -> Option<Database> {
         let database_url = match env::var("CLIPLINE_TEST_POSTGRES_URL") {
             Ok(value) if !value.trim().is_empty() => value,
             _ => return None,
@@ -446,6 +491,7 @@ mod tests {
             vec![
                 "app_settings",
                 "audit_log",
+                "auth_password_attempts",
                 "clip_comments",
                 "clip_markers",
                 "clips",
@@ -457,6 +503,7 @@ mod tests {
                 "maintenance_cursors",
                 "reset_password_tokens",
                 "sessions",
+                "upload_part_claims",
                 "upload_parts",
                 "upload_sessions",
                 "users",
@@ -1721,7 +1768,7 @@ mod tests {
         let mut failed = NewClip::new(&first_user.id, "failed", "local");
         failed.status = "failed".to_string();
         failed.file_size_bytes = Some(40);
-        repos.clips.create(&failed).await.expect("failed clip");
+        let failed = repos.clips.create(&failed).await.expect("failed clip");
 
         let mut deleted = NewClip::new(&first_user.id, "deleted", "local");
         deleted.status = "ready".to_string();
@@ -1750,7 +1797,7 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(usage.get(&first_user.id), Some(&30));
+        assert_eq!(usage.get(&first_user.id), Some(&150));
         assert_eq!(usage.get(&second_user.id), Some(&7));
         assert_eq!(usage.len(), 2);
         assert_eq!(
@@ -1759,6 +1806,29 @@ mod tests {
                 .active_storage_bytes_for_owner(&first_user.id)
                 .await
                 .expect("first owner storage"),
+            150
+        );
+        repos
+            .clips
+            .reserve_storage_bytes(&failed.id, 400)
+            .await
+            .unwrap();
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&first_user.id)
+                .await
+                .unwrap(),
+            510
+        );
+        repos.clips.delete(&deleted.id).await.unwrap();
+        repos.clips.delete(&failed.id).await.unwrap();
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&first_user.id)
+                .await
+                .unwrap(),
             30
         );
     }
@@ -2573,6 +2643,30 @@ mod tests {
             1
         );
 
+        repos.users.set_disabled(&user.id, true).await.unwrap();
+        for share_id in [format!("public-{test_id}"), format!("unlisted-{test_id}")] {
+            assert!(repos
+                .clips
+                .get_by_public_share_id(&share_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        params.owner_user_id = Some(user.id.clone());
+        assert!(repos.clips.list_public(&params).await.unwrap().is_empty());
+        assert!(repos.clips.list_public_games().await.unwrap().is_empty());
+        assert_eq!(
+            repos.clips.count_public_for_owner(&user.id).await.unwrap(),
+            0
+        );
+        repos.users.set_disabled(&user.id, false).await.unwrap();
+        assert!(repos
+            .clips
+            .get_by_public_share_id(&format!("public-{test_id}"))
+            .await
+            .unwrap()
+            .is_some());
+
         let view_count = repos
             .clips
             .increment_view_count(&public.id)
@@ -3169,6 +3263,37 @@ mod tests {
         out
     }
 }
+
+// SQLite invokes this on its connection worker with one valid argument.
+unsafe extern "C" fn unicode_lower(
+    ctx: *mut libsqlite3_sys::sqlite3_context,
+    _argc: i32,
+    argv: *mut *mut libsqlite3_sys::sqlite3_value,
+) {
+    use libsqlite3_sys::*;
+    let value = *argv;
+    if sqlite3_value_type(value) == SQLITE_NULL {
+        sqlite3_result_null(ctx);
+        return;
+    }
+    let data = sqlite3_value_text(value);
+    if data.is_null() {
+        sqlite3_result_error_nomem(ctx);
+        return;
+    }
+    let len = sqlite3_value_bytes(value) as usize;
+    let bytes = std::slice::from_raw_parts(data, len);
+    let lower = String::from_utf8_lossy(bytes).to_lowercase();
+    sqlite3_result_text(
+        ctx,
+        lower.as_ptr().cast(),
+        lower.len() as i32,
+        SQLITE_TRANSIENT(),
+    );
+}
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod optimization_tests;

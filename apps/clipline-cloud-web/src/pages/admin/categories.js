@@ -184,12 +184,13 @@ function AdminCategoryEditor({ data, reload, editing, categories }) {
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     const query = steamQuery.trim();
     setSearchBusy(true);
     setSearchError("");
     const timer = setTimeout(async () => {
       try {
-        const results = await api(`/api/v1/admin/game-categories/steamgriddb/search?q=${encodeURIComponent(query)}`);
+        const results = await api(`/api/v1/admin/game-categories/steamgriddb/search?q=${encodeURIComponent(query)}`, { signal: controller.signal });
         if (!cancelled) setSearchResults(results || []);
       } catch (error) {
         if (!cancelled) {
@@ -202,6 +203,7 @@ function AdminCategoryEditor({ data, reload, editing, categories }) {
     }, 300);
     return () => {
       cancelled = true;
+      controller.abort();
       clearTimeout(timer);
     };
   }, [data?.steamgriddb_configured, searchOpen, steamQuery]);
@@ -214,9 +216,10 @@ function AdminCategoryEditor({ data, reload, editing, categories }) {
     }
     const artworkKind = ARTWORK_SLOTS[activeArtworkSlot].kind;
     let cancelled = false;
+    const controller = new AbortController();
     setArtworkBusy(true);
     setArtworkError("");
-    api(`/api/v1/admin/game-categories/steamgriddb/games/${encodeURIComponent(steamGameId)}/artwork?kind=${encodeURIComponent(artworkKind)}`)
+    api(`/api/v1/admin/game-categories/steamgriddb/games/${encodeURIComponent(steamGameId)}/artwork?kind=${encodeURIComponent(artworkKind)}`, { signal: controller.signal })
       .then((results) => {
         if (!cancelled) setArtworkResults(results || []);
       })
@@ -231,6 +234,7 @@ function AdminCategoryEditor({ data, reload, editing, categories }) {
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [data?.steamgriddb_configured, steamGameId, activeArtworkSlot]);
 

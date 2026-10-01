@@ -24,7 +24,10 @@ use clipline_cloud_storage::{
 };
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex, Weak},
+};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
@@ -41,8 +44,54 @@ use crate::{
 
 // Acquired before reading any request body. The blocking worker retains
 // the same permit on cancellation, so abandoned blocking work stays bounded.
-static UPLOAD_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+// Preserve four-part clients while reserving capacity for another owner.
+static UPLOAD_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
+static OWNER_UPLOADS: LazyLock<OwnerUploadCapacity> = LazyLock::new(|| OwnerUploadCapacity::new(4));
 static ENRICHMENT_WORKERS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+struct OwnerUploadCapacity {
+    limit: usize,
+    owners: Mutex<HashMap<String, Weak<Semaphore>>>,
+}
+
+impl OwnerUploadCapacity {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            owners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(&self, owner_id: &str) -> Result<OwnedSemaphorePermit, ApiError> {
+        let semaphore = {
+            let mut owners = self
+                .owners
+                .lock()
+                .map_err(|_| ApiError::internal("upload capacity lock failed"))?;
+            owners.retain(|_, semaphore| semaphore.strong_count() > 0);
+            match owners.get(owner_id).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(self.limit));
+                    owners.insert(owner_id.to_string(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        semaphore.try_acquire_owned().map_err(|_| {
+            ApiError::too_many_requests_after(
+                "your upload capacity is busy",
+                std::time::Duration::from_secs(1),
+            )
+        })
+    }
+}
+
+struct UploadPermit {
+    // Return owner capacity before waking a waiter for global capacity.
+    _owner: OwnedSemaphorePermit,
+    _global: Arc<OwnedSemaphorePermit>,
+}
 
 #[derive(Clone)]
 struct UploadAdmission {
@@ -88,7 +137,7 @@ struct StagedUpload {
 async fn stage_upload(
     mut body: Body,
     expected_size: u64,
-    permit: Arc<OwnedSemaphorePermit>,
+    permit: Arc<UploadPermit>,
 ) -> Result<StagedUpload, ApiError> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
     let worker = tokio::task::spawn_blocking(move || {
@@ -155,14 +204,34 @@ const MAX_TITLE_LEN: usize = 300;
 const MAX_DESCRIPTION_LEN: usize = 10_000;
 const MAX_CLIENT_CLIP_ID_LEN: usize = 255;
 
-fn schedule_automatic_game_category_enrichment(state: AppState, category: NewGameCategory) {
+fn schedule_automatic_game_category_enrichment(
+    state: AppState,
+    category: NewGameCategory,
+    user_id: &str,
+) {
     if !steamgriddb::configured(&state.config) {
         return;
     }
     let Ok(permit) = ENRICHMENT_WORKERS.try_acquire() else {
-        warn!(event = "game_category.auto_enrichment_capacity", category_id = %category.id);
         return;
     };
+    if crate::limits::check(
+        "enrichment-user",
+        user_id,
+        10,
+        std::time::Duration::from_secs(3600),
+    )
+    .is_err()
+        || crate::limits::check(
+            "enrichment-global",
+            "all",
+            100,
+            std::time::Duration::from_secs(3600),
+        )
+        .is_err()
+    {
+        return;
+    }
     tokio::spawn(async move {
         let _permit = permit;
         enrich_new_game_category(&state, category).await;
@@ -431,7 +500,7 @@ async fn create_upload(
     };
     if let Some(category) = bundle.created_game_category {
         state.invalidate_game_category_map().await;
-        schedule_automatic_game_category_enrichment(state.clone(), category);
+        schedule_automatic_game_category_enrichment(state.clone(), category, &auth.user.id);
     }
     let session = state
         .repositories
@@ -483,7 +552,11 @@ async fn put_content(
     }
 
     let expected_size = expected_size(&session)?;
-    let staged = stage_upload(body, expected_size, permit).await?;
+    let permit = Arc::new(UploadPermit {
+        _global: permit,
+        _owner: OWNER_UPLOADS.acquire(&auth.user.id)?,
+    });
+    let staged = stage_upload(body, expected_size, permit.clone()).await?;
     let checksum = staged.checksum.clone();
     if Some(checksum.as_str()) != session.checksum_sha256.as_deref() {
         return Err(ApiError::bad_request("whole-file SHA-256 mismatch"));
@@ -538,7 +611,11 @@ async fn put_part(
 
     let expected = expected_size_for_part(&session, part_number)?;
     validate_part_size(&state.config, &session, part_number, expected)?;
-    let staged = stage_upload(body, expected, permit).await?;
+    let permit = Arc::new(UploadPermit {
+        _global: permit,
+        _owner: OWNER_UPLOADS.acquire(&auth.user.id)?,
+    });
+    let staged = stage_upload(body, expected, permit.clone()).await?;
     let checksum = staged.checksum.clone();
     if let Some(supplied_checksum) = optional_checksum_header(&headers)? {
         if supplied_checksum != checksum {
@@ -564,6 +641,40 @@ async fn put_part(
         ));
     }
 
+    let claim = clipline_cloud_db::new_ulid();
+    if !state
+        .repositories
+        .upload_parts
+        .claim_write(&session.id, i64::from(part_number), &claim)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "this part is already being uploaded; retry shortly",
+        ));
+    }
+    // Recheck after obtaining the cross-process claim: the first writer may
+    // have committed between our initial lookup and this claim.
+    if let Some(existing) = state
+        .repositories
+        .upload_parts
+        .get(&session.id, i64::from(part_number))
+        .await?
+    {
+        state
+            .repositories
+            .upload_parts
+            .release_write(&session.id, i64::from(part_number), &claim)
+            .await?;
+        if existing.checksum_sha256.as_deref() == Some(checksum.as_str())
+            && existing.size_bytes == staged.size as i64
+        {
+            return Ok(Json(part_response(&session.id, &existing, true)));
+        }
+        return Err(ApiError::conflict(
+            "part number already exists with a different checksum",
+        ));
+    }
+
     let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
     let uploaded_part = state
         .storage
@@ -579,6 +690,11 @@ async fn put_part(
     new_part.checksum_sha256 = Some(checksum);
     new_part.etag = Some(uploaded_part.etag);
     let part = state.repositories.upload_parts.upsert(&new_part).await?;
+    state
+        .repositories
+        .upload_parts
+        .release_write(&session.id, i64::from(part_number), &claim)
+        .await?;
     let received_size = state
         .repositories
         .upload_parts
@@ -630,6 +746,7 @@ async fn create_direct_part_url(
             storage_upload_id,
             &key,
             part_number,
+            expected_size_for_part(&session, part_number)?,
             DIRECT_UPLOAD_PART_URL_TTL,
         )
         .await
@@ -756,14 +873,28 @@ async fn complete_upload(
     {
         Ok(metadata) => metadata,
         Err(error) => {
+            let permanent = matches!(&error, StorageError::InvalidPart(_))
+                || matches!(&error, StorageError::S3(message) if ["InvalidPart", "EntityTooSmall", "InvalidPartOrder", "BadDigest"].iter().any(|code| message.contains(code)));
+            if permanent {
+                mark_upload_failed(&state, &session, "multipart upload contains invalid parts")
+                    .await?;
+                return Err(ApiError::conflict(
+                    "multipart upload contains invalid parts; abort and restart the upload",
+                ));
+            }
             if !should_try_completion_reconciliation(&error) {
                 return Err(storage_error(error));
             }
             match state.storage.head_object(&key).await {
                 Ok(metadata) if metadata.size_bytes == expected_size => metadata,
-                Ok(_) => {
+                Ok(metadata) => {
                     let reason =
                         "stored object exists but size does not match expected upload size";
+                    state
+                        .repositories
+                        .clips
+                        .reserve_storage_bytes(&session.clip_id, metadata.size_bytes as i64)
+                        .await?;
                     mark_upload_failed(&state, &session, reason).await?;
                     return Err(ApiError::conflict(reason));
                 }
@@ -774,6 +905,11 @@ async fn complete_upload(
 
     if metadata.size_bytes != expected_size {
         let reason = "completed object size does not match expected upload size";
+        state
+            .repositories
+            .clips
+            .reserve_storage_bytes(&session.clip_id, metadata.size_bytes as i64)
+            .await?;
         mark_upload_failed(&state, &session, reason).await?;
         return Err(ApiError::conflict(reason));
     }
@@ -783,7 +919,6 @@ async fn complete_upload(
             .await
             .map_err(storage_error)?;
         if Some(checksum.as_str()) != session.checksum_sha256.as_deref() {
-            let _ = state.storage.delete_object(&key).await;
             let reason = "completed local object SHA-256 does not match expected upload checksum";
             mark_upload_failed(&state, &session, reason).await?;
             return Err(ApiError::conflict(reason));
@@ -879,6 +1014,19 @@ async fn load_existing_idempotent_session(
             "idempotent upload is being created; retry this request",
         ));
     };
+    if existing_session.status == "failed" {
+        state
+            .repositories
+            .abort_upload(&existing_session.id, &existing_clip.id)
+            .await?;
+        if let Ok(key) = ObjectKey::parse(&existing_session.storage_key) {
+            if let Some(upload_id) = &existing_session.storage_upload_id {
+                let _ = state.storage.abort_multipart_upload(upload_id, &key).await;
+            }
+            let _ = state.storage.delete_object(&key).await;
+        }
+        return Ok(None);
+    }
     Ok(Some(existing_session))
 }
 
@@ -1628,6 +1776,17 @@ async fn mark_upload_failed(
             clip_id = %session.clip_id,
         );
     }
+    let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
+    if let Some(upload_id) = session.storage_upload_id.as_deref() {
+        if let Err(error) = state.storage.abort_multipart_upload(upload_id, &key).await {
+            warn!(event = "api.failed_upload_multipart_cleanup_failed", upload_id = %session.id, error = %error);
+        }
+    }
+    if let Err(error) = state.storage.delete_object(&key).await {
+        if !matches!(error, StorageError::NotFound(_)) {
+            warn!(event = "api.failed_upload_object_cleanup_failed", upload_id = %session.id, error = %error);
+        }
+    }
     Ok(())
 }
 
@@ -1834,6 +1993,186 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    async fn bearer_headers(state: &AppState, user_id: &str) -> HeaderMap {
+        let token = format!("upload-test-{}", clipline_cloud_db::new_ulid());
+        state
+            .repositories
+            .device_tokens
+            .create(&clipline_cloud_db::NewDeviceToken::new(
+                user_id,
+                "test",
+                sha256_hex(token.as_bytes()),
+            ))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn uploads_check_ownership_before_reading_bodies() {
+        use clipline_cloud_db::NewUser;
+        use tower::ServiceExt;
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        let owner = state
+            .repositories
+            .users
+            .create(&NewUser::new("owner", "hash", "user"))
+            .await
+            .unwrap();
+        let other = state
+            .repositories
+            .users
+            .create(&NewUser::new("other", "hash", "user"))
+            .await
+            .unwrap();
+        let keys = MediaObjectKeys::generate().unwrap();
+        let clip = state
+            .repositories
+            .clips
+            .create(&NewClip::new(&owner.id, "clip", "local"))
+            .await
+            .unwrap();
+        let session = state
+            .repositories
+            .upload_sessions
+            .create(&NewUploadSession::new(
+                &clip.id,
+                &owner.id,
+                2,
+                keys.source.as_str(),
+                now_utc() + ChronoDuration::hours(1),
+            ))
+            .await
+            .unwrap();
+        let headers = bearer_headers(&state, &other.id).await;
+        let app = routes(crate::upload_request_body_limit(&state.config)).with_state(state);
+        for suffix in ["content", "parts/1"] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/uploads/{}/{suffix}", session.id))
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(crate::tests::unreadable_body())
+                .unwrap();
+            *request.headers_mut() = headers.clone();
+            request
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_completed_objects_are_deleted_and_keep_their_quota() {
+        use clipline_cloud_db::NewUser;
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        state.storage.probe().await.unwrap();
+        let user = state
+            .repositories
+            .users
+            .create(&NewUser::new("uploader", "hash", "user"))
+            .await
+            .unwrap();
+        let headers = bearer_headers(&state, &user.id).await;
+        for oversized in [false, true] {
+            let keys = MediaObjectKeys::generate().unwrap();
+            let mut new_clip = NewClip::new(&user.id, "clip", "local");
+            new_clip.file_size_bytes = Some(2);
+            new_clip.storage_key = Some(keys.source.as_str().to_string());
+            let clip = state.repositories.clips.create(&new_clip).await.unwrap();
+            let storage_id = state
+                .storage
+                .create_multipart_upload(&keys.source)
+                .await
+                .unwrap();
+            let uploaded = state
+                .storage
+                .upload_part(&storage_id, &keys.source, 1, Bytes::from_static(b"ok"))
+                .await
+                .unwrap();
+            let mut new_session = NewUploadSession::new(
+                &clip.id,
+                &user.id,
+                2,
+                keys.source.as_str(),
+                now_utc() + ChronoDuration::hours(1),
+            );
+            new_session.storage_upload_id = Some(storage_id.clone());
+            new_session.part_size_bytes = Some(2);
+            new_session.checksum_sha256 = Some("0".repeat(64));
+            let session = state
+                .repositories
+                .upload_sessions
+                .create(&new_session)
+                .await
+                .unwrap();
+            let mut part = NewUploadPart::new(&session.id, 1, 2);
+            part.etag = Some(uploaded.etag);
+            part.checksum_sha256 = Some(sha256_hex(b"ok"));
+            state.repositories.upload_parts.upsert(&part).await.unwrap();
+            if oversized {
+                // Simulate reconciliation after S3 completed an object with a false size acknowledgment.
+                state
+                    .storage
+                    .abort_multipart_upload(&storage_id, &keys.source)
+                    .await
+                    .unwrap();
+                state
+                    .storage
+                    .put_object(
+                        &keys.source,
+                        Bytes::from_static(b"oversized"),
+                        PutObjectMetadata::new("video/mp4"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let error = complete_upload(
+                State(state.clone()),
+                headers.clone(),
+                Path(session.id.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            assert!(!state.storage.object_exists(&keys.source).await.unwrap());
+            assert_eq!(
+                state
+                    .repositories
+                    .upload_sessions
+                    .get(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+            let clip = state
+                .repositories
+                .clips
+                .get(&clip.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(clip.status, "failed");
+            assert_eq!(clip.file_size_bytes, Some(if oversized { 9 } else { 2 }));
+        }
+        assert_eq!(
+            state
+                .repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            11
+        );
+    }
+
     fn session(part_size_bytes: i64, expected_size_bytes: i64) -> UploadSession {
         let now = now_utc();
         UploadSession {
@@ -1939,9 +2278,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_owner_cannot_occupy_all_upload_capacity() {
+        let workers = Arc::new(Semaphore::new(8));
+        let owners = OwnerUploadCapacity::new(4);
+        let mut occupied = Vec::new();
+        for _ in 0..4 {
+            occupied.push(UploadPermit {
+                _global: Arc::new(workers.clone().try_acquire_owned().unwrap()),
+                _owner: owners.acquire("slow-owner").unwrap(),
+            });
+        }
+        assert_eq!(
+            owners.acquire("slow-owner").unwrap_err().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for _ in 0..4 {
+            occupied.push(UploadPermit {
+                _global: Arc::new(workers.clone().try_acquire_owned().unwrap()),
+                _owner: owners.acquire("other-owner").unwrap(),
+            });
+        }
+        assert_eq!(workers.available_permits(), 0);
+        drop(occupied);
+        for index in 0..1000 {
+            drop(owners.acquire(&format!("owner-{index}")).unwrap());
+        }
+        assert_eq!(owners.owners.lock().unwrap().len(), 1);
+        assert_eq!(workers.available_permits(), 8);
+    }
+
+    async fn staging_permit(workers: &Arc<Semaphore>) -> Arc<UploadPermit> {
+        Arc::new(UploadPermit {
+            _global: Arc::new(workers.clone().acquire_owned().await.unwrap()),
+            _owner: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+        })
+    }
+
+    #[tokio::test]
     async fn streamed_upload_checks_size_checksum_and_removes_scratch() {
         let workers = Arc::new(Semaphore::new(1));
-        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let permit = staging_permit(&workers).await;
         let staged = stage_upload(Body::from("streamed upload"), 15, permit)
             .await
             .unwrap();
@@ -1951,7 +2327,7 @@ mod tests {
         drop(staged);
         assert!(!path.exists());
         for expected in [10, 20] {
-            let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+            let permit = staging_permit(&workers).await;
             let error = stage_upload(Body::from("streamed upload"), expected, permit)
                 .await
                 .err()
@@ -1963,7 +2339,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_upload_releases_worker_and_admission_permit() {
         let workers = Arc::new(Semaphore::new(1));
-        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let owners = OwnerUploadCapacity::new(1);
+        let permit = Arc::new(UploadPermit {
+            _global: Arc::new(workers.clone().acquire_owned().await.unwrap()),
+            _owner: owners.acquire("cancelled-owner").unwrap(),
+        });
         let (_writer, reader) = tokio::io::duplex(1024);
         let task = tokio::spawn(stage_upload(
             Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
@@ -1978,6 +2358,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(owners.acquire("cancelled-owner").is_ok());
     }
 
     #[test]

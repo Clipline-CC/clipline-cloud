@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -13,15 +14,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Install media test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Test workspace
         run: cargo test --workspace --locked
 
@@ -30,9 +33,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
@@ -43,9 +46,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Install web deps
@@ -62,22 +65,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Validate Compose profiles
         run: CONFIG_ONLY=1 BUILD_IMAGE=0 deploy/compose/smoke.sh
       - name: Verify standalone image matches the server version
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' apps/clipline-cloud-server/Cargo.toml | head -n 1)"
           test -n "$version"
-          grep -F "ghcr.io/dain98/clipline-cloud:$version" deploy/compose/docker-compose.standalone.yml
-          grep -F "ghcr.io/dain98/clipline-cloud:$version" deploy/compose/standalone.env.example
+          grep -F "ghcr.io/clipline-cc/clipline-cloud:$version" deploy/compose/docker-compose.standalone.yml
+          grep -F "ghcr.io/clipline-cc/clipline-cloud:$version" deploy/compose/standalone.env.example
 
   compose-runtime:
     name: Compose Runtime Smoke
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Exercise local, MinIO, and Postgres profiles
         run: RUN_PROFILES="default minio postgres" deploy/compose/smoke.sh
 
@@ -86,9 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Build MinIO test images from pinned source
         run: |
           docker build --target minio -t clipline-minio:local deploy/compose/minio
@@ -122,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
         env:
           POSTGRES_USER: clipline
           POSTGRES_PASSWORD: clipline
@@ -138,8 +141,8 @@ jobs:
       CLIPLINE_TEST_POSTGRES_URL: postgres://clipline:clipline@localhost:5432/clipline_test
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Test SQLite and Postgres repositories
         run: cargo test --locked -p clipline-cloud-db

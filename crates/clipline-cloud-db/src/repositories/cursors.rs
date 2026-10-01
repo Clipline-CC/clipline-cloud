@@ -86,9 +86,10 @@ impl ClipCursor {
 }
 
 macro_rules! cursor_filter {
-    ($name:ident, $backend:ty) => {
+    ($name:ident, $backend:ty, $title:expr) => {
         pub(super) fn $name(builder: &mut QueryBuilder<'_, $backend>, cursor: &ClipCursor) {
             let (column, ascending, nullable) = sort_spec(cursor.sort);
+            let column = if column == "title" { $title } else { column };
             let comparison = if ascending { " > " } else { " < " };
             let is_null = matches!(cursor.value, CursorValue::Null);
             if nullable {
@@ -129,5 +130,5 @@ macro_rules! cursor_filter {
     };
 }
 
-cursor_filter!(push_cursor_sqlite, Sqlite);
-cursor_filter!(push_cursor_postgres, Postgres);
+cursor_filter!(push_cursor_sqlite, Sqlite, "title COLLATE BINARY");
+cursor_filter!(push_cursor_postgres, Postgres, "title COLLATE \"C\"");

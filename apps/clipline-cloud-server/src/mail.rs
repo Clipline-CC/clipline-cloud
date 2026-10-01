@@ -7,14 +7,14 @@ use lettre::{
 };
 use url::Url;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct InviteEmail {
     pub(crate) to_email: String,
     pub(crate) invite_url: String,
     pub(crate) expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SmtpInviteConfig {
     pub(crate) host: String,
     pub(crate) port: u16,
@@ -120,6 +120,12 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+impl std::fmt::Debug for SmtpInviteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpInviteConfig").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

@@ -81,7 +81,15 @@ function AuthShell({ titleId, children }) {
   </div>`;
 }
 
-export function LoginPage() {
+export function safeLoginReturn(value) {
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/library";
+  const url = new URL(value, "https://clipline.invalid");
+  if (url.origin !== "https://clipline.invalid" || url.pathname === "/login") return "/library";
+  return url.pathname + url.search + url.hash;
+}
+
+export function LoginPage({ route = {} }) {
+  const returnTo = safeLoginReturn(route.returnTo);
   const { user } = useStore(session);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -90,7 +98,7 @@ export function LoginPage() {
 
   // Signed-in visitors have no use for the login form.
   useEffect(() => {
-    if (user) navigate("/library");
+    if (user) navigate(user.password_change_required ? "/account" : returnTo);
   }, [user]);
 
   if (user) return null;
@@ -107,7 +115,7 @@ export function LoginPage() {
       });
       setCsrfToken(data.csrf_token);
       session.set({ user: data.user, csrfToken: data.csrf_token, ready: true });
-      navigate("/library");
+      navigate(data.user.password_change_required ? "/account" : returnTo);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Sign in failed");
       setBusy(false);

@@ -47,6 +47,8 @@ pub enum CloudApiError {
     Worker(String),
     #[error("request body is inconsistent with declared upload metadata: {0}")]
     InvalidUpload(String),
+    #[error("path identifier must be nonempty and cannot be '.' or '..'")]
+    InvalidPathIdentifier,
 }
 
 pub type CloudApiResult<T> = Result<T, CloudApiError>;
@@ -133,11 +135,19 @@ impl CloudClient {
     }
 
     pub async fn get_upload(&self, upload_id: &str) -> CloudApiResult<UploadProgressResponse> {
-        self.get(&format!("/api/v1/uploads/{upload_id}")).await
+        self.get(&format!(
+            "/api/v1/uploads/{encoded_upload_id}",
+            encoded_upload_id = encode_path_segment(upload_id)?
+        ))
+        .await
     }
 
     pub async fn get_clip(&self, clip_id: &str) -> CloudApiResult<ClipDetailResponse> {
-        self.get(&format!("/api/v1/clips/{clip_id}")).await
+        self.get(&format!(
+            "/api/v1/clips/{encoded_clip_id}",
+            encoded_clip_id = encode_path_segment(clip_id)?
+        ))
+        .await
     }
 
     pub async fn list_clips(&self, request: &ListClipsRequest) -> CloudApiResult<ClipListResponse> {
@@ -154,7 +164,10 @@ impl CloudClient {
         visibility: impl Into<String>,
     ) -> CloudApiResult<ClipDetailResponse> {
         self.post_json(
-            &format!("/api/v1/clips/{clip_id}/visibility"),
+            &format!(
+                "/api/v1/clips/{encoded_clip_id}/visibility",
+                encoded_clip_id = encode_path_segment(clip_id)?
+            ),
             &UpdateVisibilityRequest {
                 visibility: visibility.into(),
             },
@@ -168,7 +181,10 @@ impl CloudClient {
         bytes: impl Into<Bytes>,
     ) -> CloudApiResult<UploadProgressResponse> {
         self.put_body(
-            &format!("/api/v1/uploads/{upload_id}/content"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/content",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             bytes.into(),
             None,
         )
@@ -187,7 +203,10 @@ impl CloudClient {
             .await
             .map_err(|error| CloudApiError::Worker(error.to_string()))?;
         self.put_body(
-            &format!("/api/v1/uploads/{upload_id}/parts/{part_number}"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/parts/{part_number}",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             bytes,
             Some(checksum),
         )
@@ -196,7 +215,10 @@ impl CloudClient {
 
     pub async fn complete_upload(&self, upload_id: &str) -> CloudApiResult<UploadProgressResponse> {
         self.post_json(
-            &format!("/api/v1/uploads/{upload_id}/complete"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/complete",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             &serde_json_value_empty(),
         )
         .await
@@ -331,12 +353,9 @@ impl CloudClient {
             on_progress(&progress);
             return Ok(progress);
         }
-        if upload.mode != "chunked"
-            || upload.part_size_bytes == 0
-            || upload.part_size_bytes > 64 * 1024 * 1024
-        {
+        if upload.mode != "chunked" || upload.part_size_bytes == 0 {
             return Err(CloudApiError::InvalidUpload(
-                "file uploads require a supported mode and parts of at most 64 MiB".into(),
+                "file uploads require a supported mode and a nonzero part size".into(),
             ));
         }
         for batch in progress.missing_parts.chunks(4) {
@@ -358,13 +377,9 @@ impl CloudClient {
                         .ok_or_else(|| {
                             CloudApiError::InvalidUpload("invalid part offset".into())
                         })?;
-                    let count = (size - offset).min(upload.part_size_bytes) as usize;
-                    let mut file = tokio::fs::File::open(path).await?;
-                    file.seek(SeekFrom::Start(offset)).await?;
-                    let mut bytes = vec![0; count];
-                    file.read_exact(&mut bytes).await?;
+                    let count = (size - offset).min(upload.part_size_bytes);
                     client
-                        .put_upload_part(&upload, part_number, Bytes::from(bytes))
+                        .put_upload_file_part(&upload, part_number, &path, offset, count)
                         .await
                 });
             }
@@ -394,17 +409,97 @@ impl CloudClient {
         let checksum = tokio::task::spawn_blocking(move || sha256_hex(&hash_bytes))
             .await
             .map_err(|error| CloudApiError::Worker(error.to_string()))?;
+        self.put_direct_part_body(
+            upload,
+            part_number,
+            size_bytes,
+            checksum,
+            reqwest::Body::from(bytes),
+        )
+        .await
+    }
+
+    async fn put_upload_file_part(
+        &self,
+        upload: &CreateUploadResponse,
+        part_number: u16,
+        path: &Path,
+        offset: u64,
+        size_bytes: u64,
+    ) -> CloudApiResult<PartUploadResponse> {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let mut remaining = size_bytes;
+        while remaining > 0 {
+            let limit = remaining.min(buffer.len() as u64) as usize;
+            let read = file.read(&mut buffer[..limit]).await?;
+            if read == 0 {
+                return Err(CloudApiError::InvalidUpload(
+                    "file ended before the expected part size".into(),
+                ));
+            }
+            digest.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        let checksum = format!("{:x}", digest.finalize());
+        file.seek(SeekFrom::Start(offset)).await?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file.take(size_bytes)));
+        if upload.direct_part_presign_url_template.is_some()
+            && upload.direct_part_ack_url_template.is_some()
+        {
+            return self
+                .put_direct_part_body(upload, part_number, size_bytes, checksum, body)
+                .await;
+        }
+        self.send_json(
+            self.request(
+                reqwest::Method::PUT,
+                &format!(
+                    "/api/v1/uploads/{encoded_upload_id}/parts/{part_number}",
+                    encoded_upload_id = encode_path_segment(&upload.upload_id)?
+                ),
+            )?
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, size_bytes)
+            .header(PART_SHA256_HEADER, checksum)
+            .body(body),
+        )
+        .await
+    }
+
+    async fn put_direct_part_body(
+        &self,
+        upload: &CreateUploadResponse,
+        part_number: u16,
+        size_bytes: u64,
+        checksum: String,
+        body: reqwest::Body,
+    ) -> CloudApiResult<PartUploadResponse> {
         let presigned: types::DirectPartUploadUrlResponse = self
             .post_json(
                 &format!(
                     "/api/v1/uploads/{}/parts/{part_number}/presign",
-                    upload.upload_id
+                    encode_path_segment(&upload.upload_id)?
                 ),
                 &serde_json_value_empty(),
             )
             .await?;
         // This request has no Clipline credential: S3 receives only its signed URL and advertised headers.
-        let mut request = self.http.put(&presigned.url).body(bytes);
+        if presigned.expected_size_bytes != size_bytes {
+            return Err(CloudApiError::InvalidUpload(
+                "signed part size does not match file part".into(),
+            ));
+        }
+        let signed_content_length = presigned
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"));
+        let mut request = self.http.put(&presigned.url).body(body);
+        if !signed_content_length {
+            request = request.header(header::CONTENT_LENGTH, size_bytes);
+        }
         for header in presigned.headers {
             request = request.header(header.name, header.value);
         }
@@ -426,7 +521,7 @@ impl CloudClient {
         self.post_json(
             &format!(
                 "/api/v1/uploads/{}/parts/{part_number}/ack",
-                upload.upload_id
+                encode_path_segment(&upload.upload_id)?
             ),
             &types::DirectPartUploadAckRequest {
                 etag,
@@ -638,12 +733,41 @@ fn serde_json_value_empty() -> serde_json::Value {
     serde_json::json!({})
 }
 
+fn encode_path_segment(value: &str) -> CloudApiResult<String> {
+    if matches!(value, "" | "." | "..") {
+        return Err(CloudApiError::InvalidPathIdentifier);
+    }
+    Ok(url::form_urlencoded::byte_serialize(value.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20"))
+}
+
 #[cfg(test)]
 mod upload_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_identifiers_keep_reserved_characters_in_one_segment() {
+        let client = CloudClient::new(Url::parse("https://clips.example.com").unwrap());
+        let path = format!(
+            "/api/v1/clips/{}",
+            encode_path_segment("a/b #Über").unwrap()
+        );
+        let request = client
+            .request(reqwest::Method::GET, &path)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.url().path(), "/api/v1/clips/a%2Fb%20%23%C3%9Cber");
+        assert!(request.url().query().is_none());
+        assert!(request.url().fragment().is_none());
+        for value in ["", ".", ".."] {
+            assert!(encode_path_segment(value).is_err());
+        }
+    }
 
     #[test]
     fn credential_debug_is_redacted_without_changing_wire_format() {
@@ -665,6 +789,7 @@ mod tests {
         let user_wire = serde_json::json!({
             "id": "user-1", "username": "alice", "display_name": null, "email": null,
             "bio": null, "avatar_url": null, "role": "user", "is_disabled": false,
+                "password_change_required": false,
             "storage_bytes": 0, "storage_quota_bytes": null,
             "created_at": "2026-09-30T00:00:00Z", "updated_at": "2026-09-30T00:00:00Z",
             "last_login_at": null
@@ -673,6 +798,9 @@ mod tests {
             "user": user_wire, "auth_kind": "session", "csrf_token": secret
         });
         let me: MeResponse = serde_json::from_value(me_wire.clone()).expect("me response");
+        let changed_wire = serde_json::json!({"status": "ok", "csrf_token": secret});
+        let changed: types::ChangePasswordResponse =
+            serde_json::from_value(changed_wire.clone()).unwrap();
         let connected = ConnectedCloud {
             client: CloudClient::with_device_token(
                 Url::parse(&format!(
@@ -697,6 +825,7 @@ mod tests {
             format!("{request:?}"),
             format!("{token:?}"),
             format!("{me:?}"),
+            format!("{changed:?}"),
             format!("{:?}", connected.client),
             format!("{connected:#?}"),
         ] {
@@ -708,6 +837,7 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(token).expect("token JSON"), token_wire);
         assert_eq!(serde_json::to_value(me).expect("me JSON"), me_wire);
+        assert_eq!(serde_json::to_value(changed).unwrap(), changed_wire);
     }
 
     #[test]

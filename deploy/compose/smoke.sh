@@ -255,7 +255,13 @@ admin_password_for_profile() {
 
   case "$profile" in
     default|minio)
-      generated_admin_password "$project" "$file"
+      # Generated credentials are restricted to password setup. Use the
+      # operator recovery command to install the fixture before device login.
+      local fixture_password="clipline-smoke-admin-password"
+      compose "$project" "$file" exec -T clipline-cloud env \
+        CLIPLINE_ADMIN_RESET_PASSWORD="$fixture_password" \
+        /usr/local/bin/clipline-cloud-server admin reset-password >/dev/null
+      printf '%s\n' "$fixture_password"
       ;;
     *)
       tr -d '\r\n' < "$SECRET_DIR/admin_password.txt"

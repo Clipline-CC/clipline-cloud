@@ -177,7 +177,7 @@ async fn assert_cursor_and_search_results(database: Database) {
             let pattern = format!(
                 "%{}%",
                 query
-                    .to_ascii_lowercase()
+                    .to_lowercase()
                     .replace('\\', "\\\\")
                     .replace('%', "\\%")
                     .replace('_', "\\_")

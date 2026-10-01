@@ -14,7 +14,7 @@ function publicRouteQuery(params) {
     sort: params.get("sort") || "uploaded_at_desc",
     game: params.get("game") || "",
     q: params.get("q") || "",
-    page: Number.isFinite(page) ? Math.max(1, page) : 1,
+    page: Number.isSafeInteger(page) ? Math.max(1, page) : 1,
     ...(params.get("cursor") ? { cursor: params.get("cursor") } : {}),
   };
 }
@@ -107,7 +107,7 @@ export function parseRoute(pathname, search) {
     return { name: "profile" };
   }
   if (path === "/login") {
-    return { name: "login" };
+    return { name: "login", returnTo: params.get("return_to") };
   }
   if (path === "/reset-password") {
     return {

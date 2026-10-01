@@ -46,10 +46,10 @@ test("libraryParams passes through the simple string filter keys", () => {
   assert.equal(params.get("q"), "clutch");
 });
 
-test("libraryParams appends UTC day boundaries to from/to dates", () => {
+test("libraryParams appends local day boundaries to from/to dates", () => {
   const params = libraryParams({ ...DEFAULT_LIBRARY_QUERY, from: "2026-01-01", to: "2026-01-31" });
-  assert.equal(params.get("from"), "2026-01-01T00:00:00Z");
-  assert.equal(params.get("to"), "2026-01-31T23:59:59Z");
+  assert.equal(params.get("from"), "2026-01-01T00:00:00.000Z");
+  assert.equal(params.get("to"), "2026-01-31T23:59:59.999Z");
 });
 
 test("libraryParams converts duration seconds to milliseconds", () => {
@@ -190,4 +190,14 @@ test("bulkShareLinks skips private clips and can fall back to public_share_id", 
     ),
     ["http://127.0.0.1:18080/c/c%20fallback"]
   );
+});
+
+test("libraryParams uses the local DST day, including its shorter duration", () => {
+  const previous = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const params = libraryParams({ from: "2026-03-08", to: "2026-03-08" });
+    assert.equal(params.get("from"), "2026-03-08T05:00:00.000Z");
+    assert.equal(params.get("to"), "2026-03-09T03:59:59.999Z");
+  } finally { if (previous === undefined) delete process.env.TZ; else process.env.TZ = previous; }
 });

@@ -14,7 +14,7 @@ fixtures and disposable services. They are not a production load profile.
 | Duplicate serving metadata | HTTP handlers pass HEAD metadata into streaming. S3 GET uses `If-Match`; local streaming checks the opened file's size and modification time. A detected replacement returns 409 for retry. Local storage skips the read-URL attempt; range and conditional response handling remain intact. |
 | Substring search | PostgreSQL uses maintained trigram GIN indexes. SQLite uses a normalized, case-sensitive, contentless FTS5 trigram index with mutation triggers to find candidates, then the original escaped LIKE predicates verify exact results. Short and NUL-containing queries use LIKE directly. Category display-name candidates join current category mappings. |
 | Pagination and repeated totals | Cursor pagination covers all 14 sorts, both directions, ties, and NULL segments. New owner page/totals endpoints allow rendering without waiting for aggregates. The library caches totals for 30 seconds across matching pages and invalidates on its mutations. Quota checks retain authoritative database reads. |
-| Upload buffering and hashing | Four upload permits per web process are acquired by middleware before body consumption. Uploads stream in bounded chunks to temporary files; a bounded blocking worker hashes and writes them. Local/S3 part-file operations avoid collecting complete bodies. Cancellation retains a permit until the blocking worker exits. Local multipart completion hashes parts while copying and preserves atomic rename and final checksum verification. |
+| Upload buffering and hashing | Eight upload permits per web process are acquired by middleware before body consumption, with a four-upload owner limit after authentication. Uploads stream in bounded chunks to temporary files; a bounded blocking worker hashes and writes them. Local/S3 part-file operations avoid collecting complete bodies. Cancellation retains the permits until the blocking worker exits. Local multipart completion hashes parts while copying and preserves atomic rename and final checksum verification. |
 | Frontend requests | Public routes mount while authentication resolves; protected routes and edit controls retain authentication gating. Visibility changes use one atomic bulk endpoint with returned sharing data; undo groups original visibility values into at most three atomic requests. Admin panels fetch their own resources and cache other visited panels, invalidating after mutations. Checked-in distribution assets are rebuilt. |
 | Incremental maintenance | Object inventories use pages of at most 1,000 objects; source checks and deleted clips use batches of 100. Cursors and completed-subtask flags persist in the database. Incomplete sweeps continue after one second; completed cycles wait 30 minutes. Orphan deletion has concurrency four, a one-hour grace period, and a fresh reference check. Ready-source rotation now reaches clips beyond the first 100 and keeps the second missing-source check. Multipart inventories also paginate. |
 | Operational improvements | SteamGridDB reuses its HTTP client; automatic enrichment tasks are bounded to four. Cleanup prunes at most 1,000 succeeded jobs older than 30 days, retaining failed, dead, and active jobs. The Rust client supports file uploads, four concurrent missing parts, one progress poll per batch, and direct S3 presign/upload/ack. Direct requests carry no Clipline bearer credential. Direct server deployments enable gzip for compressible responses, preserving video and range responses. |
@@ -47,11 +47,12 @@ and was tested outside `public`. Index construction and FTS backfill run during
 migration, so account for migration time and temporary disk requirements on large
 databases.
 
-The four-upload limit is per web process and returns 429 with `Retry-After: 1`
-when full. Each admitted request uses temporary disk proportional to its expected
+The eight-upload limit is per web process, with at most four active uploads per owner;
+either limit returns 429 with `Retry-After: 1` when full. Incomplete bodies must make
+at least 64 KiB of progress every 30 seconds. Each admitted request uses temporary disk proportional to its expected
 body size. Scratch and storage capacity still need to cover admitted uploads and
-processing. Single file uploads stream; multipart file uploads buffer at most four
-parts, each capped by the client at 64 MiB. Automatic enrichment skips excess
+processing. Single file uploads stream; multipart file uploads hash and stream at most four
+file ranges concurrently with fixed-size read buffers, including server parts above 64 MiB. Automatic enrichment skips excess
 best-effort tasks; manual enrichment remains available.
 
 Update web and worker processes together so every runner recognizes the new

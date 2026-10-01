@@ -25,7 +25,9 @@ struct CachedReadiness {
 }
 
 pub(crate) async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+    Json(HealthResponse {
+        status: "ok".into(),
+    })
 }
 
 pub(crate) async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
@@ -37,7 +39,7 @@ pub(crate) async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<R
         }
     }
 
-    let database_status = match state.database.ping().await {
+    let database_status = match state.database.ping_writable().await {
         Ok(()) => "ok",
         Err(error) => {
             warn!(event = "database.readyz_failed", error = %error);
@@ -73,9 +75,9 @@ pub(crate) fn readiness_response(
             StatusCode::SERVICE_UNAVAILABLE
         },
         Json(ReadinessResponse {
-            status: if ready { "ok" } else { "not_ready" },
-            database: database_status,
-            storage: storage_status,
+            status: if ready { "ok" } else { "not_ready" }.into(),
+            database: database_status.into(),
+            storage: storage_status.into(),
         }),
     )
 }

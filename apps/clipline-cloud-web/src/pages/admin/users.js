@@ -48,6 +48,10 @@ export function canPurgeUser(user, currentUser) {
   return true;
 }
 
+export function canResetPassword(user, currentUser) {
+  return currentUser?.role === "owner" || !["admin", "owner"].includes(user.role);
+}
+
 function roleOptions(isOwner) {
   return isOwner ? [["user", "User"], ["admin", "Admin"]] : [["user", "User"]];
 }
@@ -68,6 +72,7 @@ function CreateUserForm({ isOwner, onCreated }) {
           display_name: nullableString(form.get("display_name")),
           email: nullableString(form.get("email")),
           password: nullableString(form.get("password")),
+          reauth_password: String(form.get("reauth_password") || ""),
           role: String(form.get("role") || "user"),
         },
       });
@@ -91,6 +96,7 @@ function CreateUserForm({ isOwner, onCreated }) {
         ${roleOptions(isOwner).map(([v, l]) => html`<option value=${v}>${l}</option>`)}
       </select>
     </label>
+    <label class="field"><span>Your password</span><input class="input" name="reauth_password" type="password" autocomplete="current-password" required /></label>
     <button class="btn btn-primary" type="submit" disabled=${busy}>${icon("plus", { size: 14 })} Create user</button>
   </form>`;
 }
@@ -110,6 +116,7 @@ function InviteLinkForm({ isOwner, smtpEnabled, onCreated }) {
           role: String(form.get("role") || "user"),
           email: nullableString(form.get("email")),
           send_email: intent === "email",
+          reauth_password: String(form.get("reauth_password") || ""),
         },
       });
       toast(intent === "email" ? "Invite sent." : "Invite link created.");
@@ -130,6 +137,7 @@ function InviteLinkForm({ isOwner, smtpEnabled, onCreated }) {
     <label class="field"><span>Email</span>
       <input class="input" name="email" type="email" placeholder=${smtpEnabled ? "Optional" : "SMTP disabled"} disabled=${!smtpEnabled} />
     </label>
+    <label class="field"><span>Your password</span><input class="input" name="reauth_password" type="password" autocomplete="current-password" required /></label>
     <div class="actions">
       <button class="btn" type="submit" name="intent" value="link" disabled=${busy}>${icon("copy", { size: 14 })} Generate link</button>
       ${smtpEnabled && html`<button class="btn btn-primary" type="submit" name="intent" value="email" disabled=${busy}>${icon("message", { size: 14 })} Send email</button>`}
@@ -234,7 +242,7 @@ function UserRow({
     <td>
       <div class="actions">
         <button class="btn" type="button" onClick=${() => onQuota(user)}>${icon("sliders", { size: 14 })} Quota</button>
-        <button class="btn" type="button" onClick=${() => onReset(user)}>${icon("clipboard", { size: 14 })} Reset link</button>
+        <button class="btn" type="button" disabled=${!canResetPassword(user, currentUser)} onClick=${() => onReset(user)}>${icon("clipboard", { size: 14 })} Reset link</button>
         ${user.is_disabled
           ? html`<button class="btn" type="button" disabled=${enableDisabled} onClick=${() => onEnable(user)}>${icon("check", { size: 14 })} Enable</button>`
           : html`<button class="btn btn-danger" type="button" disabled=${disableDisabled} onClick=${() => onDisable(user)}>${icon("x", { size: 14 })} Disable</button>`}
@@ -285,7 +293,7 @@ export function AdminUsers({ users, settings, currentUser, resetLink, setResetLi
           method: "POST",
           body: { reauth_password: value },
         });
-        setResetLink({ ...data, kind: "reset" });
+        setResetLink({ ...data, username: user.username, kind: "reset" });
         toast("Reset link created.");
       }
       reload();

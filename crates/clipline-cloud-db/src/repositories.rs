@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-mod cursors;
+mod password_attempts;
 mod transactions;
+pub use password_attempts::{PasswordAttemptAdmission, PASSWORD_ATTEMPT_MAX};
+mod cursors;
 pub use cursors::ClipCursor;
 use cursors::{push_cursor_postgres, push_cursor_sqlite};
 
@@ -249,7 +251,7 @@ impl GameCategoryRepository {
             (String, i64),
             "SELECT names.reported_name, CAST(COUNT(clips.id) AS BIGINT)
              FROM game_category_names names
-             LEFT JOIN clips ON LOWER(clips.game_name) = LOWER(names.reported_name)
+             LEFT JOIN clips ON LOWER(clips.game_name) = LOWER(names.reported_name) AND clips.deleted_at IS NULL AND clips.status <> 'deleted'
              WHERE names.category_id = ?
              GROUP BY names.id, names.reported_name
              ORDER BY LOWER(names.reported_name) ASC, names.reported_name ASC, names.id ASC",
@@ -418,7 +420,7 @@ impl GameCategoryRepository {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct UpdateAppSettings {
     pub allow_vod_uploads: Option<bool>,
     pub vod_threshold_minutes: Option<i64>,
@@ -566,8 +568,8 @@ impl UserRepository {
     pub async fn create(&self, new: &NewUser) -> DbResult<User> {
         db_execute!(
             &self.database,
-            "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 &new.id,
                 &new.username,
@@ -582,6 +584,7 @@ impl UserRepository {
                 new.created_at,
                 new.updated_at,
                 new.last_login_at,
+                new.password_change_required,
             ]
         )?;
 
@@ -592,7 +595,7 @@ impl UserRepository {
         Ok(db_fetch_optional!(
             &self.database,
             User,
-            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required
              FROM users WHERE id = ?",
             [id]
         )?)
@@ -602,8 +605,8 @@ impl UserRepository {
         Ok(db_fetch_optional!(
             &self.database,
             User,
-            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at
-             FROM users WHERE username = ?",
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required
+             FROM users WHERE LOWER(username) = LOWER(?)",
             [username]
         )?)
     }
@@ -612,7 +615,7 @@ impl UserRepository {
         Ok(db_fetch_all!(
             &self.database,
             User,
-            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required
              FROM users ORDER BY username ASC",
             []
         )?)
@@ -623,7 +626,7 @@ impl UserRepository {
             return Ok(Vec::new());
         }
         const USER_SELECT: &str =
-            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at FROM users WHERE id IN (";
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required FROM users WHERE id IN (";
         match &self.database {
             Database::Sqlite(pool) => {
                 let mut builder = QueryBuilder::<Sqlite>::new(USER_SELECT);
@@ -669,7 +672,7 @@ impl UserRepository {
         Ok(db_fetch_optional!(
             &self.database,
             User,
-            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required
              FROM users WHERE role = 'admin' AND is_disabled = ? ORDER BY created_at ASC, id ASC LIMIT 1",
             [false]
         )?)
@@ -724,7 +727,7 @@ impl UserRepository {
     pub async fn update_password_hash(&self, id: &str, password_hash: &str) -> DbResult<()> {
         db_execute!(
             &self.database,
-            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            "UPDATE users SET password_hash = ?, password_change_required = FALSE, updated_at = ? WHERE id = ?",
             [password_hash, now_utc(), id]
         )?;
         Ok(())
@@ -1230,7 +1233,8 @@ impl ClipRepository {
             Clip,
             CLIP_SELECT_SQL.to_string()
                 + " WHERE public_share_id = ? AND status = 'ready' AND deleted_at IS NULL
-                    AND visibility IN ('public','unlisted')",
+                    AND visibility IN ('public','unlisted')
+                    AND EXISTS (SELECT 1 FROM users WHERE users.id = clips.owner_user_id AND users.is_disabled = FALSE)",
             [public_share_id]
         )?)
     }
@@ -1277,9 +1281,9 @@ impl ClipRepository {
                         push_cursor_sqlite(&mut builder, cursor);
                     }
                     builder.push(if cursor.is_some() {
-                        clip_cursor_order_by(params.sort)
+                        clip_cursor_order_by(params.sort, self.database.kind())
                     } else {
-                        clip_order_by(params.sort)
+                        clip_order_by(params.sort, self.database.kind())
                     });
                     builder.push(" LIMIT ");
                     builder.push_bind(params.limit);
@@ -1294,9 +1298,9 @@ impl ClipRepository {
                         push_cursor_postgres(&mut builder, cursor);
                     }
                     builder.push(if cursor.is_some() {
-                        clip_cursor_order_by(params.sort)
+                        clip_cursor_order_by(params.sort, self.database.kind())
                     } else {
-                        clip_order_by(params.sort)
+                        clip_order_by(params.sort, self.database.kind())
                     });
                     builder.push(" LIMIT ");
                     builder.push_bind(params.limit);
@@ -1390,9 +1394,9 @@ impl ClipRepository {
                         push_cursor_sqlite(&mut builder, cursor);
                     }
                     builder.push(if cursor.is_some() {
-                        clip_cursor_order_by(params.sort)
+                        clip_cursor_order_by(params.sort, self.database.kind())
                     } else {
-                        clip_order_by(params.sort)
+                        clip_order_by(params.sort, self.database.kind())
                     });
                     builder.push(" LIMIT ");
                     builder.push_bind(params.limit);
@@ -1407,9 +1411,9 @@ impl ClipRepository {
                         push_cursor_postgres(&mut builder, cursor);
                     }
                     builder.push(if cursor.is_some() {
-                        clip_cursor_order_by(params.sort)
+                        clip_cursor_order_by(params.sort, self.database.kind())
                     } else {
-                        clip_order_by(params.sort)
+                        clip_order_by(params.sort, self.database.kind())
                     });
                     builder.push(" LIMIT ");
                     builder.push_bind(params.limit);
@@ -1438,6 +1442,7 @@ impl ClipRepository {
                AND clip.status = 'ready'
                AND clip.deleted_at IS NULL
                AND clip.public_share_id IS NOT NULL
+               AND EXISTS (SELECT 1 FROM users WHERE users.id = clip.owner_user_id AND users.is_disabled = FALSE)
              GROUP BY category.id, category.display_name
              ORDER BY LOWER(category.display_name) ASC, category.display_name ASC, category.id ASC",
             []
@@ -1485,7 +1490,8 @@ impl ClipRepository {
                AND status = 'ready'
                AND deleted_at IS NULL
                AND public_share_id IS NOT NULL
-               AND owner_user_id = ?",
+               AND owner_user_id = ?
+               AND EXISTS (SELECT 1 FROM users WHERE users.id = clips.owner_user_id AND users.is_disabled = FALSE)",
             [owner_user_id]
         )?
         .map(|row| row.0)
@@ -1505,6 +1511,14 @@ impl ClipRepository {
         Ok(row.map(|row| row.0).unwrap_or_default())
     }
 
+    pub async fn list_ready_with_storage_key_after(
+        &self,
+        after_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE status = 'ready' AND deleted_at IS NULL AND storage_key IS NOT NULL AND id > ? ORDER BY id ASC LIMIT ?", [after_id, limit])?)
+    }
+
     pub async fn list_ready_with_storage_key(&self, limit: i64) -> DbResult<Vec<Clip>> {
         Ok(db_fetch_all!(
             &self.database,
@@ -1514,6 +1528,18 @@ impl ClipRepository {
                     ORDER BY updated_at ASC, id ASC LIMIT ?",
             [limit]
         )?)
+    }
+
+    pub async fn list_deleted_after(&self, after_id: &str, limit: i64) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE (status = 'deleted' OR deleted_at IS NOT NULL) AND id > ? ORDER BY id ASC LIMIT ?", [after_id, limit])?)
+    }
+
+    pub async fn list_failed_with_reserved_storage_after(
+        &self,
+        after_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE status = 'failed' AND deleted_at IS NULL AND COALESCE(quota_bytes, file_size_bytes, 0) > 0 AND id > ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE target_type = 'clip' AND target_id = clips.id AND status = 'running') ORDER BY id ASC LIMIT ?", [after_id, limit])?)
     }
 
     pub async fn list_ready_sources_after(&self, after: &str, limit: i64) -> DbResult<Vec<Clip>> {
@@ -1532,6 +1558,7 @@ impl ClipRepository {
             &self.database,
             (i64,),
             "SELECT CAST(1 AS BIGINT) FROM clips WHERE deleted_at IS NULL AND status <> 'deleted'
+             AND (status <> 'failed' OR EXISTS (SELECT 1 FROM upload_sessions WHERE upload_sessions.clip_id = clips.id AND upload_sessions.failure_reason = 'ready clip source object is missing'))
              AND (storage_key = ? OR poster_key = ? OR thumbnail_key = ?) LIMIT 1",
             [key, key, key]
         )?
@@ -1554,13 +1581,13 @@ impl ClipRepository {
             &self.database,
             (String,),
             "SELECT storage_key FROM clips
-             WHERE deleted_at IS NULL AND status <> 'deleted' AND storage_key IS NOT NULL
+             WHERE deleted_at IS NULL AND status NOT IN ('deleted', 'failed') AND storage_key IS NOT NULL
              UNION
              SELECT poster_key FROM clips
-             WHERE deleted_at IS NULL AND status <> 'deleted' AND poster_key IS NOT NULL
+             WHERE deleted_at IS NULL AND status NOT IN ('deleted', 'failed') AND poster_key IS NOT NULL
              UNION
              SELECT thumbnail_key FROM clips
-             WHERE deleted_at IS NULL AND status <> 'deleted' AND thumbnail_key IS NOT NULL",
+             WHERE deleted_at IS NULL AND status NOT IN ('deleted', 'failed') AND thumbnail_key IS NOT NULL",
             []
         )?;
         Ok(rows.into_iter().map(|row| row.0).collect())
@@ -1581,8 +1608,8 @@ impl ClipRepository {
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
-             FROM clips WHERE deleted_at IS NULL AND status <> 'deleted'",
+            "SELECT CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
+             FROM clips",
             []
         )?
         .map(|row| row.0)
@@ -1590,13 +1617,14 @@ impl ClipRepository {
     }
 
     pub async fn active_storage_bytes_for_owner(&self, owner_user_id: &str) -> DbResult<i64> {
+        // Failed uploads retain their reservation until cleanup confirms their
+        // storage is gone. Keep file_size_bytes intact for retry diagnostics.
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
+            "SELECT CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
              FROM clips
-             WHERE owner_user_id = ? AND deleted_at IS NULL
-               AND status IN ('created','uploading','processing','ready')",
+             WHERE owner_user_id = ?",
             [owner_user_id]
         )?
         .map(|row| row.0)
@@ -1607,10 +1635,8 @@ impl ClipRepository {
         Ok(db_fetch_all!(
             &self.database,
             (String, i64),
-            "SELECT owner_user_id, CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
+            "SELECT owner_user_id, CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
              FROM clips
-             WHERE deleted_at IS NULL
-               AND status IN ('created','uploading','processing','ready')
              GROUP BY owner_user_id
              ORDER BY owner_user_id ASC",
             []
@@ -1623,6 +1649,22 @@ impl ClipRepository {
             "UPDATE clips SET status = ?, updated_at = ? WHERE id = ?",
             [status, now_utc(), id]
         )?;
+        Ok(())
+    }
+
+    pub async fn reserve_storage_bytes(&self, id: &str, size_bytes: i64) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "UPDATE clips SET file_size_bytes = CASE WHEN COALESCE(file_size_bytes, 0) < ? THEN ? ELSE file_size_bytes END, quota_bytes = NULL, updated_at = ? WHERE id = ?",
+            [size_bytes, size_bytes, now_utc(), id]
+        )?;
+        Ok(())
+    }
+
+    /// Call only after both objects and multipart bytes have been cleaned.
+    pub async fn release_failed_storage_reservation(&self, id: &str) -> DbResult<()> {
+        db_execute!(&self.database,
+            "UPDATE clips SET quota_bytes = 0 WHERE id = ? AND status = 'failed' AND deleted_at IS NULL", [id])?;
         Ok(())
     }
 
@@ -1642,7 +1684,7 @@ impl ClipRepository {
         let rows = db_execute_rows!(
             &self.database,
             "UPDATE clips
-             SET status = 'ready', updated_at = ?
+             SET status = 'ready', quota_bytes = NULL, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL AND status IN ('processing','ready')",
             [now_utc(), id]
         )?;
@@ -1872,7 +1914,8 @@ fn push_public_clip_list_filters_sqlite(
         " WHERE visibility = 'public'
           AND status = 'ready'
           AND deleted_at IS NULL
-          AND public_share_id IS NOT NULL",
+          AND public_share_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM users WHERE users.id = clips.owner_user_id AND users.is_disabled = FALSE)",
     );
     if let Some(owner_user_id) = &params.owner_user_id {
         builder.push(" AND owner_user_id = ");
@@ -1889,7 +1932,8 @@ fn push_public_clip_list_filters_postgres(
         " WHERE visibility = 'public'
           AND status = 'ready'
           AND deleted_at IS NULL
-          AND public_share_id IS NOT NULL",
+          AND public_share_id IS NOT NULL
+          AND EXISTS (SELECT 1 FROM users WHERE users.id = clips.owner_user_id AND users.is_disabled = FALSE)",
     );
     if let Some(owner_user_id) = &params.owner_user_id {
         builder.push(" AND owner_user_id = ");
@@ -2159,7 +2203,7 @@ fn push_sqlite_search_candidates(
     if query.chars().count() < 3 || query.contains('\0') {
         return;
     }
-    let phrase = format!("\"{}\"", query.to_ascii_lowercase().replace('"', "\"\""));
+    let phrase = format!("\"{}\"", query.to_lowercase().replace('"', "\"\""));
     builder.push(" AND clips.id IN (SELECT document.clip_id FROM clip_search JOIN clip_search_documents document ON document.id = clip_search.rowid WHERE clip_search MATCH ");
     builder.push_bind(phrase);
     builder.push(" UNION SELECT category_clip.id FROM game_categories candidate_category
@@ -2170,7 +2214,7 @@ fn push_sqlite_search_candidates(
     builder.push(" ESCAPE '\\')");
 }
 
-fn clip_cursor_order_by(sort: ClipSort) -> &'static str {
+fn clip_cursor_order_by(sort: ClipSort, database: crate::DatabaseKind) -> &'static str {
     // Cursor queries constrain the NULL segment. Keeping its constant expression
     // in ORDER BY makes SQLite sort the matched rows instead of stopping early.
     match sort {
@@ -2182,11 +2226,11 @@ fn clip_cursor_order_by(sort: ClipSort) -> &'static str {
         ClipSort::DurationAsc => " ORDER BY duration_ms ASC, id ASC",
         ClipSort::FileSizeDesc => " ORDER BY file_size_bytes DESC, id DESC",
         ClipSort::FileSizeAsc => " ORDER BY file_size_bytes ASC, id ASC",
-        _ => clip_order_by(sort),
+        _ => clip_order_by(sort, database),
     }
 }
 
-fn clip_order_by(sort: ClipSort) -> &'static str {
+fn clip_order_by(sort: ClipSort, database: crate::DatabaseKind) -> &'static str {
     match sort {
         ClipSort::RecordedAtDesc => " ORDER BY recorded_at IS NULL ASC, recorded_at DESC, id DESC",
         ClipSort::RecordedAtAsc => " ORDER BY recorded_at IS NULL ASC, recorded_at ASC, id ASC",
@@ -2200,8 +2244,20 @@ fn clip_order_by(sort: ClipSort) -> &'static str {
         ClipSort::FileSizeAsc => {
             " ORDER BY file_size_bytes IS NULL ASC, file_size_bytes ASC, id ASC"
         }
-        ClipSort::TitleAsc => " ORDER BY title ASC, id ASC",
-        ClipSort::TitleDesc => " ORDER BY title DESC, id DESC",
+        ClipSort::TitleAsc => {
+            if database == crate::DatabaseKind::Sqlite {
+                " ORDER BY title COLLATE BINARY ASC, id ASC"
+            } else {
+                " ORDER BY title COLLATE \"C\" ASC, id ASC"
+            }
+        }
+        ClipSort::TitleDesc => {
+            if database == crate::DatabaseKind::Sqlite {
+                " ORDER BY title COLLATE BINARY DESC, id DESC"
+            } else {
+                " ORDER BY title COLLATE \"C\" DESC, id DESC"
+            }
+        }
         ClipSort::CreatedAtDesc => " ORDER BY created_at DESC, id DESC",
         ClipSort::CreatedAtAsc => " ORDER BY created_at ASC, id ASC",
         ClipSort::UpdatedAtDesc => " ORDER BY updated_at DESC, id DESC",
@@ -2212,7 +2268,7 @@ fn clip_order_by(sort: ClipSort) -> &'static str {
 fn escaped_like_pattern(query: &str) -> String {
     let mut pattern = String::with_capacity(query.len() + 2);
     pattern.push('%');
-    for ch in query.to_ascii_lowercase().chars() {
+    for ch in query.to_lowercase().chars() {
         if matches!(ch, '%' | '_' | '\\') {
             pattern.push('\\');
         }
@@ -2266,24 +2322,19 @@ impl ClipCommentRepository {
         Ok(db_fetch_all!(
             &self.database,
             ClipComment,
-            "SELECT id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at
-             FROM (
+            "WITH recent AS (
                SELECT id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at
-               FROM clip_comments
-               WHERE clip_id = ?
-                 AND deleted_at IS NULL
-                 AND (
-                   parent_comment_id IS NULL
-                   OR parent_comment_id IN (
-                     SELECT id FROM clip_comments
-                     WHERE clip_id = ? AND parent_comment_id IS NULL AND deleted_at IS NULL
-                   )
-                 )
-               ORDER BY created_at DESC, id DESC
-               LIMIT ?
-             ) recent_comments
-             ORDER BY created_at ASC, id ASC",
-            [clip_id, clip_id, limit]
+               FROM clip_comments WHERE clip_id = ? AND deleted_at IS NULL
+                 AND (parent_comment_id IS NULL OR EXISTS (SELECT 1 FROM clip_comments parent WHERE parent.id = clip_comments.parent_comment_id AND parent.deleted_at IS NULL))
+               ORDER BY created_at DESC, id DESC LIMIT ?
+             )
+             SELECT * FROM (
+               SELECT * FROM recent
+               UNION
+               SELECT parent.id, parent.clip_id, parent.parent_comment_id, parent.user_id, parent.body, parent.created_at, parent.updated_at, parent.deleted_at
+               FROM clip_comments parent WHERE parent.id IN (SELECT parent_comment_id FROM recent)
+             ) thread_comments ORDER BY created_at ASC, id ASC",
+            [clip_id, limit]
         )?)
     }
 
@@ -2555,7 +2606,7 @@ impl UploadSessionRepository {
         let now = now_utc();
         db_execute!(
             &self.database,
-            "UPDATE upload_sessions SET status = 'failed', failure_reason = ?, failed_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE upload_sessions SET status = 'failed', failure_reason = ?, failed_at = ?, updated_at = ? WHERE id = ? AND status <> 'aborted'",
             [reason, now, now, id]
         )?;
         Ok(())
@@ -2576,19 +2627,11 @@ impl UploadSessionRepository {
     pub async fn list_failed_with_reason_after(
         &self,
         reason: &str,
-        after: &str,
+        after_id: &str,
         limit: i64,
     ) -> DbResult<Vec<UploadSession>> {
-        Ok(db_fetch_all!(
-            &self.database,
-            UploadSession,
-            "SELECT id, clip_id, user_id, status, expected_size_bytes, received_size_bytes,
-             part_size_bytes, storage_key, storage_upload_id, checksum_sha256,
-             created_at, updated_at, completed_at, expires_at, failure_reason, failed_at
-             FROM upload_sessions WHERE status = 'failed' AND failure_reason = ? AND id > ?
-             ORDER BY id ASC LIMIT ?",
-            [reason, after, limit]
-        )?)
+        Ok(db_fetch_all!(&self.database, UploadSession,
+            "SELECT id, clip_id, user_id, status, expected_size_bytes, received_size_bytes, part_size_bytes, storage_key, storage_upload_id, checksum_sha256, failure_reason, created_at, updated_at, completed_at, failed_at, expires_at FROM upload_sessions WHERE status = 'failed' AND failure_reason = ? AND id > ? ORDER BY id ASC LIMIT ?", [reason, after_id, limit])?)
     }
 
     pub async fn list_failed_with_reason(
@@ -2644,6 +2687,32 @@ pub struct UploadPartRepository {
 impl UploadPartRepository {
     pub fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    pub async fn claim_write(
+        &self,
+        session_id: &str,
+        part_number: i64,
+        token: &str,
+    ) -> DbResult<bool> {
+        let now = now_utc();
+        let expires = now + chrono::Duration::minutes(5);
+        let claimed = db_fetch_optional!(&self.database, (String,),
+            "INSERT INTO upload_part_claims (upload_session_id, part_number, token, expires_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (upload_session_id, part_number) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at
+             WHERE upload_part_claims.expires_at <= ? RETURNING token", [session_id, part_number, token, expires, now])?;
+        Ok(claimed.is_some())
+    }
+
+    pub async fn release_write(
+        &self,
+        session_id: &str,
+        part_number: i64,
+        token: &str,
+    ) -> DbResult<()> {
+        db_execute!(&self.database, "DELETE FROM upload_part_claims WHERE upload_session_id = ? AND part_number = ? AND token = ?", [session_id, part_number, token])?;
+        Ok(())
     }
 
     pub async fn upsert(&self, new: &NewUploadPart) -> DbResult<UploadPart> {
@@ -2886,10 +2955,15 @@ impl JobRepository {
                 "UPDATE jobs
                  SET status = 'running', attempts = attempts + 1, locked_by = ?, locked_at = ?, updated_at = ?
                  WHERE id = (
+                   WITH cutoff AS (SELECT ? AS due, ? AS stale)
                    SELECT id FROM jobs
-                   WHERE (status = 'pending' AND next_run_at <= ?)
-                      OR (status = 'running' AND locked_at < ?)
-                   ORDER BY next_run_at ASC, id ASC
+                   WHERE ((status = 'pending' AND next_run_at <= (SELECT due FROM cutoff)) OR (status = 'running' AND locked_at < (SELECT stale FROM cutoff)))
+                     AND NOT EXISTS (
+                       SELECT 1 FROM jobs busy JOIN clips busy_clip ON busy_clip.id = busy.target_id
+                       WHERE busy.status = 'running' AND busy.locked_at >= (SELECT stale FROM cutoff)
+                         AND busy_clip.owner_user_id = (SELECT owner_user_id FROM clips WHERE id = jobs.target_id)
+                     )
+                   ORDER BY COALESCE((SELECT MAX(previous.updated_at) FROM jobs previous JOIN clips previous_clip ON previous_clip.id = previous.target_id WHERE previous.attempts > 0 AND previous_clip.owner_user_id = (SELECT owner_user_id FROM clips WHERE id = jobs.target_id)), created_at) ASC, next_run_at ASC, id ASC
                    LIMIT 1
                  )
                  AND (
@@ -2900,14 +2974,21 @@ impl JobRepository {
                            locked_by, locked_at, last_error, created_at, updated_at",
                 [runner_id, now, now, now, stale_before, now, stale_before]
             )?),
-            Database::Postgres(pool) => Ok(sqlx::query_as::<_, Job>(
+            Database::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                sqlx::query("SELECT pg_advisory_xact_lock(4849337615266231621)").execute(&mut *tx).await?;
+                let job = sqlx::query_as::<_, Job>(
                 "UPDATE jobs
                  SET status = 'running', attempts = attempts + 1, locked_by = $1, locked_at = $2, updated_at = $3
                  WHERE id = (
                    SELECT id FROM jobs
-                   WHERE (status = 'pending' AND next_run_at <= $4)
-                      OR (status = 'running' AND locked_at < $5)
-                   ORDER BY next_run_at ASC, id ASC
+                   WHERE ((status = 'pending' AND next_run_at <= $4) OR (status = 'running' AND locked_at < $5))
+                     AND NOT EXISTS (
+                       SELECT 1 FROM jobs busy JOIN clips busy_clip ON busy_clip.id = busy.target_id
+                       WHERE busy.status = 'running' AND busy.locked_at >= $5
+                         AND busy_clip.owner_user_id = (SELECT owner_user_id FROM clips WHERE id = jobs.target_id)
+                     )
+                   ORDER BY COALESCE((SELECT MAX(previous.updated_at) FROM jobs previous JOIN clips previous_clip ON previous_clip.id = previous.target_id WHERE previous.attempts > 0 AND previous_clip.owner_user_id = (SELECT owner_user_id FROM clips WHERE id = jobs.target_id)), created_at) ASC, next_run_at ASC, id ASC
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED
                  )
@@ -2925,8 +3006,11 @@ impl JobRepository {
             .bind(stale_before)
             .bind(now)
             .bind(stale_before)
-            .fetch_optional(pool)
-            .await?),
+            .fetch_optional(&mut *tx)
+            .await?;
+                tx.commit().await?;
+                Ok(job)
+            },
         }
     }
 
@@ -3022,15 +3106,40 @@ impl JobRepository {
         attempts: i64,
         last_error: &str,
     ) -> DbResult<bool> {
-        let rows = db_execute_rows!(
-            &self.database,
-            "UPDATE jobs
-             SET status = 'dead', attempts = ?, locked_by = NULL, locked_at = NULL,
-                 last_error = ?, updated_at = ?
-             WHERE id = ? AND status = 'running' AND locked_by = ?",
-            [attempts, last_error, now_utc(), id, runner_id]
-        )?;
-        Ok(rows > 0)
+        let now = now_utc();
+        match &self.database {
+            Database::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                let dead: Option<(String, Option<String>)> = sqlx::query_as("UPDATE jobs SET status = 'dead', attempts = ?, locked_by = NULL, locked_at = NULL, last_error = ?, updated_at = ? WHERE id = ? AND status = 'running' AND locked_by = ? RETURNING kind, target_id")
+                    .bind(attempts).bind(last_error).bind(now).bind(id).bind(runner_id).fetch_optional(&mut *tx).await?;
+                let Some((kind, target)) = dead else {
+                    return Ok(false);
+                };
+                if kind == "validate_object" {
+                    if let Some(clip_id) = target {
+                        sqlx::query("UPDATE clips SET status = 'failed', updated_at = ? WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'").bind(now).bind(&clip_id).execute(&mut *tx).await?;
+                        sqlx::query("UPDATE upload_sessions SET status = 'failed', failed_at = ?, updated_at = ?, failure_reason = 'uploaded object could not be validated after maximum attempts' WHERE clip_id = ? AND status <> 'aborted'").bind(now).bind(now).bind(&clip_id).execute(&mut *tx).await?;
+                    }
+                }
+                tx.commit().await?;
+            }
+            Database::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let dead: Option<(String, Option<String>)> = sqlx::query_as("UPDATE jobs SET status = 'dead', attempts = $1, locked_by = NULL, locked_at = NULL, last_error = $2, updated_at = $3 WHERE id = $4 AND status = 'running' AND locked_by = $5 RETURNING kind, target_id")
+                    .bind(attempts).bind(last_error).bind(now).bind(id).bind(runner_id).fetch_optional(&mut *tx).await?;
+                let Some((kind, target)) = dead else {
+                    return Ok(false);
+                };
+                if kind == "validate_object" {
+                    if let Some(clip_id) = target {
+                        sqlx::query("UPDATE clips SET status = 'failed', updated_at = $1 WHERE id = $2 AND deleted_at IS NULL AND status <> 'deleted'").bind(now).bind(&clip_id).execute(&mut *tx).await?;
+                        sqlx::query("UPDATE upload_sessions SET status = 'failed', failed_at = $1, updated_at = $2, failure_reason = 'uploaded object could not be validated after maximum attempts' WHERE clip_id = $3 AND status <> 'aborted'").bind(now).bind(now).bind(&clip_id).execute(&mut *tx).await?;
+                    }
+                }
+                tx.commit().await?;
+            }
+        }
+        Ok(true)
     }
 
     pub async fn touch_lock(&self, id: &str, runner_id: &str) -> DbResult<bool> {
@@ -3178,19 +3287,28 @@ impl ResetPasswordTokenRepository {
     }
 
     pub async fn create(&self, new: &NewResetPasswordToken) -> DbResult<ResetPasswordToken> {
-        db_execute!(
-            &self.database,
-            "INSERT INTO reset_password_tokens (id, user_id, token_hash, created_at, expires_at, used_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                &new.id,
-                &new.user_id,
-                &new.token_hash,
-                new.created_at,
-                new.expires_at,
-                new.used_at,
-            ]
-        )?;
+        match &self.database {
+            Database::Sqlite(pool) => {
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+                sqlx::query("UPDATE reset_password_tokens SET used_at = COALESCE(used_at, ?) WHERE user_id = ?")
+                    .bind(new.created_at).bind(&new.user_id).execute(&mut *transaction).await?;
+                sqlx::query("INSERT INTO reset_password_tokens (id, user_id, token_hash, created_at, expires_at, used_at) VALUES (?, ?, ?, ?, ?, ?)")
+                    .bind(&new.id).bind(&new.user_id).bind(&new.token_hash).bind(new.created_at).bind(new.expires_at).bind(new.used_at).execute(&mut *transaction).await?;
+                transaction.commit().await?;
+            }
+            Database::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                    .bind(&new.user_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                sqlx::query("UPDATE reset_password_tokens SET used_at = COALESCE(used_at, $1) WHERE user_id = $2")
+                    .bind(new.created_at).bind(&new.user_id).execute(&mut *transaction).await?;
+                sqlx::query("INSERT INTO reset_password_tokens (id, user_id, token_hash, created_at, expires_at, used_at) VALUES ($1, $2, $3, $4, $5, $6)")
+                    .bind(&new.id).bind(&new.user_id).bind(&new.token_hash).bind(new.created_at).bind(new.expires_at).bind(new.used_at).execute(&mut *transaction).await?;
+                transaction.commit().await?;
+            }
+        }
 
         Ok(self.get(&new.id).await?.ok_or(sqlx::Error::RowNotFound)?)
     }
@@ -3328,7 +3446,8 @@ impl InvitationTokenRepository {
                AND claim_token_hash IS NULL
                AND claimed_at IS NULL
                AND used_at IS NULL
-               AND expires_at > ?",
+               AND expires_at > ?
+               AND EXISTS (SELECT 1 FROM users WHERE users.id = invitation_tokens.created_by_user_id AND users.is_disabled = FALSE AND users.role = 'admin')",
             [claim_token_hash, now, id, now]
         )?;
         Ok(rows > 0)
@@ -3365,9 +3484,15 @@ impl InvitationTokenRepository {
     pub async fn clear_created_by(&self, user_id: &str) -> DbResult<()> {
         db_execute!(
             &self.database,
-            "UPDATE invitation_tokens SET created_by_user_id = NULL WHERE created_by_user_id = ?",
+            "DELETE FROM invitation_tokens WHERE created_by_user_id = ?",
             [user_id]
         )?;
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for UpdateAppSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateAppSettings").finish_non_exhaustive()
     }
 }

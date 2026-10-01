@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use argon2::{
     password_hash::{
@@ -29,7 +29,8 @@ use clipline_cloud_api_types::{
 };
 use clipline_cloud_db::{
     now_utc, AppSettings, Clip, DeviceToken, NewAuditLogEntry, NewDeviceToken, NewInvitationToken,
-    NewResetPasswordToken, NewSession, NewUser, Repositories, Session, UploadSession, User,
+    NewResetPasswordToken, NewSession, NewUser, PasswordAttemptAdmission, Repositories, Session,
+    UploadSession, User,
 };
 use clipline_cloud_storage::{ObjectKey, ObjectMetadata, PutObjectMetadata, StorageError};
 use cookie::{Cookie, SameSite};
@@ -49,7 +50,7 @@ const CSRF_HEADER: &str = "x-csrf-token";
 const SESSION_TTL_DAYS: i64 = 30;
 const RESET_TOKEN_TTL_HOURS: i64 = 2;
 const LOGIN_LIMIT_WINDOW: Duration = Duration::from_secs(15 * 60);
-const LOGIN_USERNAME_MAX_FAILURES: u32 = 5;
+const LOGIN_USERNAME_MAX_FAILURES: u32 = clipline_cloud_db::PASSWORD_ATTEMPT_MAX;
 const LOGIN_SOURCE_MAX_FAILURES: u32 = 30;
 const LOGIN_LOCKOUT_BASE: Duration = Duration::from_secs(60);
 const LOGIN_LOCKOUT_MAX: Duration = Duration::from_secs(15 * 60);
@@ -63,6 +64,7 @@ const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DEVICE_NAME_LEN: usize = 120;
 const MAX_DEVICE_TOKENS_PER_USER: i64 = 25;
 const PASSWORD_HASH_CONCURRENCY: usize = 4;
+const PASSWORD_ADMISSION_CONCURRENCY: usize = 2;
 const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$Y2xpcGxpbmVkdW1teXNhbHQ$29NAnsMp/zppbS3YN0zQLv+FC4Kkln7bC58S5joRLPw";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -72,6 +74,7 @@ pub struct AuthRuntime {
     csrf_secret: Arc<Vec<u8>>,
     login_limiter: Arc<Mutex<HashMap<String, LoginBucket>>>,
     password_workers: Arc<Semaphore>,
+    password_admissions: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,16 +82,17 @@ struct LoginBucket {
     failures: u32,
     reset_at: Instant,
     blocked_until: Option<Instant>,
+    last_seen: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum PatchField<T> {
+pub(crate) enum PatchField<T> {
     #[default]
     Unset,
     Set(Option<T>),
 }
 
-fn deserialize_patch_field<'de, D, T>(deserializer: D) -> Result<PatchField<T>, D::Error>
+pub(crate) fn deserialize_patch_field<'de, D, T>(deserializer: D) -> Result<PatchField<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -115,20 +119,33 @@ impl AuthRuntime {
             csrf_secret: Arc::new(csrf_secret),
             login_limiter: Arc::new(Mutex::new(HashMap::new())),
             password_workers: Arc::new(Semaphore::new(PASSWORD_HASH_CONCURRENCY)),
+            password_admissions: Arc::new(Semaphore::new(PASSWORD_ADMISSION_CONCURRENCY)),
         }
     }
 
-    async fn hash_password(&self, password: String) -> Result<String, ApiError> {
-        let permit = self
-            .password_workers
+    fn acquire_password_worker(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.password_workers
             .clone()
             .try_acquire_owned()
-            .map_err(|_| {
-                ApiError::too_many_requests_after(
-                    "password service is busy; retry shortly",
-                    Duration::from_secs(1),
-                )
-            })?;
+            .map_err(|_| Self::password_service_busy())
+    }
+
+    fn password_service_busy() -> ApiError {
+        ApiError::too_many_requests_after(
+            "password service is busy; retry shortly",
+            Duration::from_secs(1),
+        )
+    }
+
+    fn check_password_worker_capacity(&self) -> Result<(), ApiError> {
+        if self.password_workers.available_permits() == 0 {
+            return Err(Self::password_service_busy());
+        }
+        Ok(())
+    }
+
+    async fn hash_password(&self, password: String) -> Result<String, ApiError> {
+        let permit = self.acquire_password_worker()?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             hash_password(&password)
@@ -145,16 +162,18 @@ impl AuthRuntime {
         if password.len() > MAX_PASSWORD_LEN {
             return Ok(false);
         }
-        let permit = self
-            .password_workers
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                ApiError::too_many_requests_after(
-                    "password service is busy; retry shortly",
-                    Duration::from_secs(1),
-                )
-            })?;
+        let permit = self.acquire_password_worker()?;
+        Self::verify_password_with_worker(password, password_hash, permit).await
+    }
+
+    async fn verify_password_with_worker(
+        password: String,
+        password_hash: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<bool, ApiError> {
+        if password.len() > MAX_PASSWORD_LEN {
+            return Ok(false);
+        }
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             verify_password(&password, &password_hash)
@@ -165,26 +184,94 @@ impl AuthRuntime {
 
     async fn verify_login_password(
         &self,
+        repositories: &Repositories,
         password: String,
         user: Option<&User>,
     ) -> Result<bool, ApiError> {
         let eligible_user = user.filter(|user| !user.is_disabled);
-        let password_hash = eligible_user
-            .map(|user| user.password_hash.clone())
-            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
-        let verified = self.verify_password(password, password_hash).await?;
-        Ok(eligible_user.is_some() && verified)
+        if let Some(user) = eligible_user {
+            return self
+                .verify_account_password(repositories, user, password, "login")
+                .await;
+        }
+        self.verify_password(password, DUMMY_PASSWORD_HASH.to_string())
+            .await?;
+        Ok(false)
     }
 
-    async fn require_reauth(&self, user: &User, password: String) -> Result<(), ApiError> {
+    async fn require_reauth(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+    ) -> Result<(), ApiError> {
         if self
-            .verify_password(password, user.password_hash.clone())
+            .verify_user_password(repositories, user, password)
             .await?
         {
             Ok(())
         } else {
             Err(ApiError::forbidden("reauthentication failed"))
         }
+    }
+
+    async fn verify_user_password(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+    ) -> Result<bool, ApiError> {
+        self.verify_account_password(repositories, user, password, "reauth")
+            .await
+    }
+
+    async fn verify_account_password(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+        scope: &str,
+    ) -> Result<bool, ApiError> {
+        // Reject a known-busy service without opening a write transaction.
+        self.check_password_worker_capacity()?;
+        // Cap reservations separately so DB waits leave connections and hashing
+        // workers available, even when many requests pass the preflight at once.
+        let admission = self
+            .password_admissions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Self::password_service_busy())?;
+        let now = now_utc();
+        // Wait for database locks before acquiring a worker. Worker admission
+        // happens inside the reservation, so a busy service consumes no attempt.
+        let reservation = repositories
+            .users
+            .reserve_password_attempt_with_admission(&user.id, scope, now, || {
+                self.acquire_password_worker().ok()
+            })
+            .await?;
+        drop(admission);
+        let permit = match reservation {
+            PasswordAttemptAdmission::Admitted(permit) => permit,
+            PasswordAttemptAdmission::RateLimited(until) => {
+                return Err(ApiError::too_many_requests_after(
+                    "too many password attempts",
+                    (until - now).to_std().unwrap_or(Duration::from_secs(1)),
+                ));
+            }
+            PasswordAttemptAdmission::Busy => {
+                return Err(Self::password_service_busy());
+            }
+        };
+        let verified =
+            Self::verify_password_with_worker(password, user.password_hash.clone(), permit).await?;
+        if verified {
+            repositories
+                .users
+                .clear_password_attempts(&user.id, scope)
+                .await?;
+        }
+        Ok(verified)
     }
 
     fn csrf_token(&self, session_hash: &str) -> String {
@@ -209,18 +296,21 @@ impl AuthRuntime {
         let mut buckets = self.login_limiter.lock().expect("login limiter lock");
         let now = Instant::now();
         prune_login_buckets(&mut buckets, now);
-        let username_retry = login_bucket_retry_after(
-            &mut buckets,
-            login_username_key(username),
-            now,
-            LOGIN_USERNAME_MAX_FAILURES,
-        );
-        let source_retry = login_bucket_retry_after(
-            &mut buckets,
-            login_source_key(source),
-            now,
-            LOGIN_SOURCE_MAX_FAILURES,
-        );
+        let username_key = login_username_key(username);
+        let source_key = login_source_key(source);
+        make_login_bucket_room(&mut buckets, &[&username_key, &source_key]);
+        // This bounded cache limits source/unknown-name traffic. Real accounts
+        // also have durable counters, so eviction cannot reset their limits.
+        buckets
+            .entry(username_key.clone())
+            .or_insert_with(|| new_login_bucket(now));
+        buckets
+            .entry(source_key.clone())
+            .or_insert_with(|| new_login_bucket(now));
+        let username_retry =
+            login_bucket_retry_after(&mut buckets, username_key, now, LOGIN_USERNAME_MAX_FAILURES);
+        let source_retry =
+            login_bucket_retry_after(&mut buckets, source_key, now, LOGIN_SOURCE_MAX_FAILURES);
         match (username_retry, source_retry) {
             (None, None) => Ok(()),
             (Some(left), None) | (None, Some(left)) => Err(left),
@@ -255,11 +345,18 @@ impl AuthRuntime {
 }
 
 fn login_username_key(username: &str) -> String {
-    format!("user:{}", username.trim().to_ascii_lowercase())
+    format!("user:{}", hash_token(&username.trim().to_lowercase()))
 }
 
 fn login_source_key(source: &str) -> String {
-    format!("source:{source}")
+    let normalized = match source.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => {
+            std::net::Ipv6Addr::from(u128::from(ip) & (!0u128 << 64)).to_string()
+        }
+        Ok(ip) => ip.to_string(),
+        Err(_) => hash_token(source),
+    };
+    format!("source:{normalized}")
 }
 
 fn new_login_bucket(now: Instant) -> LoginBucket {
@@ -267,6 +364,7 @@ fn new_login_bucket(now: Instant) -> LoginBucket {
         failures: 0,
         reset_at: now + LOGIN_LIMIT_WINDOW,
         blocked_until: None,
+        last_seen: now,
     }
 }
 
@@ -274,15 +372,23 @@ fn prune_login_buckets(buckets: &mut HashMap<String, LoginBucket>, now: Instant)
     buckets.retain(|_, bucket| {
         bucket.reset_at > now || bucket.blocked_until.is_some_and(|blocked| blocked > now)
     });
-    while buckets.len() >= LOGIN_LIMIT_MAX_BUCKETS {
-        let Some(oldest_key) = buckets
+}
+
+fn make_login_bucket_room(buckets: &mut HashMap<String, LoginBucket>, keys: &[&String]) {
+    let needed = keys
+        .iter()
+        .filter(|key| !buckets.contains_key(**key))
+        .count();
+    while buckets.len().saturating_add(needed) > LOGIN_LIMIT_MAX_BUCKETS {
+        let oldest = buckets
             .iter()
-            .min_by_key(|(_, bucket)| bucket.reset_at)
-            .map(|(key, _)| key.clone())
-        else {
+            .filter(|(key, _)| !keys.contains(key))
+            .min_by_key(|(_, bucket)| bucket.last_seen)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
             break;
         };
-        buckets.remove(&oldest_key);
+        buckets.remove(&oldest);
     }
 }
 
@@ -293,6 +399,7 @@ fn login_bucket_retry_after(
     _max_failures: u32,
 ) -> Option<Duration> {
     let bucket = buckets.get_mut(&key)?;
+    bucket.last_seen = now;
     if now >= bucket.reset_at && bucket.blocked_until.map_or(true, |blocked| blocked <= now) {
         bucket.failures = 0;
         bucket.reset_at = now + LOGIN_LIMIT_WINDOW;
@@ -310,10 +417,12 @@ fn record_login_bucket_failure(
     now: Instant,
     max_failures: u32,
 ) {
+    make_login_bucket_room(buckets, &[&key]);
     let bucket = buckets.entry(key).or_insert_with(|| new_login_bucket(now));
     if now >= bucket.reset_at && bucket.blocked_until.map_or(true, |blocked| blocked <= now) {
         *bucket = new_login_bucket(now);
     }
+    bucket.last_seen = now;
     bucket.failures = bucket.failures.saturating_add(1);
     if bucket.failures >= max_failures {
         let overage = bucket.failures.saturating_sub(max_failures).min(8);
@@ -368,12 +477,14 @@ pub async fn ensure_first_admin(
         None => generate_one_time_password(),
     };
     let generated_password = config.bootstrap_admin_password.is_none();
+    validate_new_password(&password).map_err(|error| {
+        anyhow::anyhow!("invalid bootstrap admin password: {}", error.message())
+    })?;
     let password_hash =
         hash_password(&password).map_err(|error| anyhow::anyhow!(error.message().to_string()))?;
-    let user = repositories
-        .users
-        .create(&NewUser::new(&username, password_hash, "admin"))
-        .await?;
+    let mut bootstrap_user = NewUser::new(&username, password_hash, "admin");
+    bootstrap_user.password_change_required = generated_password;
+    let user = repositories.users.create(&bootstrap_user).await?;
     repositories.settings.set_owner_user_id(&user.id).await?;
 
     let mut audit = NewAuditLogEntry::new("owner.bootstrap.created");
@@ -401,11 +512,17 @@ pub async fn ensure_first_admin(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/.well-known/clipline-cloud", get(discovery))
-        .route("/api/v1/auth/login", post(login))
+        .route(
+            "/api/v1/auth/login",
+            post(login).layer(DefaultBodyLimit::max(8192)),
+        )
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/reset-password", post(redeem_reset_password))
-        .route("/api/v1/auth/device-token", post(create_device_token))
+        .route(
+            "/api/v1/auth/device-token",
+            post(create_device_token).layer(DefaultBodyLimit::max(8192)),
+        )
         .route("/api/v1/auth/device-tokens", get(list_device_tokens))
         .route(
             "/api/v1/auth/device-tokens/{id}",
@@ -450,13 +567,13 @@ async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> Json<Di
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct LoginRequest {
     username: String,
     password: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct LoginResponse {
     user: UserResponse,
     csrf_token: String,
@@ -468,6 +585,11 @@ async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    if request.username.len() > MAX_USERNAME_LEN * 4
+        || request.username.chars().count() > MAX_USERNAME_LEN
+    {
+        return Err(ApiError::bad_request("username is too long"));
+    }
     let login_source = client_ip.as_str();
     if let Err(retry_after) = state.auth.login_allowed(&request.username, login_source) {
         return Err(ApiError::too_many_requests_after(
@@ -476,6 +598,8 @@ async fn login(
         ));
     }
 
+    state.auth.check_password_worker_capacity()?;
+
     let user = state
         .repositories
         .users
@@ -483,7 +607,7 @@ async fn login(
         .await?;
     if !state
         .auth
-        .verify_login_password(request.password.clone(), user.as_ref())
+        .verify_login_password(&state.repositories, request.password.clone(), user.as_ref())
         .await?
     {
         state
@@ -528,7 +652,7 @@ async fn login(
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let auth = require_auth(&state, &headers).await?;
+    let auth = authenticate(&state, &headers).await?;
     require_csrf_for_cookie(&state, &headers, &auth)?;
 
     if let AuthKind::Cookie { token_hash } = &auth.kind {
@@ -552,7 +676,7 @@ async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MeResponse>, ApiError> {
-    let auth = require_auth(&state, &headers).await?;
+    let auth = authenticate(&state, &headers).await?;
     let csrf_token = match &auth.kind {
         AuthKind::Cookie { token_hash } => Some(state.auth.csrf_token(token_hash)),
         AuthKind::Bearer => None,
@@ -570,6 +694,11 @@ async fn create_device_token(
     Extension(client_ip): Extension<ClientIp>,
     Json(request): Json<CreateDeviceTokenRequest>,
 ) -> Result<Json<CreateDeviceTokenResponse>, ApiError> {
+    if request.username.len() > MAX_USERNAME_LEN * 4
+        || request.username.chars().count() > MAX_USERNAME_LEN
+    {
+        return Err(ApiError::bad_request("username is too long"));
+    }
     let device_name = request.name.trim();
     if device_name.is_empty() {
         return Err(ApiError::bad_request("device name is required"));
@@ -587,6 +716,8 @@ async fn create_device_token(
         ));
     }
 
+    state.auth.check_password_worker_capacity()?;
+
     let user = state
         .repositories
         .users
@@ -594,7 +725,7 @@ async fn create_device_token(
         .await?;
     if !state
         .auth
-        .verify_login_password(request.password.clone(), user.as_ref())
+        .verify_login_password(&state.repositories, request.password.clone(), user.as_ref())
         .await?
     {
         state
@@ -603,6 +734,11 @@ async fn create_device_token(
         return Err(ApiError::unauthorized("invalid username or password"));
     }
     let user = user.expect("verified login user should exist");
+    if user.password_change_required {
+        return Err(ApiError::forbidden(
+            "change your bootstrap password in the web app first",
+        ));
+    }
 
     state
         .auth
@@ -761,8 +897,9 @@ async fn list_users(
     Ok(Json(users))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CreateUserRequest {
+    reauth_password: String,
     username: String,
     password: Option<String>,
     email: Option<String>,
@@ -785,6 +922,10 @@ async fn create_user(
 ) -> Result<Json<CreateUserResponse>, ApiError> {
     let auth = require_admin(&state, &headers).await?;
     require_csrf_for_cookie(&state, &headers, &auth)?;
+    state
+        .auth
+        .require_reauth(&state.repositories, &auth.user, request.reauth_password)
+        .await?;
 
     let role = request.role.unwrap_or_else(|| "user".to_string());
     validate_role(&role)?;
@@ -819,19 +960,20 @@ async fn create_user(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct CreateInviteLinkRequest {
+    reauth_password: String,
     role: Option<String>,
     email: Option<String>,
     send_email: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ClaimInviteLinkRequest {
     invite_token: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct ClaimInviteLinkResponse {
     reset_token: String,
     expires_at: DateTime<Utc>,
@@ -845,6 +987,10 @@ async fn create_invite_link(
 ) -> Result<Json<PasswordSetupLinkResponse>, ApiError> {
     let auth = require_admin(&state, &headers).await?;
     require_csrf_for_cookie(&state, &headers, &auth)?;
+    state
+        .auth
+        .require_reauth(&state.repositories, &auth.user, request.reauth_password)
+        .await?;
 
     let role = request.role.unwrap_or_else(|| "user".to_string());
     validate_role(&role)?;
@@ -983,7 +1129,7 @@ async fn get_user(
     Ok(Json(user_response_for_state(&state, user).await?))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct UpdateUserRequest {
     display_name: Option<String>,
     role: Option<String>,
@@ -1028,22 +1174,23 @@ async fn update_user(
     };
     let display_name = match request.display_name {
         Some(display_name) => normalized_display_name(Some(display_name))?,
-        None => existing.display_name,
+        None => existing.display_name.clone(),
     };
 
-    state
+    if !state
         .repositories
-        .users
-        .update_profile(
-            &id,
+        .update_user_if_current(
+            &existing,
             display_name.as_deref(),
             &role,
             is_disabled,
             storage_quota_bytes,
         )
-        .await?;
-    if is_disabled && !was_disabled {
-        revoke_user_auth(&state.repositories, &id).await?;
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "user changed while this update was being applied; reload and retry",
+        ));
     }
     audit_with_ip(
         &state.repositories,
@@ -1056,16 +1203,13 @@ async fn update_user(
     )
     .await?;
 
-    Ok(Json(user_response_with_storage_and_owner(
-        state
-            .repositories
-            .users
-            .get(&id)
-            .await?
-            .ok_or_else(|| ApiError::conflict("user was deleted before the update completed"))?,
-        0,
-        settings.owner_user_id.as_deref(),
-    )))
+    let updated = state
+        .repositories
+        .users
+        .get(&id)
+        .await?
+        .ok_or_else(|| ApiError::conflict("user was deleted before the update completed"))?;
+    Ok(Json(user_response_for_state(&state, updated).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1236,7 +1380,11 @@ async fn disable_user(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(existing) = state.repositories.users.get(&id).await? else {
@@ -1245,8 +1393,21 @@ async fn disable_user(
     let settings = state.repositories.settings.get().await?;
     enforce_user_disable_policy(&auth.user, &existing, &settings)?;
 
-    state.repositories.users.set_disabled(&id, true).await?;
-    revoke_user_auth(&state.repositories, &id).await?;
+    if !state
+        .repositories
+        .update_user_if_current(
+            &existing,
+            existing.display_name.as_deref(),
+            &existing.role,
+            true,
+            existing.storage_quota_bytes,
+        )
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "user changed while being disabled; reload and retry",
+        ));
+    }
     audit_with_ip(
         &state.repositories,
         Some(client_ip.as_str()),
@@ -1271,7 +1432,11 @@ async fn purge_user(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(existing) = state.repositories.users.get(&id).await? else {
@@ -1457,12 +1622,12 @@ async fn revoke_user_auth(repositories: &Repositories, user_id: &str) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ResetPasswordRequest {
     reauth_password: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct PasswordSetupLinkResponse {
     reset_token: String,
     reset_url: String,
@@ -1493,16 +1658,23 @@ async fn reset_password(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(target_user) = state.repositories.users.get(&id).await? else {
         return Err(ApiError::not_found("user not found"));
     };
     let settings = state.repositories.settings.get().await?;
-    if is_owner_user(&target_user, &settings) && !is_owner_user(&auth.user, &settings) {
+    if (is_owner_user(&target_user, &settings)
+        || matches!(target_user.role.as_str(), "admin" | "owner"))
+        && !is_owner_user(&auth.user, &settings)
+    {
         return Err(ApiError::forbidden(
-            "owner role required to reset the owner",
+            "owner role required to reset admin passwords",
         ));
     }
 
@@ -1597,13 +1769,13 @@ async fn create_user_or_conflict(state: &AppState, new_user: &NewUser) -> Result
         })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RedeemResetPasswordRequest {
     reset_token: String,
     new_password: String,
@@ -1745,13 +1917,14 @@ async fn change_password(
     headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<Response, ApiError> {
-    let auth = require_auth(&state, &headers).await?;
+    let auth = authenticate(&state, &headers).await?;
     require_csrf_for_cookie(&state, &headers, &auth)?;
     if !state
         .auth
-        .verify_password(
+        .verify_user_password(
+            &state.repositories,
+            &auth.user,
             request.current_password.clone(),
-            auth.user.password_hash.clone(),
         )
         .await?
     {
@@ -1852,6 +2025,19 @@ pub(crate) async fn user_is_owner(state: &AppState, user: &User) -> Result<bool,
 }
 
 pub(crate) async fn require_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedUser, ApiError> {
+    let auth = authenticate(state, headers).await?;
+    if auth.user.password_change_required {
+        return Err(ApiError::forbidden(
+            "change your bootstrap password before using this account",
+        ));
+    }
+    Ok(auth)
+}
+
+async fn authenticate(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedUser, ApiError> {
@@ -2120,7 +2306,7 @@ async fn require_reauth_for_privileged_user_patch(
         };
         state
             .auth
-            .require_reauth(actor, password.to_string())
+            .require_reauth(&state.repositories, actor, password.to_string())
             .await?;
     }
     Ok(())
@@ -2454,6 +2640,7 @@ fn user_response_with_storage_and_owner(
         avatar_url,
         role,
         is_disabled: value.is_disabled,
+        password_change_required: value.password_change_required,
         storage_bytes,
         storage_quota_bytes,
         created_at: value.created_at,
@@ -2506,6 +2693,13 @@ fn session_response(value: Session, current_token_hash: Option<&str>) -> Session
     }
 }
 
+impl std::fmt::Debug for PasswordSetupLinkResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordSetupLinkResponse")
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2523,6 +2717,380 @@ mod tests {
     struct TestApp {
         state: AppState,
         _temp_dir: TempDir,
+    }
+
+    #[tokio::test]
+    async fn login_cache_saturation_keeps_account_limits_and_admits_newcomers() {
+        let app = test_app().await;
+        let victim = insert_user(&app.state, "victim").await;
+        let now = now_utc();
+        for _ in 0..LOGIN_USERNAME_MAX_FAILURES {
+            assert!(app
+                .state
+                .repositories
+                .users
+                .reserve_password_attempt(&victim.id, "login", now)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        for index in 0..LOGIN_LIMIT_MAX_BUCKETS * 2 {
+            app.state.auth.record_login_failure(
+                &format!("user-{index}"),
+                &format!(
+                    "198.{}.{}.{}",
+                    index / 65536,
+                    index / 256 % 256,
+                    index % 256
+                ),
+            );
+        }
+        assert!(app
+            .state
+            .auth
+            .login_allowed("new-user", "192.0.2.2")
+            .is_ok());
+        assert!(app
+            .state
+            .repositories
+            .users
+            .reserve_password_attempt(&victim.id, "login", now)
+            .await
+            .unwrap()
+            .is_some());
+        // A fresh process has the same account limit, independent of its source cache.
+        let restarted = AuthRuntime::new(Some("secret"));
+        assert_eq!(
+            restarted
+                .verify_login_password(&app.state.repositories, "wrong".into(), Some(&victim))
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(app.state.auth.login_limiter.lock().unwrap().len() <= LOGIN_LIMIT_MAX_BUCKETS);
+        assert_eq!(login_username_key(&"x".repeat(100_000)).len(), 69);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_invalid_passwords_before_creating_owner() {
+        let app = test_app().await;
+        let mut config = (*app.state.config).clone();
+        for password in ["", "short", &"x".repeat(MAX_PASSWORD_LEN + 1)] {
+            config.bootstrap_admin_password = Some(password.to_string());
+            assert!(ensure_first_admin(&config, &app.state.repositories)
+                .await
+                .is_err());
+            assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 0);
+        }
+        config.bootstrap_admin_password = Some("valid-bootstrap-password".to_string());
+        ensure_first_admin(&config, &app.state.repositories)
+            .await
+            .unwrap();
+        assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn database_lock_waits_leave_password_workers_available() {
+        let app = test_app().await;
+        let user = insert_user(&app.state, "database-lock").await;
+        set_user_password(&app.state, &user.id, "correct-password").await;
+        let user = app
+            .state
+            .repositories
+            .users
+            .get(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let clipline_cloud_db::Database::Sqlite(pool) = &app.state.database else {
+            panic!("test uses SQLite");
+        };
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut checks = Vec::new();
+        for _ in 0..PASSWORD_ADMISSION_CONCURRENCY {
+            checks.push(Box::pin(app.state.auth.verify_account_password(
+                &app.state.repositories,
+                &user,
+                "wrong".into(),
+                "login",
+            )));
+        }
+        // Poll every request into its database wait without relying on sleeps.
+        for check in &mut checks {
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(check.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(
+            app.state.auth.password_workers.available_permits(),
+            PASSWORD_HASH_CONCURRENCY
+        );
+        let busy = app
+            .state
+            .auth
+            .verify_account_password(&app.state.repositories, &user, "wrong".into(), "login")
+            .await
+            .unwrap_err();
+        assert_eq!(busy.message(), "password service is busy; retry shortly");
+
+        let worker = app.state.auth.acquire_password_worker().unwrap();
+        drop(worker);
+        writer.rollback().await.unwrap();
+        // Drive both waiters together. One can own SQLite's write lock while
+        // the other waits, so awaiting them sequentially can deadlock the test.
+        let second = checks.pop().unwrap();
+        let first = checks.pop().unwrap();
+        assert!(checks.is_empty());
+        let (first, second) = tokio::join!(first, second);
+        assert!(!first.unwrap());
+        assert!(!second.unwrap());
+        assert!(!app
+            .state
+            .auth
+            .verify_login_password(&app.state.repositories, "wrong".into(), None,)
+            .await
+            .unwrap());
+        assert!(app
+            .state
+            .auth
+            .verify_account_password(
+                &app.state.repositories,
+                &user,
+                "correct-password".into(),
+                "login",
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            app.state.auth.password_workers.available_permits(),
+            PASSWORD_HASH_CONCURRENCY
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_password_workers_do_not_consume_account_attempts() {
+        let app = test_app().await;
+        let user = insert_user(&app.state, "worker-budget").await;
+        set_user_password(&app.state, &user.id, "correct-password").await;
+        let user = app
+            .state
+            .repositories
+            .users
+            .get(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let workers = app
+            .state
+            .auth
+            .password_workers
+            .clone()
+            .try_acquire_many_owned(PASSWORD_HASH_CONCURRENCY as u32)
+            .unwrap();
+        let clipline_cloud_db::Database::Sqlite(pool) = &app.state.database else {
+            panic!("SQLite test");
+        };
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        for scope in ["login", "reauth"] {
+            for _ in 0..LOGIN_USERNAME_MAX_FAILURES * 2 {
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    app.state.auth.verify_account_password(
+                        &app.state.repositories,
+                        &user,
+                        "wrong".into(),
+                        scope,
+                    ),
+                )
+                .await
+                .expect("busy preflight must avoid the locked database")
+                .unwrap_err();
+                assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(error.message(), "password service is busy; retry shortly");
+            }
+        }
+        writer.rollback().await.unwrap();
+        drop(workers);
+        for scope in ["login", "reauth"] {
+            // Every real attempt remains available after the service recovers.
+            for _ in 0..LOGIN_USERNAME_MAX_FAILURES {
+                assert!(!app
+                    .state
+                    .auth
+                    .verify_account_password(&app.state.repositories, &user, "wrong".into(), scope,)
+                    .await
+                    .unwrap());
+            }
+            let error = app
+                .state
+                .auth
+                .verify_account_password(
+                    &app.state.repositories,
+                    &user,
+                    "correct-password".into(),
+                    scope,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.message(), "too many password attempts");
+        }
+    }
+
+    #[tokio::test]
+    async fn password_checks_share_a_per_user_failure_limit() {
+        let app = test_app().await;
+        let user = insert_user(&app.state, "password-check").await;
+        set_user_password(&app.state, &user.id, "correct-password").await;
+        let user = app
+            .state
+            .repositories
+            .users
+            .get(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..LOGIN_USERNAME_MAX_FAILURES {
+            assert_eq!(
+                error_status(
+                    app.state
+                        .auth
+                        .require_reauth(&app.state.repositories, &user, "wrong".to_string())
+                        .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            error_status(
+                app.state
+                    .auth
+                    .verify_user_password(
+                        &app.state.repositories,
+                        &user,
+                        "correct-password".to_string()
+                    )
+                    .await
+            ),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn resetting_admin_passwords_requires_the_owner() {
+        let app = test_app().await;
+        let owner = insert_user_with_role(&app.state, "owner", "admin").await;
+        let actor = insert_user_with_role(&app.state, "actor", "admin").await;
+        let target = insert_user_with_role(&app.state, "target", "admin").await;
+        let ordinary_user = insert_user(&app.state, "ordinary").await;
+        app.state
+            .repositories
+            .settings
+            .set_owner_user_id(&owner.id)
+            .await
+            .unwrap();
+        for user in [&owner, &actor] {
+            set_user_password(&app.state, &user.id, "actor-password").await;
+        }
+        let (actor_headers, _) = cookie_auth_headers(&app.state, &actor.id).await;
+        for target in [&owner, &actor, &target] {
+            assert_eq!(
+                error_status(
+                    reset_password(
+                        State(app.state.clone()),
+                        Extension(ClientIp("192.0.2.1".to_string())),
+                        actor_headers.clone(),
+                        Path(target.id.clone()),
+                        Json(ResetPasswordRequest {
+                            reauth_password: "actor-password".to_string()
+                        })
+                    )
+                    .await
+                ),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let _ = reset_password(
+            State(app.state.clone()),
+            Extension(ClientIp("192.0.2.1".to_string())),
+            actor_headers,
+            Path(ordinary_user.id),
+            Json(ResetPasswordRequest {
+                reauth_password: "actor-password".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let (owner_headers, _) = cookie_auth_headers(&app.state, &owner.id).await;
+        let _ = reset_password(
+            State(app.state),
+            Extension(ClientIp("192.0.2.1".to_string())),
+            owner_headers,
+            Path(target.id),
+            Json(ResetPasswordRequest {
+                reauth_password: "actor-password".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn creating_users_and_invites_requires_the_actors_password() {
+        let app = test_app().await;
+        let owner = insert_user_with_role(&app.state, "owner", "admin").await;
+        app.state
+            .repositories
+            .settings
+            .set_owner_user_id(&owner.id)
+            .await
+            .unwrap();
+        set_user_password(&app.state, &owner.id, "owner-password").await;
+        let (headers, _) = cookie_auth_headers(&app.state, &owner.id).await;
+        for password in ["wrong-password", "owner-password"] {
+            let user_result = create_user(
+                State(app.state.clone()),
+                Extension(ClientIp("192.0.2.1".to_string())),
+                headers.clone(),
+                Json(CreateUserRequest {
+                    reauth_password: password.to_string(),
+                    username: "new-admin".to_string(),
+                    password: Some("new-user-password".to_string()),
+                    email: None,
+                    display_name: None,
+                    role: Some("admin".to_string()),
+                }),
+            )
+            .await;
+            let invite_result = create_invite_link(
+                State(app.state.clone()),
+                Extension(ClientIp("192.0.2.1".to_string())),
+                headers.clone(),
+                Json(CreateInviteLinkRequest {
+                    reauth_password: password.to_string(),
+                    role: Some("admin".to_string()),
+                    email: None,
+                    send_email: Some(false),
+                }),
+            )
+            .await;
+            if password == "wrong-password" {
+                assert_eq!(error_status(user_result), StatusCode::FORBIDDEN);
+                assert_eq!(error_status(invite_result), StatusCode::FORBIDDEN);
+                assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 1);
+            } else {
+                assert!(user_result.is_ok());
+                assert!(invite_result.is_ok());
+                assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 2);
+            }
+        }
+        assert!(serde_json::from_value::<CreateUserRequest>(
+            json!({"username":"new-user", "password":"password"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<CreateInviteLinkRequest>(json!({"role":"user"})).is_err());
     }
 
     #[test]
@@ -2635,6 +3203,9 @@ mod tests {
         let mut config = Config::for_tests("sqlite://:memory:", temp_dir.path());
         config.public_url = url::Url::parse("https://clips.petrichor.one").expect("canonical");
 
+        config
+            .additional_public_urls
+            .push(url::Url::parse("https://watch.clipline.cc").unwrap());
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("watch.clipline.cc"));
         headers.insert(
@@ -2657,11 +3228,15 @@ mod tests {
         }
 
         let retry_after = runtime
-            .login_allowed("dain", "198.51.100.11")
+            .login_allowed("dain", "198.51.100.10")
             .expect_err("username should be blocked");
         assert!(retry_after >= Duration::from_secs(1));
 
-        runtime.record_login_success("dain", "198.51.100.11");
+        assert!(
+            runtime.login_allowed("dain", "198.51.100.11").is_err(),
+            "the username budget must be shared across source addresses"
+        );
+        runtime.record_login_success("dain", "198.51.100.10");
         assert!(runtime.login_allowed("dain", "198.51.100.11").is_ok());
     }
 
@@ -3644,5 +4219,128 @@ mod tests {
             Ok(_) => panic!("expected handler error"),
             Err(error) => error.into_response().status(),
         }
+    }
+}
+
+#[cfg(test)]
+mod remaining_regressions {
+    use super::*;
+    use crate::tests::test_state;
+
+    #[tokio::test]
+    async fn generated_bootstrap_password_requires_replacement() {
+        let (_dir, mut state) = test_state().await;
+        Arc::make_mut(&mut state.config).bootstrap_admin_password = None;
+        ensure_first_admin(&state.config, &state.repositories)
+            .await
+            .unwrap();
+        let owner = state
+            .repositories
+            .users
+            .first_admin()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(owner.password_change_required);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_session_can_only_finish_password_setup() {
+        let (_dir, state) = test_state().await;
+        let mut new = NewUser::new(
+            "setup-owner",
+            hash_password("bootstrap-password").unwrap(),
+            "admin",
+        );
+        new.password_change_required = true;
+        let user = state.repositories.users.create(&new).await.unwrap();
+        let raw = "test-setup-session";
+        let hash = hash_token(raw);
+        state
+            .repositories
+            .sessions
+            .create(&NewSession::new(
+                &user.id,
+                &hash,
+                now_utc() + ChronoDuration::days(1),
+            ))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={raw}")).unwrap(),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_str(state.config.public_url.as_str().trim_end_matches('/')).unwrap(),
+        );
+        headers.insert(
+            CSRF_HEADER,
+            HeaderValue::from_str(&state.auth.csrf_token(&hash)).unwrap(),
+        );
+        assert_eq!(
+            require_auth(&state, &headers).await.unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            me(State(state.clone()), headers.clone())
+                .await
+                .unwrap()
+                .user
+                .password_change_required
+        );
+        let response = change_password(
+            State(state.clone()),
+            Extension(ClientIp("127.0.0.1".into())),
+            headers,
+            Json(ChangePasswordRequest {
+                current_password: "bootstrap-password".into(),
+                new_password: "new-owner-password".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !state
+                .repositories
+                .users
+                .get(&user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_change_required
+        );
+        let mut replacement = HeaderMap::new();
+        replacement.insert(
+            header::COOKIE,
+            HeaderValue::from_str(
+                response.headers()[header::SET_COOKIE]
+                    .to_str()
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(require_auth(&state, &replacement).await.is_ok());
+    }
+
+    #[test]
+    fn ipv6_source_buckets_cover_the_network_prefix() {
+        let runtime = AuthRuntime::new(Some("test-secret"));
+        for index in 0..LOGIN_SOURCE_MAX_FAILURES {
+            let source = format!("2001:db8:1:2::{index:x}");
+            runtime
+                .login_allowed(&format!("account-{index}"), &source)
+                .unwrap();
+            runtime.record_login_failure(&format!("account-{index}"), &source);
+        }
+        assert!(runtime
+            .login_allowed("owner", "2001:db8:1:2::ffff")
+            .is_err());
+        assert!(runtime.login_allowed("owner", "2001:db8:1:3::ffff").is_ok());
     }
 }

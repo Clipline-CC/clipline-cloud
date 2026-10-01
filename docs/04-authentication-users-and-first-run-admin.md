@@ -120,7 +120,7 @@ POST   /api/v1/me/change-password
 
 `POST /api/v1/users/{id}/reset-password` returns both the raw reset token and a browser-ready
 `/reset-password?token=...` URL. The web UI shows the reset URL with a copy action so owners and
-admins can create password setup links for users.
+admins can create password setup links for users. Only the owner can reset an admin account.
 
 ### First-run owner creation (§21)
 
@@ -147,8 +147,12 @@ tokens/reset links.
 Owners and admins can use the admin API. Only the owner can create admin accounts, disable admin
 accounts, modify the owner account, edit the public About text, or configure SMTP invite settings.
 Admins can create users manually, or generate standalone invite links that let invitees choose their
-username, display name, email, and password. Invite links are copyable without SMTP and can be sent
-by email when SMTP is enabled.
+username, display name, email, and password. Both user creation and invite creation require the actor's
+current password in `reauth_password`; all session password checks share a per-user failure limit.
+Invite links are copyable without SMTP and can be sent by email when SMTP is enabled.
+
+Bootstrap passwords must meet the same password policy as account passwords (8–1024 bytes).
+An empty secret file stops startup instead of creating an owner with an empty password.
 
 ### Security requirements that land here (§21)
 
@@ -178,7 +182,7 @@ by email when SMTP is enabled.
 - [x] Owner guardrails: only owner can create/disable admins, modify the owner account, and edit About text
 - [x] Re-authentication required for sensitive admin actions (create/disable user, reset password)
 - [x] Reset-password tokens: short-lived, random, stored hashed; redeeming one changes the password and revokes existing sessions/device tokens
-- [x] Login rate limiting by username/source and source, with bounded in-memory buckets
+- [x] Login and re-authentication have separate durable per-account limits; bounded in-memory buckets limit username/source traffic
 - [x] Audit-log writes for admin actions, password resets, token revocation
 
 ## Definition of done
