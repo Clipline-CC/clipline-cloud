@@ -1,7 +1,9 @@
 use axum::{
-    body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, Path, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    body::{Body, Bytes, HttpBody},
+    extract::{DefaultBodyLimit, Extension, Path, Request, State},
+    http::{header, HeaderMap},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -20,8 +22,11 @@ use clipline_cloud_storage::{
     CompletedUploadPart, MediaObjectKeys, ObjectKey, PutObjectMetadata, SharedStorageBackend,
     StorageError,
 };
+use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, LazyLock};
 use tokio::io::AsyncReadExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
 
 use crate::{
@@ -33,6 +38,111 @@ use crate::{
     validation::{normalized_optional_ref, validate_optional_char_count},
     AppState,
 };
+
+// Acquired before reading any request body. The blocking worker retains
+// the same permit on cancellation, so abandoned blocking work stays bounded.
+static UPLOAD_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+static ENRICHMENT_WORKERS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+#[derive(Clone)]
+struct UploadAdmission {
+    max_size: usize,
+    workers: Arc<Semaphore>,
+}
+
+async fn admit_upload(
+    State(admission): State<UploadAdmission>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.body().size_hint().lower() > admission.max_size as u64
+        || request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|size| size > admission.max_size as u64)
+    {
+        return ApiError::payload_too_large("upload body exceeds request limit").into_response();
+    }
+    let Ok(permit) = admission.workers.try_acquire_owned() else {
+        return ApiError::too_many_requests_after(
+            "upload capacity is busy",
+            std::time::Duration::from_secs(1),
+        )
+        .into_response();
+    };
+    let permit = Arc::new(permit);
+    request.extensions_mut().insert(permit.clone());
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
+struct StagedUpload {
+    path: tempfile::TempPath,
+    checksum: String,
+    size: u64,
+}
+
+async fn stage_upload(
+    mut body: Body,
+    expected_size: u64,
+    permit: Arc<OwnedSemaphorePermit>,
+) -> Result<StagedUpload, ApiError> {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
+    let worker = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let _permit = permit;
+        let mut file = tempfile::NamedTempFile::new()
+            .map_err(|_| ApiError::internal("upload scratch file could not be created"))?;
+        let mut digest = Sha256::new();
+        let mut size = 0_u64;
+        while let Some(bytes) = receiver.blocking_recv() {
+            size += bytes.len() as u64;
+            if size > expected_size {
+                return Err(ApiError::bad_request("request body exceeds expected size"));
+            }
+            digest.update(&bytes);
+            file.write_all(&bytes)
+                .map_err(|_| ApiError::internal("upload scratch write failed"))?;
+        }
+        if size != expected_size {
+            return Err(ApiError::bad_request(
+                "request body does not match expected size",
+            ));
+        }
+        file.flush()
+            .map_err(|_| ApiError::internal("upload scratch flush failed"))?;
+        Ok(StagedUpload {
+            path: file.into_temp_path(),
+            checksum: format!("{:x}", digest.finalize()),
+            size,
+        })
+    });
+    let mut size = 0_u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ApiError::bad_request("upload body could not be read"))?;
+        if let Ok(bytes) = frame.into_data() {
+            size = size
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| ApiError::bad_request("request body is too large"))?;
+            if size > expected_size {
+                return Err(ApiError::bad_request("request body exceeds expected size"));
+            }
+            for chunk in bytes.chunks(64 * 1024) {
+                sender
+                    .send(Bytes::copy_from_slice(chunk))
+                    .await
+                    .map_err(|_| ApiError::internal("upload scratch worker failed"))?;
+            }
+        }
+    }
+    drop(sender);
+    worker
+        .await
+        .map_err(|_| ApiError::internal("upload scratch worker failed"))?
+}
 
 const MIB: u64 = 1024 * 1024;
 const S3_MIN_PART_SIZE_BYTES: u64 = 5 * MIB;
@@ -53,8 +163,7 @@ fn schedule_automatic_game_category_enrichment(
     if !steamgriddb::configured(&state.config) {
         return;
     }
-    static ENRICHMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let Ok(permit) = ENRICHMENT_SLOTS.try_acquire() else {
+    let Ok(permit) = ENRICHMENT_WORKERS.try_acquire() else {
         return;
     };
     if crate::limits::check(
@@ -190,7 +299,14 @@ pub fn routes(max_request_body_bytes: usize) -> Router<AppState> {
     let media_body_routes = Router::new()
         .route("/api/v1/uploads/{id}/content", put(put_content))
         .route("/api/v1/uploads/{id}/parts/{part_number}", put(put_part))
-        .layer(DefaultBodyLimit::max(max_request_body_bytes));
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            UploadAdmission {
+                max_size: max_request_body_bytes,
+                workers: UPLOAD_WORKERS.clone(),
+            },
+            admit_upload,
+        ));
 
     Router::new()
         .route(
@@ -371,6 +487,7 @@ async fn put_content(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
     body: Body,
 ) -> Result<Json<UploadProgressResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
@@ -386,15 +503,8 @@ async fn put_content(
     }
 
     let expected_size = expected_size(&session)?;
-    let body = read_upload_body(&state.config, body, expected_size).await?;
-    if body.len() as u64 != expected_size {
-        return Err(ApiError::bad_request(format!(
-            "request body size {} does not match expected file size {expected_size}",
-            body.len()
-        )));
-    }
-
-    let checksum = sha256_hex(&body);
+    let staged = stage_upload(body, expected_size, permit).await?;
+    let checksum = staged.checksum.clone();
     if Some(checksum.as_str()) != session.checksum_sha256.as_deref() {
         return Err(ApiError::bad_request("whole-file SHA-256 mismatch"));
     }
@@ -404,7 +514,7 @@ async fn put_content(
     metadata.checksum_sha256 = Some(checksum);
     let object_metadata = state
         .storage
-        .put_object(&key, body, metadata)
+        .put_file(&key, &staged.path, metadata)
         .await
         .map_err(storage_error)?;
     if object_metadata.size_bytes != expected_size {
@@ -432,6 +542,7 @@ async fn put_part(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, part_number)): Path<(String, u16)>,
+    Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
     body: Body,
 ) -> Result<Json<PartUploadResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
@@ -445,14 +556,10 @@ async fn put_part(
     };
     validate_part_number_for_session(&session, part_number)?;
 
-    let body = read_upload_body(
-        &state.config,
-        body,
-        expected_size_for_part(&session, part_number)?,
-    )
-    .await?;
-
-    let checksum = sha256_hex(&body);
+    let expected = expected_size_for_part(&session, part_number)?;
+    validate_part_size(&state.config, &session, part_number, expected)?;
+    let staged = stage_upload(body, expected, permit).await?;
+    let checksum = staged.checksum.clone();
     if let Some(supplied_checksum) = optional_checksum_header(&headers)? {
         if supplied_checksum != checksum {
             return Err(ApiError::bad_request(
@@ -468,7 +575,7 @@ async fn put_part(
         .await?
     {
         if existing.checksum_sha256.as_deref() == Some(checksum.as_str())
-            && u64::try_from(existing.size_bytes).ok() == Some(body.len() as u64)
+            && u64::try_from(existing.size_bytes).ok() == Some(staged.size)
         {
             return Ok(Json(part_response(&session.id, &existing, true)));
         }
@@ -476,8 +583,6 @@ async fn put_part(
             "part number already exists with a different checksum",
         ));
     }
-
-    validate_part_size(&state.config, &session, part_number, body.len() as u64)?;
 
     let claim = clipline_cloud_db::new_ulid();
     if !state
@@ -504,7 +609,7 @@ async fn put_part(
             .release_write(&session.id, i64::from(part_number), &claim)
             .await?;
         if existing.checksum_sha256.as_deref() == Some(checksum.as_str())
-            && existing.size_bytes == body.len() as i64
+            && existing.size_bytes == staged.size as i64
         {
             return Ok(Json(part_response(&session.id, &existing, true)));
         }
@@ -516,7 +621,7 @@ async fn put_part(
     let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
     let uploaded_part = state
         .storage
-        .upload_part(storage_upload_id, &key, part_number, body)
+        .upload_part_file(storage_upload_id, &key, part_number, &staged.path)
         .await
         .map_err(storage_error)?;
 
@@ -1628,25 +1733,6 @@ async fn mark_upload_failed(
     Ok(())
 }
 
-async fn read_upload_body(
-    config: &Config,
-    body: Body,
-    expected_size: u64,
-) -> Result<Bytes, ApiError> {
-    let limit = usize::try_from(expected_size)
-        .unwrap_or(usize::MAX)
-        .min(crate::upload_request_body_limit(config));
-    let mut request = Request::new(body);
-    DefaultBodyLimit::max(limit).apply(&mut request);
-    Bytes::from_request(request, &()).await.map_err(|error| {
-        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::payload_too_large("upload body exceeds the allowed size")
-        } else {
-            ApiError::bad_request("failed to read upload body")
-        }
-    })
-}
-
 fn recovery_action(status: &str) -> Option<&'static str> {
     match status {
         "failed" => Some("delete_and_retry"),
@@ -1713,6 +1799,8 @@ fn validate_checksum(checksum: &str) -> Result<(), ApiError> {
     ))
 }
 
+#[cfg(test)]
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_bytes(&digest)
@@ -1867,24 +1955,6 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         headers
-    }
-
-    #[tokio::test]
-    async fn upload_body_is_bounded_by_the_expected_size() {
-        let (_temp_dir, state) = crate::tests::test_state().await;
-        assert_eq!(
-            read_upload_body(&state.config, Body::from("ok"), 2)
-                .await
-                .unwrap(),
-            Bytes::from_static(b"ok")
-        );
-        assert_eq!(
-            read_upload_body(&state.config, Body::from("oversized"), 2)
-                .await
-                .unwrap_err()
-                .status(),
-            StatusCode::PAYLOAD_TOO_LARGE
-        );
     }
 
     #[tokio::test]
@@ -2089,6 +2159,108 @@ mod tests {
             .expect_err("expected handler error")
             .into_response()
             .status()
+    }
+
+    #[tokio::test]
+    async fn upload_admission_rejects_before_polling_request_bodies() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+        use tower::ServiceExt;
+        struct PollTracker(Arc<AtomicUsize>);
+        impl tokio::io::AsyncRead for PollTracker {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+        }
+        let workers = Arc::new(Semaphore::new(1));
+        let _occupied = workers.acquire().await.unwrap();
+        async fn unexpected_upload(_: Body) -> StatusCode {
+            panic!("rejected uploads must not reach the handler")
+        }
+        let router =
+            Router::new()
+                .route("/", put(unexpected_upload))
+                .layer(middleware::from_fn_with_state(
+                    UploadAdmission {
+                        max_size: 1024,
+                        workers: workers.clone(),
+                    },
+                    admit_upload,
+                ));
+        for (length, status) in [
+            (1025, StatusCode::PAYLOAD_TOO_LARGE),
+            (1, StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let body = Body::from_stream(tokio_util::io::ReaderStream::new(PollTracker(
+                polls.clone(),
+            )));
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .method("PUT")
+                        .header(header::CONTENT_LENGTH, length)
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_checks_size_checksum_and_removes_scratch() {
+        let workers = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let staged = stage_upload(Body::from("streamed upload"), 15, permit)
+            .await
+            .unwrap();
+        let path = staged.path.to_path_buf();
+        assert_eq!(staged.checksum, sha256_hex(b"streamed upload"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"streamed upload");
+        drop(staged);
+        assert!(!path.exists());
+        for expected in [10, 20] {
+            let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+            let error = stage_upload(Body::from("streamed upload"), expected, permit)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_releases_worker_and_admission_permit() {
+        let workers = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let (_writer, reader) = tokio::io::duplex(1024);
+        let task = tokio::spawn(stage_upload(
+            Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+            100,
+            permit,
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), workers.acquire())
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

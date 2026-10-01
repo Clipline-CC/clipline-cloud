@@ -4,6 +4,9 @@ use sqlx::{Postgres, QueryBuilder, Sqlite};
 mod password_attempts;
 mod transactions;
 pub use password_attempts::{PasswordAttemptAdmission, PASSWORD_ATTEMPT_MAX};
+mod cursors;
+pub use cursors::ClipCursor;
+use cursors::{push_cursor_postgres, push_cursor_sqlite};
 
 use crate::{
     db_execute, db_execute_rows, db_fetch_all, db_fetch_optional, now_utc, AppSettings,
@@ -16,7 +19,7 @@ use crate::{
 
 pub const DEFAULT_ABOUT_TEXT: &str = "Self-hosted clip sharing for Clipline. Upload clips from the desktop app, manage your own library, and share public links without relying on a hosted service.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClipSort {
     RecordedAtDesc,
     RecordedAtAsc,
@@ -829,10 +832,13 @@ impl SessionRepository {
     }
 
     pub async fn touch(&self, id: &str) -> DbResult<()> {
+        let now = now_utc();
+        let cutoff = now - chrono::Duration::minutes(1);
         db_execute!(
             &self.database,
-            "UPDATE sessions SET last_used_at = ? WHERE id = ?",
-            [now_utc(), id]
+            "UPDATE sessions SET last_used_at = ? WHERE id = ?
+             AND (last_used_at IS NULL OR last_used_at <= ?) AND revoked_at IS NULL",
+            [now, id, cutoff]
         )?;
         Ok(())
     }
@@ -1035,10 +1041,13 @@ impl DeviceTokenRepository {
     }
 
     pub async fn touch(&self, id: &str) -> DbResult<()> {
+        let now = now_utc();
+        let cutoff = now - chrono::Duration::minutes(1);
         db_execute!(
             &self.database,
-            "UPDATE device_tokens SET last_used_at = ? WHERE id = ?",
-            [now_utc(), id]
+            "UPDATE device_tokens SET last_used_at = ? WHERE id = ?
+             AND (last_used_at IS NULL OR last_used_at <= ?) AND revoked_at IS NULL",
+            [now, id, cutoff]
         )?;
         Ok(())
     }
@@ -1231,82 +1240,193 @@ impl ClipRepository {
     }
 
     pub async fn list_for_owner(&self, params: &ClipListParams) -> DbResult<Vec<Clip>> {
-        match &self.database {
-            Database::Sqlite(pool) => {
-                let mut builder = QueryBuilder::<Sqlite>::new(CLIP_SELECT_SQL);
-                push_clip_list_filters_sqlite(&mut builder, params);
-                builder.push(clip_order_by(params.sort, self.database.kind()));
-                builder.push(" LIMIT ");
-                builder.push_bind(params.limit);
-                builder.push(" OFFSET ");
-                builder.push_bind(params.offset);
-                Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
-            }
-            Database::Postgres(pool) => {
-                let mut builder = QueryBuilder::<Postgres>::new(CLIP_SELECT_SQL);
-                push_clip_list_filters_postgres(&mut builder, params);
-                builder.push(clip_order_by(params.sort, self.database.kind()));
-                builder.push(" LIMIT ");
-                builder.push_bind(params.limit);
-                builder.push(" OFFSET ");
-                builder.push_bind(params.offset);
-                Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+        self.list_for_owner_segment(params, None).await
+    }
+
+    pub async fn list_for_owner_after(
+        &self,
+        params: &ClipListParams,
+        cursor: Option<&ClipCursor>,
+    ) -> DbResult<Vec<Clip>> {
+        let mut params = params.clone();
+        if cursor.is_some() {
+            params.offset = 0;
+        }
+        let mut rows = self.list_for_owner_segment(&params, cursor).await?;
+        if let Some(cursor) = cursor {
+            if cursor.has_null_tail() && rows.len() < params.limit as usize {
+                params.limit -= rows.len() as i64;
+                params.offset = 0;
+                rows.extend(
+                    self.list_for_owner_segment(&params, Some(&cursor.null_start()))
+                        .await?,
+                );
             }
         }
+        Ok(rows)
+    }
+
+    async fn list_for_owner_segment(
+        &self,
+        params: &ClipListParams,
+        cursor: Option<&ClipCursor>,
+    ) -> DbResult<Vec<Clip>> {
+        let started = std::time::Instant::now();
+        let result: DbResult<Vec<Clip>> = async {
+            match &self.database {
+                Database::Sqlite(pool) => {
+                    let mut builder = QueryBuilder::<Sqlite>::new(CLIP_SELECT_SQL);
+                    push_clip_list_filters_sqlite(&mut builder, params);
+                    if let Some(cursor) = cursor {
+                        push_cursor_sqlite(&mut builder, cursor);
+                    }
+                    builder.push(if cursor.is_some() {
+                        clip_cursor_order_by(params.sort, self.database.kind())
+                    } else {
+                        clip_order_by(params.sort, self.database.kind())
+                    });
+                    builder.push(" LIMIT ");
+                    builder.push_bind(params.limit);
+                    builder.push(" OFFSET ");
+                    builder.push_bind(params.offset);
+                    Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+                }
+                Database::Postgres(pool) => {
+                    let mut builder = QueryBuilder::<Postgres>::new(CLIP_SELECT_SQL);
+                    push_clip_list_filters_postgres(&mut builder, params);
+                    if let Some(cursor) = cursor {
+                        push_cursor_postgres(&mut builder, cursor);
+                    }
+                    builder.push(if cursor.is_some() {
+                        clip_cursor_order_by(params.sort, self.database.kind())
+                    } else {
+                        clip_order_by(params.sort, self.database.kind())
+                    });
+                    builder.push(" LIMIT ");
+                    builder.push_bind(params.limit);
+                    builder.push(" OFFSET ");
+                    builder.push_bind(params.offset);
+                    Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+                }
+            }
+        }
+        .await;
+        tracing::debug!(event = "db.query", operation = "list_for_owner", backend = ?self.database.kind(),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }
 
     pub async fn stats_for_owner(&self, params: &ClipListParams) -> DbResult<ClipListStats> {
-        let row = match &self.database {
-            Database::Sqlite(pool) => {
-                let mut builder = QueryBuilder::<Sqlite>::new(
+        let started = std::time::Instant::now();
+        let result: DbResult<ClipListStats> = async {
+            let row = match &self.database {
+                Database::Sqlite(pool) => {
+                    let mut builder = QueryBuilder::<Sqlite>::new(
                     "SELECT COUNT(*), CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT) FROM clips",
                 );
-                push_clip_list_filters_sqlite(&mut builder, params);
-                builder
-                    .build_query_as::<(i64, i64)>()
-                    .fetch_one(pool)
-                    .await?
-            }
-            Database::Postgres(pool) => {
-                let mut builder = QueryBuilder::<Postgres>::new(
+                    push_clip_list_filters_sqlite(&mut builder, params);
+                    builder
+                        .build_query_as::<(i64, i64)>()
+                        .fetch_one(pool)
+                        .await?
+                }
+                Database::Postgres(pool) => {
+                    let mut builder = QueryBuilder::<Postgres>::new(
                     "SELECT COUNT(*), CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT) FROM clips",
                 );
-                push_clip_list_filters_postgres(&mut builder, params);
-                builder
-                    .build_query_as::<(i64, i64)>()
-                    .fetch_one(pool)
-                    .await?
-            }
-        };
-        Ok(ClipListStats {
-            total: row.0,
-            total_size_bytes: row.1,
-        })
+                    push_clip_list_filters_postgres(&mut builder, params);
+                    builder
+                        .build_query_as::<(i64, i64)>()
+                        .fetch_one(pool)
+                        .await?
+                }
+            };
+            Ok(ClipListStats {
+                total: row.0,
+                total_size_bytes: row.1,
+            })
+        }
+        .await;
+        tracing::debug!(event = "db.query", operation = "stats_for_owner", backend = ?self.database.kind(),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }
 
     pub async fn list_public(&self, params: &PublicClipListParams) -> DbResult<Vec<Clip>> {
-        match &self.database {
-            Database::Sqlite(pool) => {
-                let mut builder = QueryBuilder::<Sqlite>::new(CLIP_SELECT_SQL);
-                push_public_clip_list_filters_sqlite(&mut builder, params);
-                builder.push(clip_order_by(params.sort, self.database.kind()));
-                builder.push(" LIMIT ");
-                builder.push_bind(params.limit);
-                builder.push(" OFFSET ");
-                builder.push_bind(params.offset);
-                Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
-            }
-            Database::Postgres(pool) => {
-                let mut builder = QueryBuilder::<Postgres>::new(CLIP_SELECT_SQL);
-                push_public_clip_list_filters_postgres(&mut builder, params);
-                builder.push(clip_order_by(params.sort, self.database.kind()));
-                builder.push(" LIMIT ");
-                builder.push_bind(params.limit);
-                builder.push(" OFFSET ");
-                builder.push_bind(params.offset);
-                Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+        self.list_public_segment(params, None).await
+    }
+
+    pub async fn list_public_after(
+        &self,
+        params: &PublicClipListParams,
+        cursor: Option<&ClipCursor>,
+    ) -> DbResult<Vec<Clip>> {
+        let mut params = params.clone();
+        if cursor.is_some() {
+            params.offset = 0;
+        }
+        let mut rows = self.list_public_segment(&params, cursor).await?;
+        if let Some(cursor) = cursor {
+            if cursor.has_null_tail() && rows.len() < params.limit as usize {
+                params.limit -= rows.len() as i64;
+                params.offset = 0;
+                rows.extend(
+                    self.list_public_segment(&params, Some(&cursor.null_start()))
+                        .await?,
+                );
             }
         }
+        Ok(rows)
+    }
+
+    async fn list_public_segment(
+        &self,
+        params: &PublicClipListParams,
+        cursor: Option<&ClipCursor>,
+    ) -> DbResult<Vec<Clip>> {
+        let started = std::time::Instant::now();
+        let result: DbResult<Vec<Clip>> = async {
+            match &self.database {
+                Database::Sqlite(pool) => {
+                    let mut builder = QueryBuilder::<Sqlite>::new(CLIP_SELECT_SQL);
+                    push_public_clip_list_filters_sqlite(&mut builder, params);
+                    if let Some(cursor) = cursor {
+                        push_cursor_sqlite(&mut builder, cursor);
+                    }
+                    builder.push(if cursor.is_some() {
+                        clip_cursor_order_by(params.sort, self.database.kind())
+                    } else {
+                        clip_order_by(params.sort, self.database.kind())
+                    });
+                    builder.push(" LIMIT ");
+                    builder.push_bind(params.limit);
+                    builder.push(" OFFSET ");
+                    builder.push_bind(params.offset);
+                    Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+                }
+                Database::Postgres(pool) => {
+                    let mut builder = QueryBuilder::<Postgres>::new(CLIP_SELECT_SQL);
+                    push_public_clip_list_filters_postgres(&mut builder, params);
+                    if let Some(cursor) = cursor {
+                        push_cursor_postgres(&mut builder, cursor);
+                    }
+                    builder.push(if cursor.is_some() {
+                        clip_cursor_order_by(params.sort, self.database.kind())
+                    } else {
+                        clip_order_by(params.sort, self.database.kind())
+                    });
+                    builder.push(" LIMIT ");
+                    builder.push_bind(params.limit);
+                    builder.push(" OFFSET ");
+                    builder.push_bind(params.offset);
+                    Ok(builder.build_query_as::<Clip>().fetch_all(pool).await?)
+                }
+            }
+        }
+        .await;
+        tracing::debug!(event = "db.query", operation = "list_public", backend = ?self.database.kind(),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }
 
     pub async fn list_public_games(&self) -> DbResult<Vec<PublicGameSummary>> {
@@ -1420,6 +1540,29 @@ impl ClipRepository {
         limit: i64,
     ) -> DbResult<Vec<Clip>> {
         Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE status = 'failed' AND deleted_at IS NULL AND COALESCE(quota_bytes, file_size_bytes, 0) > 0 AND id > ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE target_type = 'clip' AND target_id = clips.id AND status = 'running') ORDER BY id ASC LIMIT ?", [after_id, limit])?)
+    }
+
+    pub async fn list_ready_sources_after(&self, after: &str, limit: i64) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            Clip,
+            CLIP_SELECT_SQL.to_string()
+                + " WHERE status = 'ready' AND deleted_at IS NULL AND storage_key IS NOT NULL
+                AND id > ? ORDER BY id ASC LIMIT ?",
+            [after, limit]
+        )?)
+    }
+
+    pub async fn storage_key_is_referenced(&self, key: &str) -> DbResult<bool> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (i64,),
+            "SELECT CAST(1 AS BIGINT) FROM clips WHERE deleted_at IS NULL AND status <> 'deleted'
+             AND (status <> 'failed' OR EXISTS (SELECT 1 FROM upload_sessions WHERE upload_sessions.clip_id = clips.id AND upload_sessions.failure_reason = 'ready clip source object is missing'))
+             AND (storage_key = ? OR poster_key = ? OR thumbnail_key = ?) LIMIT 1",
+            [key, key, key]
+        )?
+        .is_some())
     }
 
     pub async fn list_deleted(&self, limit: i64) -> DbResult<Vec<Clip>> {
@@ -1908,6 +2051,7 @@ fn push_clip_optional_filters_sqlite(
     }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
+        push_sqlite_search_candidates(builder, query, &pattern);
         builder.push(" AND (LOWER(title) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
@@ -1970,15 +2114,18 @@ fn push_clip_optional_filters_postgres(
     }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
-        builder.push(" AND (LOWER(title) LIKE ");
+        builder.push(" AND clips.id IN (SELECT search_clip.id FROM clips search_clip WHERE LOWER(search_clip.title) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
+        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(search_clip.game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(search_clip.game_id, '')) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
+        builder.push(" ESCAPE '\\' UNION SELECT category_clip.id FROM game_categories candidate_category
+            JOIN game_category_names candidate_name ON candidate_name.category_id = candidate_category.id
+            JOIN clips category_clip ON LOWER(category_clip.game_name) = LOWER(candidate_name.reported_name)
+            WHERE LOWER(candidate_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\'))");
+        builder.push(" ESCAPE '\\')");
     }
 }
 
@@ -2000,6 +2147,7 @@ fn push_public_clip_optional_filters_sqlite(
     }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
+        push_sqlite_search_candidates(builder, query, &pattern);
         builder.push(" AND (LOWER(title) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
@@ -2030,15 +2178,55 @@ fn push_public_clip_optional_filters_postgres(
     }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
-        builder.push(" AND (LOWER(title) LIKE ");
+        builder.push(" AND clips.id IN (SELECT search_clip.id FROM clips search_clip WHERE LOWER(search_clip.title) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
+        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(search_clip.game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push(" ESCAPE '\\' OR LOWER(COALESCE(search_clip.game_id, '')) LIKE ");
         builder.push_bind(pattern.clone());
-        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
+        builder.push(" ESCAPE '\\' UNION SELECT category_clip.id FROM game_categories candidate_category
+            JOIN game_category_names candidate_name ON candidate_name.category_id = candidate_category.id
+            JOIN clips category_clip ON LOWER(category_clip.game_name) = LOWER(candidate_name.reported_name)
+            WHERE LOWER(candidate_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\'))");
+        builder.push(" ESCAPE '\\')");
+    }
+}
+
+fn push_sqlite_search_candidates(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    query: &str,
+    pattern: &str,
+) {
+    // Short strings have no trigram. NUL is not representable in an FTS phrase;
+    // fall back to the authoritative LIKE query for both cases.
+    if query.chars().count() < 3 || query.contains('\0') {
+        return;
+    }
+    let phrase = format!("\"{}\"", query.to_lowercase().replace('"', "\"\""));
+    builder.push(" AND clips.id IN (SELECT document.clip_id FROM clip_search JOIN clip_search_documents document ON document.id = clip_search.rowid WHERE clip_search MATCH ");
+    builder.push_bind(phrase);
+    builder.push(" UNION SELECT category_clip.id FROM game_categories candidate_category
+        JOIN game_category_names candidate_name ON candidate_name.category_id = candidate_category.id
+        JOIN clips category_clip ON LOWER(category_clip.game_name) = LOWER(candidate_name.reported_name)
+        WHERE LOWER(candidate_category.display_name) LIKE ");
+    builder.push_bind(pattern.to_string());
+    builder.push(" ESCAPE '\\')");
+}
+
+fn clip_cursor_order_by(sort: ClipSort, database: crate::DatabaseKind) -> &'static str {
+    // Cursor queries constrain the NULL segment. Keeping its constant expression
+    // in ORDER BY makes SQLite sort the matched rows instead of stopping early.
+    match sort {
+        ClipSort::RecordedAtDesc => " ORDER BY recorded_at DESC, id DESC",
+        ClipSort::RecordedAtAsc => " ORDER BY recorded_at ASC, id ASC",
+        ClipSort::UploadedAtDesc => " ORDER BY uploaded_at DESC, id DESC",
+        ClipSort::UploadedAtAsc => " ORDER BY uploaded_at ASC, id ASC",
+        ClipSort::DurationDesc => " ORDER BY duration_ms DESC, id DESC",
+        ClipSort::DurationAsc => " ORDER BY duration_ms ASC, id ASC",
+        ClipSort::FileSizeDesc => " ORDER BY file_size_bytes DESC, id DESC",
+        ClipSort::FileSizeAsc => " ORDER BY file_size_bytes ASC, id ASC",
+        _ => clip_order_by(sort, database),
     }
 }
 
@@ -2340,6 +2528,11 @@ impl UploadSessionRepository {
         )?)
     }
 
+    pub async fn storage_upload_is_active(&self, upload_id: &str) -> DbResult<bool> {
+        Ok(db_fetch_optional!(&self.database, (i64,),
+            "SELECT CAST(1 AS BIGINT) FROM upload_sessions WHERE storage_upload_id = ? AND status IN ('created','uploading') LIMIT 1", [upload_id])?.is_some())
+    }
+
     pub async fn list_active_storage_upload_ids(&self) -> DbResult<Vec<String>> {
         let rows = db_fetch_all!(
             &self.database,
@@ -2611,6 +2804,30 @@ pub struct JobRepository {
 impl JobRepository {
     pub fn new(database: Database) -> Self {
         Self { database }
+    }
+
+    pub async fn sweep_cursor(&self, name: &str) -> DbResult<Option<String>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (Option<String>,),
+            "SELECT value FROM maintenance_cursors WHERE name = ?",
+            [name]
+        )?
+        .and_then(|row| row.0))
+    }
+
+    pub async fn set_sweep_cursor(&self, name: &str, value: Option<&str>) -> DbResult<()> {
+        db_execute!(&self.database,
+            "INSERT INTO maintenance_cursors(name, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            [name, value, now_utc()])?;
+        Ok(())
+    }
+
+    pub async fn prune_succeeded_before(&self, before: DateTime<Utc>, limit: i64) -> DbResult<u64> {
+        Ok(db_execute_rows!(&self.database,
+            "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE status = 'succeeded' AND updated_at < ?
+             ORDER BY updated_at ASC, id ASC LIMIT ?)", [before, limit])?)
     }
 
     pub async fn create(&self, new: &NewJob) -> DbResult<Job> {

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -54,6 +55,8 @@ pub enum StorageError {
     InvalidKey { key: String, reason: &'static str },
     #[error("object not found: {0}")]
     NotFound(String),
+    #[error("object changed while opening stream: {0}")]
+    ObjectChanged(String),
     #[error("invalid byte range {start}-{end:?} for object of size {size}")]
     InvalidRange {
         start: u64,
@@ -211,10 +214,23 @@ pub struct ObjectSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPage {
+    pub objects: Vec<ObjectSummary>,
+    /// Last logical key, exclusive; portable across worker restarts.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartUploadSummary {
     pub upload_id: String,
     pub key: ObjectKey,
     pub initiated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadPage {
+    pub uploads: Vec<MultipartUploadSummary>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +298,18 @@ pub trait StorageBackend: Send + Sync {
         key: &ObjectKey,
         range: Option<ByteRange>,
     ) -> StorageResult<StoredObjectStream>;
+    /// Reuse a caller's HEAD result; implementations must detect source replacement.
+    async fn get_object_stream_with_metadata(
+        &self,
+        key: &ObjectKey,
+        range: Option<ByteRange>,
+        _metadata: ObjectMetadata,
+    ) -> StorageResult<StoredObjectStream> {
+        self.get_object_stream(key, range).await
+    }
+    fn supports_read_urls(&self) -> bool {
+        false
+    }
     async fn copy_object(
         &self,
         source_key: &ObjectKey,
@@ -292,11 +320,53 @@ pub trait StorageBackend: Send + Sync {
     async fn delete_object(&self, key: &ObjectKey) -> StorageResult<()>;
     async fn object_exists(&self, key: &ObjectKey) -> StorageResult<bool>;
     async fn list_objects(&self, prefix: &str) -> StorageResult<Vec<ObjectSummary>>;
+    async fn list_objects_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<ObjectPage> {
+        let mut objects = self.list_objects(prefix).await?;
+        objects.sort_by(|a, b| a.key.as_str().cmp(b.key.as_str()));
+        objects.retain(|object| after.map_or(true, |after| object.key.as_str() > after));
+        let has_more = objects.len() > limit;
+        objects.truncate(limit);
+        let next_cursor = if has_more {
+            objects.last().map(|object| object.key.to_string())
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            objects,
+            next_cursor,
+        })
+    }
     async fn create_multipart_upload(&self, key: &ObjectKey) -> StorageResult<String>;
     async fn list_multipart_uploads(
         &self,
         prefix: &str,
     ) -> StorageResult<Vec<MultipartUploadSummary>>;
+    async fn list_multipart_uploads_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<MultipartUploadPage> {
+        let mut uploads = self.list_multipart_uploads(prefix).await?;
+        uploads.sort_by(|a, b| a.upload_id.cmp(&b.upload_id));
+        uploads.retain(|upload| after.map_or(true, |after| upload.upload_id.as_str() > after));
+        let has_more = uploads.len() > limit;
+        uploads.truncate(limit);
+        let next_cursor = if has_more {
+            uploads.last().map(|upload| upload.upload_id.clone())
+        } else {
+            None
+        };
+        Ok(MultipartUploadPage {
+            uploads,
+            next_cursor,
+        })
+    }
     async fn upload_part(
         &self,
         upload_id: &str,
@@ -304,6 +374,21 @@ pub trait StorageBackend: Send + Sync {
         part_number: u16,
         bytes: Bytes,
     ) -> StorageResult<PartResult>;
+    async fn upload_part_file(
+        &self,
+        upload_id: &str,
+        key: &ObjectKey,
+        part_number: u16,
+        path: &Path,
+    ) -> StorageResult<PartResult> {
+        self.upload_part(
+            upload_id,
+            key,
+            part_number,
+            Bytes::from(fs::read(path).await?),
+        )
+        .await
+    }
     async fn create_upload_part_url(
         &self,
         upload_id: &str,
@@ -320,6 +405,13 @@ pub trait StorageBackend: Send + Sync {
     ) -> StorageResult<ObjectMetadata>;
     async fn abort_multipart_upload(&self, upload_id: &str, key: &ObjectKey) -> StorageResult<()>;
     async fn create_read_url(&self, key: &ObjectKey, ttl: Duration) -> StorageResult<Option<Url>>;
+}
+
+struct UncommittedFile(PathBuf);
+impl Drop for UncommittedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +473,7 @@ impl LocalStorage {
             fs::create_dir_all(parent).await?;
         }
 
+        let _uncommitted = UncommittedFile(tmp_path.clone());
         let mut final_file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -402,16 +495,30 @@ impl LocalStorage {
                 )));
             }
 
-            let expected_etag = local_part_etag_for_path(part.part_number, &part_path).await?;
-            if part.etag != expected_etag {
+            let mut part_file = File::open(part_path).await?;
+            let mut digest = Sha256::new();
+            let mut copied = 0_u64;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let count = part_file.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                copied += count as u64;
+                digest.update(&buffer[..count]);
+                final_file.write_all(&buffer[..count]).await?;
+            }
+            let expected_etag = format!(
+                "local-part-{}-{}",
+                part.part_number,
+                hex_bytes(&digest.finalize())
+            );
+            if copied != part.size_bytes || part.etag != expected_etag {
                 return Err(StorageError::InvalidPart(format!(
                     "part {} etag mismatch",
                     part.part_number
                 )));
             }
-
-            let mut part_file = File::open(part_path).await?;
-            tokio::io::copy(&mut part_file, &mut final_file).await?;
         }
 
         final_file.flush().await?;
@@ -522,6 +629,11 @@ impl StorageBackend for LocalStorage {
         bytes: Bytes,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "put_object",
+            backend = "LocalStorage"
+        );
         self.probe().await?;
         let final_path = self.path_for_key(key);
         let tmp_path = unique_tmp_path(&final_path);
@@ -555,6 +667,11 @@ impl StorageBackend for LocalStorage {
         path: &Path,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "put_file",
+            backend = "LocalStorage"
+        );
         self.probe().await?;
         let final_path = self.path_for_key(key);
         let tmp_path = unique_tmp_path(&final_path);
@@ -579,6 +696,11 @@ impl StorageBackend for LocalStorage {
         key: &ObjectKey,
         range: Option<ByteRange>,
     ) -> StorageResult<StoredObject> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "get_object",
+            backend = "LocalStorage"
+        );
         let metadata = self.head_object(key).await?;
         let path = self.path_for_key(key);
         let mut file = File::open(&path)
@@ -625,10 +747,33 @@ impl StorageBackend for LocalStorage {
         range: Option<ByteRange>,
     ) -> StorageResult<StoredObjectStream> {
         let metadata = self.head_object(key).await?;
+        self.get_object_stream_with_metadata(key, range, metadata)
+            .await
+    }
+
+    async fn get_object_stream_with_metadata(
+        &self,
+        key: &ObjectKey,
+        range: Option<ByteRange>,
+        metadata: ObjectMetadata,
+    ) -> StorageResult<StoredObjectStream> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "get_object_stream_with_metadata",
+            backend = "LocalStorage"
+        );
         let path = self.path_for_key(key);
         let mut file = File::open(&path)
             .await
             .map_err(|error| map_not_found(error, key.to_string()))?;
+
+        let opened = file.metadata().await?;
+        if !opened.is_file()
+            || opened.len() != metadata.size_bytes
+            || opened.modified().ok().map(DateTime::<Utc>::from) != metadata.last_modified
+        {
+            return Err(StorageError::ObjectChanged(key.to_string()));
+        }
 
         let (start, end_inclusive, content_range) = match range {
             Some(range) => {
@@ -667,6 +812,11 @@ impl StorageBackend for LocalStorage {
         target_key: &ObjectKey,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "copy_object",
+            backend = "LocalStorage"
+        );
         self.probe().await?;
         let source_path = self.path_for_key(source_key);
         let final_path = self.path_for_key(target_key);
@@ -696,10 +846,16 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn head_object(&self, key: &ObjectKey) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "head_object",
+            backend = "LocalStorage"
+        );
         let path = self.path_for_key(key);
         let file_metadata = local_regular_file_metadata(&path, key).await?;
 
         let sidecar = read_local_sidecar(&path).await?;
+        let fallback_etag = fallback_local_etag(&file_metadata);
         Ok(ObjectMetadata {
             size_bytes: file_metadata.len(),
             content_type: sidecar
@@ -709,13 +865,19 @@ impl StorageBackend for LocalStorage {
             etag: sidecar
                 .as_ref()
                 .and_then(|value| value.etag.clone())
-                .or_else(|| Some(fallback_local_etag(&file_metadata))),
+                .filter(|etag| !etag.starts_with("local-") || *etag == fallback_etag)
+                .or(Some(fallback_etag)),
             last_modified: file_metadata.modified().ok().map(DateTime::<Utc>::from),
             checksum_sha256: sidecar.and_then(|value| value.checksum_sha256),
         })
     }
 
     async fn delete_object(&self, key: &ObjectKey) -> StorageResult<()> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "delete_object",
+            backend = "LocalStorage"
+        );
         let path = self.path_for_key(key);
         match fs::remove_file(&path).await {
             Ok(()) => {}
@@ -774,7 +936,121 @@ impl StorageBackend for LocalStorage {
         Ok(summaries)
     }
 
+    async fn list_objects_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<ObjectPage> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "list_objects_page",
+            backend = "LocalStorage"
+        );
+        validate_prefix(prefix)?;
+        let limit = limit.clamp(1, 1000);
+        let start = self.data_dir.join(prefix.trim_end_matches('/'));
+        let first = match fs::read_dir(&start).await {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ObjectPage {
+                    objects: vec![],
+                    next_cursor: None,
+                })
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // Filesystem iteration is unordered. Retain only the smallest limit+1
+        // keys, with a traversal stack bounded by directory depth.
+        let mut stack = vec![first];
+        let mut candidates: BTreeMap<String, ObjectSummary> = BTreeMap::new();
+        while let Some(dir) = stack.last_mut() {
+            let Some(entry) = dir.next_entry().await? else {
+                stack.pop();
+                continue;
+            };
+            let path = entry.path();
+            let relative_key =
+                path_to_object_key(path.strip_prefix(&self.data_dir).expect("storage path"))?;
+            if candidates.len() > limit
+                && candidates
+                    .last_key_value()
+                    .is_some_and(|(last, _)| relative_key.as_str() > last.as_str())
+            {
+                continue;
+            }
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                // Descendants sort by the prefix including '/': a-/source sorts
+                // before a/source even though the directory name a sorts first.
+                let directory_prefix = format!("{relative_key}/");
+                if after.is_some_and(|after| {
+                    directory_prefix.as_str() <= after && !after.starts_with(&directory_prefix)
+                }) {
+                    continue;
+                }
+                match fs::read_dir(entry.path()).await {
+                    Ok(dir) => stack.push(dir),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let key = path_to_object_key(path.strip_prefix(&self.data_dir).expect("storage path"))?;
+            if key.as_str().ends_with(".meta.json")
+                || after.is_some_and(|after| key.as_str() <= after)
+            {
+                continue;
+            }
+            if candidates.len() > limit
+                && candidates
+                    .last_key_value()
+                    .is_some_and(|(last, _)| key.as_str() >= last.as_str())
+            {
+                continue;
+            }
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            candidates.insert(
+                key.to_string(),
+                ObjectSummary {
+                    key,
+                    size_bytes: metadata.len(),
+                    last_modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+                },
+            );
+            if candidates.len() > limit + 1 {
+                candidates.pop_last();
+            }
+        }
+        let has_more = candidates.len() > limit;
+        if has_more {
+            candidates.pop_last();
+        }
+        let next_cursor = if has_more {
+            candidates.last_key_value().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            objects: candidates.into_values().collect(),
+            next_cursor,
+        })
+    }
+
     async fn create_multipart_upload(&self, key: &ObjectKey) -> StorageResult<String> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_multipart_upload",
+            backend = "LocalStorage"
+        );
         self.probe().await?;
         let upload_id = generate_upload_id();
         let upload_dir = self.upload_dir(&upload_id)?;
@@ -832,6 +1108,89 @@ impl StorageBackend for LocalStorage {
         Ok(summaries)
     }
 
+    async fn list_multipart_uploads_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<MultipartUploadPage> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "list_multipart_uploads_page",
+            backend = "LocalStorage"
+        );
+        validate_prefix(prefix)?;
+        let limit = limit.clamp(1, 1000);
+        let mut candidates = BTreeMap::new();
+        let mut entries = match fs::read_dir(&self.tmp_uploads_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(MultipartUploadPage {
+                    uploads: vec![],
+                    next_cursor: None,
+                })
+            }
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let Some(upload_id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if after.is_some_and(|after| upload_id.as_str() <= after)
+                || (candidates.len() > limit
+                    && candidates
+                        .last_key_value()
+                        .is_some_and(|(last, _)| &upload_id >= last))
+            {
+                continue;
+            }
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            validate_upload_id(&upload_id)?;
+            let metadata = match entry.metadata().await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let upload_metadata = self.read_upload_metadata(&upload_id).await?;
+            let key = match upload_metadata
+                .as_ref()
+                .and_then(|value| ObjectKey::parse(value.key.clone()).ok())
+            {
+                Some(key) => key,
+                None => ObjectKey::parse("objects/media/unknown/source.mp4")?,
+            };
+            if !key.as_str().starts_with(prefix) {
+                continue;
+            }
+            let summary = MultipartUploadSummary {
+                upload_id: upload_id.clone(),
+                key,
+                initiated_at: upload_metadata
+                    .map(|value| value.created_at)
+                    .or_else(|| metadata.modified().ok().map(DateTime::<Utc>::from)),
+            };
+            candidates.insert(upload_id, summary);
+            if candidates.len() > limit + 1 {
+                candidates.pop_last();
+            }
+        }
+        let has_more = candidates.len() > limit;
+        if has_more {
+            candidates.pop_last();
+        }
+        let next_cursor = if has_more {
+            candidates.last_key_value().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        Ok(MultipartUploadPage {
+            uploads: candidates.into_values().collect(),
+            next_cursor,
+        })
+    }
+
     async fn upload_part(
         &self,
         upload_id: &str,
@@ -839,6 +1198,11 @@ impl StorageBackend for LocalStorage {
         part_number: u16,
         bytes: Bytes,
     ) -> StorageResult<PartResult> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "upload_part",
+            backend = "LocalStorage"
+        );
         validate_part_number(part_number)?;
         let part_path = self.part_path(upload_id, part_number)?;
         let tmp_path = unique_tmp_path(&part_path);
@@ -866,6 +1230,51 @@ impl StorageBackend for LocalStorage {
         })
     }
 
+    async fn upload_part_file(
+        &self,
+        upload_id: &str,
+        _key: &ObjectKey,
+        part_number: u16,
+        path: &Path,
+    ) -> StorageResult<PartResult> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "upload_part_file",
+            backend = "LocalStorage"
+        );
+        validate_part_number(part_number)?;
+        let part_path = self.part_path(upload_id, part_number)?;
+        let tmp_path = unique_tmp_path(&part_path);
+        let _uncommitted = UncommittedFile(tmp_path.clone());
+        if let Some(parent) = part_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let mut source = File::open(path).await?;
+        let mut target = File::create(&tmp_path).await?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let mut size_bytes = 0_u64;
+        loop {
+            let count = source.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+            target.write_all(&buffer[..count]).await?;
+            size_bytes += count as u64;
+        }
+        target.flush().await?;
+        target.sync_all().await?;
+        drop(target);
+        fs::rename(&tmp_path, &part_path).await?;
+        sync_parent_dir(&part_path).await;
+        Ok(PartResult {
+            part_number,
+            size_bytes,
+            etag: format!("local-part-{part_number}-{}", hex_bytes(&digest.finalize())),
+        })
+    }
+
     async fn create_upload_part_url(
         &self,
         _upload_id: &str,
@@ -874,6 +1283,11 @@ impl StorageBackend for LocalStorage {
         _size_bytes: u64,
         _ttl: Duration,
     ) -> StorageResult<Option<PresignedUploadPartUrl>> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_upload_part_url",
+            backend = "LocalStorage"
+        );
         validate_part_number(part_number)?;
         Ok(None)
     }
@@ -884,6 +1298,11 @@ impl StorageBackend for LocalStorage {
         key: &ObjectKey,
         parts: &[CompletedUploadPart],
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "complete_multipart_upload",
+            backend = "LocalStorage"
+        );
         self.complete_multipart_upload_inner(upload_id, key, parts, false)
             .await
     }
@@ -901,6 +1320,11 @@ impl StorageBackend for LocalStorage {
         _key: &ObjectKey,
         _ttl: Duration,
     ) -> StorageResult<Option<Url>> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_read_url",
+            backend = "LocalStorage"
+        );
         Ok(None)
     }
 }
@@ -1135,6 +1559,11 @@ impl StorageBackend for S3Storage {
         bytes: Bytes,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "put_object",
+            backend = "S3Storage"
+        );
         let physical_key = self.physical_key(key);
         let mut request = self
             .client
@@ -1156,6 +1585,11 @@ impl StorageBackend for S3Storage {
         path: &Path,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "put_file",
+            backend = "S3Storage"
+        );
         let size_bytes = fs::metadata(path).await?.len();
         let physical_key = self.physical_key(key);
         if size_bytes <= S3_SINGLE_COPY_MAX_BYTES {
@@ -1268,6 +1702,11 @@ impl StorageBackend for S3Storage {
         key: &ObjectKey,
         range: Option<ByteRange>,
     ) -> StorageResult<StoredObject> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "get_object",
+            backend = "S3Storage"
+        );
         let metadata = self.head_object(key).await?;
         let content_range = range
             .as_ref()
@@ -1310,6 +1749,21 @@ impl StorageBackend for S3Storage {
         range: Option<ByteRange>,
     ) -> StorageResult<StoredObjectStream> {
         let metadata = self.head_object(key).await?;
+        self.get_object_stream_with_metadata(key, range, metadata)
+            .await
+    }
+
+    async fn get_object_stream_with_metadata(
+        &self,
+        key: &ObjectKey,
+        range: Option<ByteRange>,
+        metadata: ObjectMetadata,
+    ) -> StorageResult<StoredObjectStream> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "get_object_stream_with_metadata",
+            backend = "S3Storage"
+        );
         let content_range = range
             .as_ref()
             .map(|range| {
@@ -1330,13 +1784,30 @@ impl StorageBackend for S3Storage {
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(physical_key);
+            .key(physical_key)
+            .set_if_match(metadata.etag.as_ref().map(|etag| format!("\"{etag}\"")));
         if let Some(range) = &content_range {
             request = request
                 .range(ByteRange::new(range.start, Some(range.end_inclusive)).s3_header_value());
         }
 
-        let output = request.send().await.map_err(s3_error)?;
+        let output = request.send().await.map_err(|error| {
+            if error.as_service_error().and_then(|error| error.code()) == Some("PreconditionFailed")
+            {
+                StorageError::ObjectChanged(key.to_string())
+            } else if is_s3_not_found(&error) {
+                StorageError::NotFound(key.to_string())
+            } else {
+                s3_error(error)
+            }
+        })?;
+        if output
+            .content_length()
+            .and_then(|len| u64::try_from(len).ok())
+            != Some(content_length)
+        {
+            return Err(StorageError::ObjectChanged(key.to_string()));
+        }
         Ok(StoredObjectStream {
             reader: Box::pin(output.body.into_async_read().take(content_length)),
             metadata,
@@ -1345,12 +1816,21 @@ impl StorageBackend for S3Storage {
         })
     }
 
+    fn supports_read_urls(&self) -> bool {
+        true
+    }
+
     async fn copy_object(
         &self,
         source_key: &ObjectKey,
         target_key: &ObjectKey,
         metadata: PutObjectMetadata,
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "copy_object",
+            backend = "S3Storage"
+        );
         let source_metadata = self.head_object(source_key).await?;
         if source_metadata.size_bytes <= S3_SINGLE_COPY_MAX_BYTES {
             self.copy_object_single(source_key, target_key, metadata)
@@ -1362,6 +1842,11 @@ impl StorageBackend for S3Storage {
     }
 
     async fn head_object(&self, key: &ObjectKey) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "head_object",
+            backend = "S3Storage"
+        );
         let output = self
             .client
             .head_object()
@@ -1392,6 +1877,11 @@ impl StorageBackend for S3Storage {
     }
 
     async fn delete_object(&self, key: &ObjectKey) -> StorageResult<()> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "delete_object",
+            backend = "S3Storage"
+        );
         self.client
             .delete_object()
             .bucket(&self.bucket)
@@ -1454,7 +1944,66 @@ impl StorageBackend for S3Storage {
         Ok(summaries)
     }
 
+    async fn list_objects_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<ObjectPage> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "list_objects_page",
+            backend = "S3Storage"
+        );
+        validate_prefix(prefix)?;
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(self.physical_prefix(prefix))
+            .max_keys(limit.clamp(1, 1000) as i32);
+        if let Some(after) = after {
+            // Inventory cursors may name a skipped folder marker or foreign key.
+            request = request.start_after(self.physical_prefix(after));
+        }
+        let output = request.send().await.map_err(s3_error)?;
+        let mut objects = Vec::new();
+        let mut last_key = None;
+        for object in output.contents() {
+            let Some(key) = object.key().and_then(|key| self.logical_key(key)) else {
+                continue;
+            };
+            last_key = Some(key.to_owned());
+            let key = match ObjectKey::parse(&key) {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(event = "storage.s3.invalid_inventory_key", key, error = %error);
+                    continue;
+                }
+            };
+            objects.push(ObjectSummary {
+                key,
+                size_bytes: object.size().unwrap_or(0).max(0) as u64,
+                last_modified: object.last_modified().and_then(smithy_datetime_to_chrono),
+            });
+        }
+        let next_cursor = if output.is_truncated().unwrap_or(false) {
+            last_key
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            objects,
+            next_cursor,
+        })
+    }
+
     async fn create_multipart_upload(&self, key: &ObjectKey) -> StorageResult<String> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_multipart_upload",
+            backend = "S3Storage"
+        );
         let output = self
             .client
             .create_multipart_upload()
@@ -1475,51 +2024,102 @@ impl StorageBackend for S3Storage {
         &self,
         prefix: &str,
     ) -> StorageResult<Vec<MultipartUploadSummary>> {
-        validate_prefix(prefix)?;
-        let physical_prefix = self.physical_prefix(prefix);
-        let mut key_marker = None;
-        let mut upload_id_marker = None;
-        let mut summaries = Vec::new();
+        let mut cursor = None;
+        let mut uploads = Vec::new();
         loop {
-            let mut request = self
-                .client
-                .list_multipart_uploads()
-                .bucket(&self.bucket)
-                .prefix(&physical_prefix);
-            if let Some(marker) = key_marker.take() {
-                request = request.key_marker(marker);
-            }
-            if let Some(marker) = upload_id_marker.take() {
-                request = request.upload_id_marker(marker);
-            }
-
-            let output = request.send().await.map_err(s3_error)?;
-            for upload in output.uploads() {
-                let (Some(upload_id), Some(physical_key)) = (upload.upload_id(), upload.key())
-                else {
-                    continue;
-                };
-                let Some(logical_key) = self.logical_key(physical_key) else {
-                    continue;
-                };
-                summaries.push(MultipartUploadSummary {
-                    upload_id: upload_id.to_string(),
-                    key: ObjectKey::parse(logical_key)?,
-                    initiated_at: upload.initiated().and_then(smithy_datetime_to_chrono),
-                });
-            }
-
-            if output.is_truncated().unwrap_or(false) {
-                key_marker = output.next_key_marker().map(ToOwned::to_owned);
-                upload_id_marker = output.next_upload_id_marker().map(ToOwned::to_owned);
-                if key_marker.is_none() {
-                    break;
-                }
-            } else {
+            let page = self
+                .list_multipart_uploads_page(prefix, cursor.as_deref(), 1000)
+                .await?;
+            uploads.extend(page.uploads);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
                 break;
             }
         }
-        Ok(summaries)
+        Ok(uploads)
+    }
+
+    async fn list_multipart_uploads_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<MultipartUploadPage> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "list_multipart_uploads_page",
+            backend = "S3Storage"
+        );
+        validate_prefix(prefix)?;
+        let mut request = self
+            .client
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .prefix(self.physical_prefix(prefix))
+            .max_uploads(limit.clamp(1, 1000) as i32);
+        if let Some(after) = after {
+            let (key, upload_id): (String, String) = serde_json::from_str(after)
+                .map_err(|error| StorageError::InvalidPart(error.to_string()))?;
+            request = request
+                .key_marker(self.physical_prefix(&key))
+                .upload_id_marker(upload_id);
+        }
+        let output = request.send().await.map_err(s3_error)?;
+        let mut uploads = Vec::new();
+        let mut last_marker = None;
+        for upload in output.uploads() {
+            let (Some(upload_id), Some(key)) = (
+                upload.upload_id(),
+                upload.key().and_then(|key| self.logical_key(key)),
+            ) else {
+                continue;
+            };
+            last_marker = Some((key.to_owned(), upload_id.to_owned()));
+            let key = match ObjectKey::parse(&key) {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(event = "storage.s3.invalid_multipart_key", key, error = %error);
+                    continue;
+                }
+            };
+            uploads.push(MultipartUploadSummary {
+                upload_id: upload_id.to_string(),
+                key,
+                initiated_at: upload.initiated().and_then(smithy_datetime_to_chrono),
+            });
+        }
+        let next_cursor = if output.is_truncated().unwrap_or(false) {
+            // Some S3-compatible servers return an empty NextKeyMarker for
+            // multiple uploads of the same key. The last returned key is valid.
+            let key = output
+                .next_key_marker()
+                .filter(|key| !key.is_empty())
+                .and_then(|key| self.logical_key(key))
+                .or_else(|| last_marker.as_ref().map(|(key, _)| key.clone()))
+                .ok_or_else(|| StorageError::S3("S3 omitted the multipart page marker".into()))?;
+            let upload_id = output
+                .next_upload_id_marker()
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    last_marker
+                        .as_ref()
+                        .map(|(_, upload_id)| upload_id.as_str())
+                })
+                .ok_or_else(|| StorageError::S3("S3 omitted the multipart upload marker".into()))?;
+            let cursor = serde_json::to_string(&(key, upload_id)).expect("multipart cursor");
+            if Some(cursor.as_str()) == after {
+                return Err(StorageError::S3(
+                    "S3 multipart listing did not advance".into(),
+                ));
+            }
+            Some(cursor)
+        } else {
+            None
+        };
+        Ok(MultipartUploadPage {
+            uploads,
+            next_cursor,
+        })
     }
 
     async fn upload_part(
@@ -1529,6 +2129,11 @@ impl StorageBackend for S3Storage {
         part_number: u16,
         bytes: Bytes,
     ) -> StorageResult<PartResult> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "upload_part",
+            backend = "S3Storage"
+        );
         validate_part_number(part_number)?;
         let output = self
             .client
@@ -1549,6 +2154,45 @@ impl StorageBackend for S3Storage {
         })
     }
 
+    async fn upload_part_file(
+        &self,
+        upload_id: &str,
+        key: &ObjectKey,
+        part_number: u16,
+        path: &Path,
+    ) -> StorageResult<PartResult> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "upload_part_file",
+            backend = "S3Storage"
+        );
+        validate_part_number(part_number)?;
+        let size_bytes = fs::metadata(path).await?.len();
+        let body = ByteStream::from_path(path)
+            .await
+            .map_err(|error| StorageError::S3(error.to_string()))?;
+        let output = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(self.physical_key(key))
+            .upload_id(upload_id)
+            .part_number(i32::from(part_number))
+            .body(body)
+            .send()
+            .await
+            .map_err(s3_error)?;
+        let etag = output
+            .e_tag()
+            .map(trim_s3_etag)
+            .ok_or_else(|| StorageError::S3("S3 did not return a part ETag".into()))?;
+        Ok(PartResult {
+            part_number,
+            size_bytes,
+            etag,
+        })
+    }
+
     async fn create_upload_part_url(
         &self,
         upload_id: &str,
@@ -1557,6 +2201,11 @@ impl StorageBackend for S3Storage {
         size_bytes: u64,
         ttl: Duration,
     ) -> StorageResult<Option<PresignedUploadPartUrl>> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_upload_part_url",
+            backend = "S3Storage"
+        );
         validate_part_number(part_number)?;
         let content_length = i64::try_from(size_bytes).map_err(|_| {
             StorageError::S3("upload part size exceeds supported range".to_string())
@@ -1601,6 +2250,11 @@ impl StorageBackend for S3Storage {
         key: &ObjectKey,
         parts: &[CompletedUploadPart],
     ) -> StorageResult<ObjectMetadata> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "complete_multipart_upload",
+            backend = "S3Storage"
+        );
         let parts = validate_completed_parts(parts)?;
         let completed_parts = parts
             .into_iter()
@@ -1646,6 +2300,11 @@ impl StorageBackend for S3Storage {
     }
 
     async fn create_read_url(&self, key: &ObjectKey, ttl: Duration) -> StorageResult<Option<Url>> {
+        tracing::debug!(
+            event = "storage.operation",
+            operation = "create_read_url",
+            backend = "S3Storage"
+        );
         let cache_control = format!("private, max-age={}", ttl.as_secs());
         let presigned = self
             .client
@@ -1947,11 +2606,6 @@ fn local_part_etag(part_number: u16, bytes: &[u8]) -> String {
     format!("local-part-{part_number}-{}", hex_bytes(&digest))
 }
 
-async fn local_part_etag_for_path(part_number: u16, path: &Path) -> StorageResult<String> {
-    let bytes = fs::read(path).await?;
-    Ok(local_part_etag(part_number, &bytes))
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2030,6 +2684,122 @@ mod tests {
             S3_MULTIPART_MAX_PARTS
         );
         assert!(validate_s3_multipart_size(maximum_size + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_pages_preserve_directory_prefix_ordering() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(temp.path());
+        for directory in ["a-", "a", "a0", "a.", "aa", "a_/nested"] {
+            for file in ["source.mp4", "poster.jpg"] {
+                let key = ObjectKey::parse(format!("objects/media/{directory}/{file}")).unwrap();
+                storage
+                    .put_object(
+                        &key,
+                        Bytes::from_static(b"source"),
+                        PutObjectMetadata::new("application/octet-stream"),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let expected = storage
+            .list_objects("objects/media/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|object| object.key.to_string())
+            .collect::<Vec<_>>();
+        for limit in [1, 2, 3, 5, 1000] {
+            let mut actual = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = storage
+                    .list_objects_page("objects/media/", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                assert!(page.objects.len() <= limit);
+                actual.extend(
+                    page.objects
+                        .into_iter()
+                        .map(|object| object.key.to_string()),
+                );
+                assert!(actual.len() <= expected.len(), "pagination must advance");
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected, "page size {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_pages_survive_deleted_cursor_and_streams_detect_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(temp.path());
+        let mut keys = Vec::new();
+        for i in 0..5 {
+            let key = ObjectKey::parse(format!("objects/media/{i}/source.mp4")).unwrap();
+            storage
+                .put_object(
+                    &key,
+                    Bytes::from_static(b"original"),
+                    PutObjectMetadata::new("video/mp4"),
+                )
+                .await
+                .unwrap();
+            keys.push(key);
+        }
+        let page = storage
+            .list_objects_page("objects/media/", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 2);
+        let after = page.next_cursor.unwrap();
+        storage.delete_object(&keys[1]).await.unwrap();
+        let next = storage
+            .list_objects_page("objects/media/", Some(&after), 2)
+            .await
+            .unwrap();
+        assert_eq!(next.objects[0].key, keys[2]);
+        let last = storage
+            .list_objects_page("objects/media/", next.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.objects.len(), 1);
+        assert!(last.next_cursor.is_none());
+        let metadata = storage.head_object(&keys[0]).await.unwrap();
+        storage
+            .put_object(
+                &keys[0],
+                Bytes::from_static(b"replacement"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .get_object_stream_with_metadata(&keys[0], None, metadata)
+                .await,
+            Err(StorageError::ObjectChanged(_))
+        ));
+        let path = temp.path().join("part-source");
+        fs::write(&path, b"file part").await.unwrap();
+        let upload_id = storage.create_multipart_upload(&keys[0]).await.unwrap();
+        let part = storage
+            .upload_part_file(&upload_id, &keys[0], 1, &path)
+            .await
+            .unwrap();
+        assert_eq!(part.etag, local_part_etag(1, b"file part"));
+        storage
+            .complete_multipart_upload(&upload_id, &keys[0], &[part.into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_object(&keys[0], None).await.unwrap().bytes,
+            b"file part"[..]
+        );
     }
 
     #[tokio::test]
@@ -2377,7 +3147,9 @@ mod tests {
 
         storage.probe().await.expect("probe");
 
-        let folder_key = storage.physical_prefix("objects/media/");
+        // A sibling folder marker sorts before generated source keys. MinIO
+        // treats a marker equal to the listing prefix itself as a leaf object.
+        let folder_key = storage.physical_prefix("objects/media/!folder-marker/");
         storage
             .client
             .put_object()
@@ -2391,6 +3163,30 @@ mod tests {
             .list_objects("objects/media/")
             .await
             .expect("folder markers do not break cleanup");
+        let marker_neighbor = MediaObjectKeys::generate().unwrap().source;
+        storage
+            .put_object(
+                &marker_neighbor,
+                Bytes::from_static(b"neighbor"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        let skipped = storage
+            .list_objects_page("objects/media/", None, 1)
+            .await
+            .unwrap();
+        assert!(skipped.objects.is_empty(), "the folder marker is skipped");
+        assert!(
+            skipped.next_cursor.is_some(),
+            "a page containing only a marker must advance"
+        );
+        let following = storage
+            .list_objects_page("objects/media/", skipped.next_cursor.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(following.objects[0].key, marker_neighbor);
+        storage.delete_object(&marker_neighbor).await.unwrap();
         storage
             .client
             .delete_object()
@@ -2465,7 +3261,114 @@ mod tests {
             .await
             .expect("presign")
             .is_some());
+        let metadata = storage.head_object(&key).await.unwrap();
+        let mut stream = storage
+            .get_object_stream_with_metadata(
+                &key,
+                Some(ByteRange::new(3, Some(6))),
+                metadata.clone(),
+            )
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        stream.reader.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, b"3456");
+        storage
+            .put_object(
+                &key,
+                Bytes::from_static(b"abcdefghij"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .get_object_stream_with_metadata(&key, None, metadata)
+                .await,
+            Err(StorageError::ObjectChanged(_))
+        ));
         storage.delete_object(&key).await.expect("delete object");
+
+        let prefix = format!("objects/media/{}/", generate_upload_id());
+        let mut page_keys = Vec::new();
+        for i in 0..5 {
+            let key = ObjectKey::parse(format!("{prefix}page-{i}.bin")).unwrap();
+            storage
+                .put_object(
+                    &key,
+                    Bytes::from_static(b"page"),
+                    PutObjectMetadata::new("application/octet-stream"),
+                )
+                .await
+                .unwrap();
+            page_keys.push(key);
+        }
+        let first = storage.list_objects_page(&prefix, None, 2).await.unwrap();
+        assert_eq!(
+            first
+                .objects
+                .iter()
+                .map(|object| &object.key)
+                .collect::<Vec<_>>(),
+            page_keys[..2].iter().collect::<Vec<_>>()
+        );
+        storage.delete_object(&page_keys[1]).await.unwrap();
+        let second = storage
+            .list_objects_page(&prefix, first.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .objects
+                .iter()
+                .map(|object| &object.key)
+                .collect::<Vec<_>>(),
+            page_keys[2..4].iter().collect::<Vec<_>>()
+        );
+        let last = storage
+            .list_objects_page(&prefix, second.next_cursor.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.objects[0].key, page_keys[4]);
+        assert!(last.next_cursor.is_none());
+        for key in &page_keys {
+            storage.delete_object(key).await.unwrap();
+        }
+
+        // Several unfinished uploads may share one key; both S3 markers matter.
+        let unfinished_key = MediaObjectKeys::generate().unwrap().source;
+        let mut upload_ids = Vec::new();
+        for _ in 0..3 {
+            upload_ids.push(
+                storage
+                    .create_multipart_upload(&unfinished_key)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut listed = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = storage
+                .list_multipart_uploads_page(unfinished_key.as_str(), cursor.as_deref(), 1)
+                .await
+                .unwrap();
+            listed.extend(page.uploads.into_iter().map(|upload| upload.upload_id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(listed.len() <= 3, "multipart pagination did not advance");
+        }
+        listed.sort();
+        upload_ids.sort();
+        assert_eq!(listed, upload_ids);
+        for upload_id in upload_ids {
+            storage
+                .abort_multipart_upload(&upload_id, &unfinished_key)
+                .await
+                .unwrap();
+        }
 
         let file_dir = tempfile::tempdir().expect("file temp dir");
         let file_path = file_dir.path().join("optimized.mp4");
@@ -2500,8 +3403,9 @@ mod tests {
             .upload_part(&upload_id, &multipart_key, 1, part1_bytes)
             .await
             .expect("part 1");
+        fs::write(&file_path, b"tail").await.unwrap();
         let part2 = storage
-            .upload_part(&upload_id, &multipart_key, 2, Bytes::from_static(b"tail"))
+            .upload_part_file(&upload_id, &multipart_key, 2, &file_path)
             .await
             .expect("part 2");
         storage

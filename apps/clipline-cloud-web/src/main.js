@@ -56,7 +56,7 @@ function App() {
   }, [loginRedirect]);
   const passwordChangeRedirect = ready && user?.password_change_required && route.name !== "account";
   useEffect(() => { if (passwordChangeRedirect) navigate("/account"); }, [passwordChangeRedirect]);
-  if (!ready || loginRedirect || passwordChangeRedirect) return html`<div class="boot">Loading…</div>`;
+  if ((!ready && !isPublicRouteName(route.name)) || loginRedirect || passwordChangeRedirect) return html`<div class="boot">Loading…</div>`;
   const Page = PAGES[route.name];
   const bare = route.name === "login" || route.name === "resetPassword";
   return html`<div class="ui" onClick=${onLinkClick}>
@@ -73,6 +73,11 @@ window.addEventListener("clipline:unauthorized", () => {
   if (!isPublicRouteName(currentRouteName)) navigate(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
 });
 
+// Clear the static boot screen before mounting public pages immediately.
+const root = document.querySelector("#app");
+root.textContent = "";
+render(html`<${App} />`, root);
+
 (async () => {
   try {
     const me = await api("/api/v1/auth/me");
@@ -82,10 +87,4 @@ window.addEventListener("clipline:unauthorized", () => {
     setCsrfToken(null);
     session.set({ user: null, csrfToken: null, ready: true });
   }
-  // Preact's render() appends into the container rather than replacing its
-  // contents, so the static boot-screen markup from index.html must be
-  // cleared first or it stays in the DOM alongside the mounted app.
-  const root = document.querySelector("#app");
-  root.textContent = "";
-  render(html`<${App} />`, root);
 })();

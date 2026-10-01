@@ -20,6 +20,8 @@ clipline-cloud-storage = { path = "../../crates/clipline-cloud-storage" }
 cookie.workspace = true
 hmac.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
 lettre.workspace = true
 rand.workspace = true
 reqwest.workspace = true

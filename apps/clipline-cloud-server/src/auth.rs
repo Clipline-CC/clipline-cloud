@@ -64,6 +64,7 @@ const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DEVICE_NAME_LEN: usize = 120;
 const MAX_DEVICE_TOKENS_PER_USER: i64 = 25;
 const PASSWORD_HASH_CONCURRENCY: usize = 4;
+const PASSWORD_ADMISSION_CONCURRENCY: usize = 2;
 const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$Y2xpcGxpbmVkdW1teXNhbHQ$29NAnsMp/zppbS3YN0zQLv+FC4Kkln7bC58S5joRLPw";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,6 +74,7 @@ pub struct AuthRuntime {
     csrf_secret: Arc<Vec<u8>>,
     login_limiter: Arc<Mutex<HashMap<String, LoginBucket>>>,
     password_workers: Arc<Semaphore>,
+    password_admissions: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ impl AuthRuntime {
             csrf_secret: Arc::new(csrf_secret),
             login_limiter: Arc::new(Mutex::new(HashMap::new())),
             password_workers: Arc::new(Semaphore::new(PASSWORD_HASH_CONCURRENCY)),
+            password_admissions: Arc::new(Semaphore::new(PASSWORD_ADMISSION_CONCURRENCY)),
         }
     }
 
@@ -124,12 +127,21 @@ impl AuthRuntime {
         self.password_workers
             .clone()
             .try_acquire_owned()
-            .map_err(|_| {
-                ApiError::too_many_requests_after(
-                    "password service is busy; retry shortly",
-                    Duration::from_secs(1),
-                )
-            })
+            .map_err(|_| Self::password_service_busy())
+    }
+
+    fn password_service_busy() -> ApiError {
+        ApiError::too_many_requests_after(
+            "password service is busy; retry shortly",
+            Duration::from_secs(1),
+        )
+    }
+
+    fn check_password_worker_capacity(&self) -> Result<(), ApiError> {
+        if self.password_workers.available_permits() == 0 {
+            return Err(Self::password_service_busy());
+        }
+        Ok(())
     }
 
     async fn hash_password(&self, password: String) -> Result<String, ApiError> {
@@ -220,16 +232,26 @@ impl AuthRuntime {
         password: String,
         scope: &str,
     ) -> Result<bool, ApiError> {
+        // Reject a known-busy service without opening a write transaction.
+        self.check_password_worker_capacity()?;
+        // Cap reservations separately so DB waits leave connections and hashing
+        // workers available, even when many requests pass the preflight at once.
+        let admission = self
+            .password_admissions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Self::password_service_busy())?;
         let now = now_utc();
         // Wait for database locks before acquiring a worker. Worker admission
         // happens inside the reservation, so a busy service consumes no attempt.
-        let permit = match repositories
+        let reservation = repositories
             .users
             .reserve_password_attempt_with_admission(&user.id, scope, now, || {
                 self.acquire_password_worker().ok()
             })
-            .await?
-        {
+            .await?;
+        drop(admission);
+        let permit = match reservation {
             PasswordAttemptAdmission::Admitted(permit) => permit,
             PasswordAttemptAdmission::RateLimited(until) => {
                 return Err(ApiError::too_many_requests_after(
@@ -238,10 +260,7 @@ impl AuthRuntime {
                 ));
             }
             PasswordAttemptAdmission::Busy => {
-                return Err(ApiError::too_many_requests_after(
-                    "password service is busy; retry shortly",
-                    Duration::from_secs(1),
-                ));
+                return Err(Self::password_service_busy());
             }
         };
         let verified =
@@ -579,6 +598,8 @@ async fn login(
         ));
     }
 
+    state.auth.check_password_worker_capacity()?;
+
     let user = state
         .repositories
         .users
@@ -694,6 +715,8 @@ async fn create_device_token(
             retry_after,
         ));
     }
+
+    state.auth.check_password_worker_capacity()?;
 
     let user = state
         .repositories
@@ -2041,11 +2064,13 @@ async fn authenticate(
         if user.is_disabled {
             return Err(ApiError::unauthorized("user is disabled"));
         }
-        state
-            .repositories
-            .device_tokens
-            .touch(&device_token.id)
-            .await?;
+        if activity_touch_due(device_token.last_used_at) {
+            state
+                .repositories
+                .device_tokens
+                .touch(&device_token.id)
+                .await?;
+        }
         return Ok(AuthenticatedUser {
             user,
             kind: AuthKind::Bearer,
@@ -2073,12 +2098,18 @@ async fn authenticate(
     if user.is_disabled {
         return Err(ApiError::unauthorized("user is disabled"));
     }
-    state.repositories.sessions.touch(&session.id).await?;
+    if activity_touch_due(session.last_used_at) {
+        state.repositories.sessions.touch(&session.id).await?;
+    }
 
     Ok(AuthenticatedUser {
         user,
         kind: AuthKind::Cookie { token_hash },
     })
+}
+
+fn activity_touch_due(last_used_at: Option<DateTime<Utc>>) -> bool {
+    last_used_at.map_or(true, |last| last <= now_utc() - ChronoDuration::minutes(1))
 }
 
 pub(crate) async fn optional_auth(
@@ -2777,7 +2808,7 @@ mod tests {
         };
         let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let mut checks = Vec::new();
-        for _ in 0..PASSWORD_HASH_CONCURRENCY {
+        for _ in 0..PASSWORD_ADMISSION_CONCURRENCY {
             checks.push(Box::pin(app.state.auth.verify_account_password(
                 &app.state.repositories,
                 &user,
@@ -2797,6 +2828,14 @@ mod tests {
             app.state.auth.password_workers.available_permits(),
             PASSWORD_HASH_CONCURRENCY
         );
+        let busy = app
+            .state
+            .auth
+            .verify_account_password(&app.state.repositories, &user, "wrong".into(), "login")
+            .await
+            .unwrap_err();
+        assert_eq!(busy.message(), "password service is busy; retry shortly");
+
         assert!(!app
             .state
             .auth
@@ -2844,18 +2883,29 @@ mod tests {
             .clone()
             .try_acquire_many_owned(PASSWORD_HASH_CONCURRENCY as u32)
             .unwrap();
+        let clipline_cloud_db::Database::Sqlite(pool) = &app.state.database else {
+            panic!("SQLite test");
+        };
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         for scope in ["login", "reauth"] {
             for _ in 0..LOGIN_USERNAME_MAX_FAILURES * 2 {
-                let error = app
-                    .state
-                    .auth
-                    .verify_account_password(&app.state.repositories, &user, "wrong".into(), scope)
-                    .await
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    app.state.auth.verify_account_password(
+                        &app.state.repositories,
+                        &user,
+                        "wrong".into(),
+                        scope,
+                    ),
+                )
+                .await
+                .expect("busy preflight must avoid the locked database")
+                .unwrap_err();
                 assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
                 assert_eq!(error.message(), "password service is busy; retry shortly");
             }
         }
+        writer.rollback().await.unwrap();
         drop(workers);
         for scope in ["login", "reauth"] {
             // Every real attempt remains available after the service recovers.

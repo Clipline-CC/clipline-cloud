@@ -291,7 +291,8 @@ macro_rules! db_execute {
     ($database:expr, $sql:expr, [$($bind:expr),* $(,)?]) => {{
         let sql = $sql;
         let sql_ref: &str = sql.as_ref();
-        match $database {
+        let started = std::time::Instant::now();
+        let result = match $database {
             $crate::Database::Sqlite(pool) => {
                 #[allow(unused_mut)]
                 let mut query = sqlx::query(sql_ref);
@@ -305,7 +306,10 @@ macro_rules! db_execute {
                 $(query = query.bind($bind);)*
                 query.execute(pool).await.map(|_| ())
             }
-        }
+        };
+        tracing::debug!(event = "db.query", operation = sql_ref.split_whitespace().next().unwrap_or("unknown"),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }};
 }
 
@@ -313,7 +317,8 @@ macro_rules! db_execute_rows {
     ($database:expr, $sql:expr, [$($bind:expr),* $(,)?]) => {{
         let sql = $sql;
         let sql_ref: &str = sql.as_ref();
-        match $database {
+        let started = std::time::Instant::now();
+        let result = match $database {
             $crate::Database::Sqlite(pool) => {
                 #[allow(unused_mut)]
                 let mut query = sqlx::query(sql_ref);
@@ -327,7 +332,10 @@ macro_rules! db_execute_rows {
                 $(query = query.bind($bind);)*
                 query.execute(pool).await.map(|result| result.rows_affected())
             }
-        }
+        };
+        tracing::debug!(event = "db.query", operation = sql_ref.split_whitespace().next().unwrap_or("unknown"),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }};
 }
 
@@ -335,7 +343,8 @@ macro_rules! db_fetch_optional {
     ($database:expr, $model:ty, $sql:expr, [$($bind:expr),* $(,)?]) => {{
         let sql = $sql;
         let sql_ref: &str = sql.as_ref();
-        match $database {
+        let started = std::time::Instant::now();
+        let result = match $database {
             $crate::Database::Sqlite(pool) => {
                 #[allow(unused_mut)]
                 let mut query = sqlx::query_as::<_, $model>(sql_ref);
@@ -349,7 +358,10 @@ macro_rules! db_fetch_optional {
                 $(query = query.bind($bind);)*
                 query.fetch_optional(pool).await
             }
-        }
+        };
+        tracing::debug!(event = "db.query", operation = sql_ref.split_whitespace().next().unwrap_or("unknown"),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }};
 }
 
@@ -357,7 +369,8 @@ macro_rules! db_fetch_all {
     ($database:expr, $model:ty, $sql:expr, [$($bind:expr),* $(,)?]) => {{
         let sql = $sql;
         let sql_ref: &str = sql.as_ref();
-        match $database {
+        let started = std::time::Instant::now();
+        let result = match $database {
             $crate::Database::Sqlite(pool) => {
                 #[allow(unused_mut)]
                 let mut query = sqlx::query_as::<_, $model>(sql_ref);
@@ -371,7 +384,10 @@ macro_rules! db_fetch_all {
                 $(query = query.bind($bind);)*
                 query.fetch_all(pool).await
             }
-        }
+        };
+        tracing::debug!(event = "db.query", operation = sql_ref.split_whitespace().next().unwrap_or("unknown"),
+            duration_us = started.elapsed().as_micros() as u64, success = result.is_ok());
+        result
     }};
 }
 
@@ -456,7 +472,19 @@ mod tests {
             .expect("second migration run");
         database.ping().await.expect("ping");
 
-        let tables = database.table_names().await.expect("table names");
+        let mut tables = database.table_names().await.expect("table names");
+        // SQLite has an additional FTS document map, virtual table, and index tables.
+        tables.retain(|name| {
+            !matches!(
+                name.as_str(),
+                "clip_search"
+                    | "clip_search_documents"
+                    | "clip_search_config"
+                    | "clip_search_data"
+                    | "clip_search_docsize"
+                    | "clip_search_idx"
+            )
+        });
 
         assert_eq!(
             tables,
@@ -472,6 +500,7 @@ mod tests {
                 "game_category_names",
                 "invitation_tokens",
                 "jobs",
+                "maintenance_cursors",
                 "reset_password_tokens",
                 "sessions",
                 "upload_part_claims",
@@ -3265,3 +3294,6 @@ unsafe extern "C" fn unicode_lower(
 
 #[cfg(test)]
 mod regression_tests;
+
+#[cfg(test)]
+mod optimization_tests;

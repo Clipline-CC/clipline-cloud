@@ -9,7 +9,9 @@ use clipline_cloud_api_types::{
     ClipDetailResponse, ClipListResponse, ClipMarkerResponse, ClipSummaryResponse, StatusResponse,
     UpdateVisibilityRequest,
 };
-use clipline_cloud_db::{BulkVisibilityUpdate, Clip, ClipListParams, ClipMarker, ClipSort};
+use clipline_cloud_db::{
+    BulkVisibilityUpdate, Clip, ClipCursor, ClipListParams, ClipMarker, ClipSort,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -37,6 +39,8 @@ const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/clips", get(list_clips))
+        .route("/api/v1/clips/page", get(list_clip_page))
+        .route("/api/v1/clips/totals", get(list_clip_totals))
         .route("/api/v1/clips/bulk-delete", post(bulk_delete_clips))
         .route(
             "/api/v1/clips/bulk-visibility",
@@ -66,6 +70,7 @@ struct ListClipsQuery {
     q: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,12 +117,53 @@ struct BulkMutationResponse {
     affected: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct BulkVisibilityResponse {
+    status: &'static str,
+    affected: usize,
+    clips: Vec<BulkVisibilityClipResponse>,
+}
+#[derive(Debug, Serialize)]
+struct BulkVisibilityClipResponse {
+    id: String,
+    visibility: String,
+    public_share_id: Option<String>,
+    public_url: Option<String>,
+}
+
 async fn list_clips(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ListClipsQuery>,
 ) -> Result<Json<ClipListResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
+    let (params, page, page_size) = list_params(query, &auth.user.id)?;
+
+    let mut clips = state.repositories.clips.list_for_owner(&params).await?;
+    let has_more = clips.len() as i64 > page_size;
+    clips.truncate(page_size as usize);
+    let stats = state.repositories.clips.stats_for_owner(&params).await?;
+    let display_names = game_display_name_map(&state).await?;
+    let public_base = state.request_public_url(&headers);
+    let clips = clips
+        .into_iter()
+        .map(|clip| clip_summary_response(clip, &public_base, &display_names))
+        .collect();
+
+    Ok(Json(ClipListResponse {
+        page,
+        page_size,
+        has_more,
+        total: stats.total,
+        total_size_bytes: stats.total_size_bytes,
+        clips,
+    }))
+}
+
+fn list_params(
+    query: ListClipsQuery,
+    owner_user_id: &str,
+) -> Result<(ClipListParams, i64, i64), ApiError> {
     let page = query.page.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     let page_size = query
         .page_size
@@ -145,7 +191,7 @@ async fn list_clips(
         ));
     }
     let params = ClipListParams {
-        owner_user_id: auth.user.id.clone(),
+        owner_user_id: owner_user_id.to_string(),
         game,
         game_category_id,
         source_type: normalized_optional(query.source_type),
@@ -170,24 +216,101 @@ async fn list_clips(
         return Err(ApiError::bad_request("from must be before or equal to to"));
     }
 
-    let mut clips = state.repositories.clips.list_for_owner(&params).await?;
+    Ok((params, page, page_size))
+}
+
+#[derive(Serialize)]
+struct ClipPageResponse {
+    page: i64,
+    page_size: i64,
+    has_more: bool,
+    next_cursor: Option<String>,
+    clips: Vec<ClipSummaryResponse>,
+}
+
+#[derive(Serialize)]
+struct ClipTotalsResponse {
+    total: i64,
+    total_size_bytes: i64,
+}
+
+pub(crate) fn decode_cursor(
+    value: Option<&str>,
+    sort: ClipSort,
+) -> Result<Option<ClipCursor>, ApiError> {
+    use base64::Engine;
+    value
+        .map(|value| {
+            if value.len() > 8192 {
+                return Err(ApiError::bad_request("invalid cursor"));
+            }
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(value)
+                .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+            let cursor: ClipCursor = serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+            if !cursor.is_valid_for(sort) {
+                return Err(ApiError::bad_request("cursor does not match sort"));
+            }
+            Ok(cursor)
+        })
+        .transpose()
+}
+
+pub(crate) fn encode_cursor(sort: ClipSort, clip: &Clip) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&ClipCursor::from_clip(sort, clip)).expect("cursor serialization"),
+    )
+}
+
+async fn list_clip_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListClipsQuery>,
+) -> Result<Json<ClipPageResponse>, ApiError> {
+    let auth = auth::require_auth(&state, &headers).await?;
+    let cursor = query.cursor.clone();
+    let (params, page, page_size) = list_params(query, &auth.user.id)?;
+    let cursor = decode_cursor(cursor.as_deref(), params.sort)?;
+    let mut clips = state
+        .repositories
+        .clips
+        .list_for_owner_after(&params, cursor.as_ref())
+        .await?;
     let has_more = clips.len() as i64 > page_size;
     clips.truncate(page_size as usize);
-    let stats = state.repositories.clips.stats_for_owner(&params).await?;
+    let next_cursor = if has_more {
+        clips.last().map(|clip| encode_cursor(params.sort, clip))
+    } else {
+        None
+    };
     let display_names = game_display_name_map(&state).await?;
     let public_base = state.request_public_url(&headers);
     let clips = clips
         .into_iter()
         .map(|clip| clip_summary_response(clip, &public_base, &display_names))
         .collect();
-
-    Ok(Json(ClipListResponse {
+    Ok(Json(ClipPageResponse {
         page,
         page_size,
         has_more,
+        next_cursor,
+        clips,
+    }))
+}
+
+async fn list_clip_totals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListClipsQuery>,
+) -> Result<Json<ClipTotalsResponse>, ApiError> {
+    let auth = auth::require_auth(&state, &headers).await?;
+    let (params, _, _) = list_params(query, &auth.user.id)?;
+    let stats = state.repositories.clips.stats_for_owner(&params).await?;
+    Ok(Json(ClipTotalsResponse {
         total: stats.total,
         total_size_bytes: stats.total_size_bytes,
-        clips,
     }))
 }
 
@@ -441,7 +564,7 @@ async fn bulk_update_visibility(
     Extension(client_ip): Extension<ClientIp>,
     headers: HeaderMap,
     Json(request): Json<BulkVisibilityRequest>,
-) -> Result<Json<BulkMutationResponse>, ApiError> {
+) -> Result<Json<BulkVisibilityResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let visibility = validate_visibility(request.visibility)?;
@@ -475,9 +598,22 @@ async fn bulk_update_visibility(
         )
         .await?;
 
-    Ok(Json(BulkMutationResponse {
+    let public_base = state.request_public_url(&headers);
+    let clips = updates
+        .into_iter()
+        .map(|update| BulkVisibilityClipResponse {
+            id: update.clip_id,
+            visibility: visibility.clone(),
+            public_url: update.public_share_id.as_ref().map(|share_id| {
+                crate::config::join_public_path(&public_base, &format!("c/{share_id}"))
+            }),
+            public_share_id: update.public_share_id,
+        })
+        .collect();
+    Ok(Json(BulkVisibilityResponse {
         status: "ok",
         affected,
+        clips,
     }))
 }
 
@@ -898,6 +1034,7 @@ mod tests {
                     q: None,
                     page: None,
                     page_size: None,
+                    cursor: None,
                 }),
             )
             .await,

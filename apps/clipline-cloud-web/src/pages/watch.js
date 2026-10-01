@@ -101,7 +101,7 @@ export function WatchAuthorRow({ author }) {
 }
 
 export function WatchPage({ route }) {
-  const { user } = useStore(session);
+  const { user, ready } = useStore(session);
   const [clip, setClip] = useState(null);
   const [error, setError] = useState(null);
   const [upNext, setUpNext] = useState([]);
@@ -170,7 +170,7 @@ export function WatchPage({ route }) {
     return html`<main class="page watch"><div><div class="skeleton-thumb"></div></div><aside class="upnext"></aside></main>`;
   }
 
-  const isOwner = isOwnerForRoute(route.name, clip);
+  const isOwner = ready && Boolean(user) && isOwnerForRoute(route.name, clip);
   const shareId = currentShareId;
   const ownedClipId = resolveOwnedClipId(route.name, route, clip);
   const mediaSrc =

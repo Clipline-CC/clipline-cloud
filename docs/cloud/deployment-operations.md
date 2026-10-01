@@ -4,6 +4,10 @@ This runbook covers the v1 Docker Compose profiles, operational limits, backup/r
 failure-mode checks. For step-by-step first-time setup of each profile, start with the
 [deployment guide](deployment-guide.md); this document is the deeper operations reference.
 
+For the 2026-10-01 index/search migrations, PostgreSQL extension prerequisite,
+upload admission limits, job retention, and new timing events, see the
+[optimization implementation notes](../optimization-review-implementation.md).
+
 ## Compose Profiles
 
 Run commands from `deploy/compose/`.
@@ -409,6 +413,8 @@ Back up the database before upgrading. The migrations add case-insensitive usern
 uniqueness and Unicode-aware SQLite category/search comparisons. Existing case-only identity or
 category-name collisions cause a migration error; resolve the ambiguous records explicitly before
 retrying. The migrations preserve records rather than silently renaming or merging accounts.
+Existing SQLite substring-search indexes are rebuilt with Unicode case folding during migration so
+non-ASCII names remain searchable after upgrading from the performance release.
 
 Generated links use `CLIPLINE_PUBLIC_URL` and `CLIPLINE_ADDITIONAL_PUBLIC_URLS`. Add every supported
 public hostname to that allowlist; an arbitrary `Host` header cannot become a generated link.
@@ -425,6 +431,9 @@ separate bounded request budgets. Login and session password checks have separat
 stored in the database, shared across client addresses and server processes. Successful password checks
 clear that budget, and password replacement clears both budgets. The bounded source cache can evict
 old entries without resetting account limits or denying all new clients when it fills.
+Password verification allows four concurrent hashing workers and two database admission operations
+per server process. Saturated hashing workers reject new password checks before account lookup or
+reservation writes; database lock waits do not occupy hashing workers or consume password attempts.
 
 Upload handlers authenticate before reading the body. Uploads can continue while data arrives at least
 once every 30 seconds; stalled transfers return 408. Once the body is received, processing has the

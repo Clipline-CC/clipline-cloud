@@ -110,6 +110,7 @@ struct PublicClipListQuery {
     q: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +121,7 @@ struct PublicRecommendationQuery {
 
 #[derive(Debug, Serialize)]
 struct PublicClipListResponse {
+    next_cursor: Option<String>,
     page: i64,
     page_size: i64,
     has_more: bool,
@@ -297,8 +299,20 @@ async fn list_public_clips(
         limit: page_size + 1,
         offset,
     };
-    let clips = state.repositories.clips.list_public(&params).await?;
+    let cursor = crate::clips::decode_cursor(query.cursor.as_deref(), params.sort)?;
+    let clips = state
+        .repositories
+        .clips
+        .list_public_after(&params, cursor.as_ref())
+        .await?;
     let has_more = clips.len() as i64 > page_size;
+    let next_cursor = if has_more {
+        clips
+            .get(page_size as usize - 1)
+            .map(|clip| crate::clips::encode_cursor(params.sort, clip))
+    } else {
+        None
+    };
     let public_base = state.request_public_url(&headers);
     let authors = public_authors_for_clips(&state, &clips, &public_base).await?;
     let display_names = game_display_name_map(&state).await?;
@@ -318,6 +332,7 @@ async fn list_public_clips(
     }
 
     Ok(Json(PublicClipListResponse {
+        next_cursor,
         page,
         page_size,
         has_more,
@@ -1009,7 +1024,9 @@ async fn get_public_media(
 ) -> Result<Response, ApiError> {
     let clip = load_public_clip(&state, &share_id).await?;
 
-    if state.config.public_media_mode == PublicMediaMode::Presigned {
+    if state.config.public_media_mode == PublicMediaMode::Presigned
+        && state.storage.supports_read_urls()
+    {
         let key = clip_source_key(&clip)?;
         let metadata = state
             .storage
@@ -1114,7 +1131,11 @@ async fn serve_clip_media(
         return Ok(not_modified_response(&metadata, scope));
     }
 
-    let object = match state.storage.get_object_stream(&key, range).await {
+    let object = match state
+        .storage
+        .get_object_stream_with_metadata(&key, range, metadata.clone())
+        .await
+    {
         Ok(object) => object,
         Err(StorageError::InvalidRange { .. }) => {
             return Ok(range_not_satisfiable_response(&metadata, scope));
@@ -1178,7 +1199,11 @@ async fn try_serve_clip_image(
         return Some(not_modified_response(&metadata, scope));
     }
 
-    match state.storage.get_object_stream(&key, None).await {
+    match state
+        .storage
+        .get_object_stream_with_metadata(&key, None, metadata.clone())
+        .await
+    {
         Ok(object) => Some(media_response(object, scope)),
         Err(StorageError::NotFound(_)) => None,
         Err(error) => {
@@ -2010,6 +2035,7 @@ fn absolute_url(public_base: &Url, path: &str) -> String {
 fn storage_error(error: StorageError) -> ApiError {
     match error {
         StorageError::NotFound(_) => ApiError::not_found("media not found"),
+        StorageError::ObjectChanged(_) => ApiError::conflict("media changed; retry the request"),
         StorageError::InvalidRange { .. } => ApiError::bad_request("invalid range"),
         StorageError::InvalidKey { .. } | StorageError::InvalidPart(_) => {
             ApiError::bad_request(error.to_string())

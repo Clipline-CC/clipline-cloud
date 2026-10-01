@@ -1,5 +1,5 @@
 import { html } from "../lib/html.js";
-import { useEffect, useState } from "preact/hooks";
+import { useCallback, useEffect, useState } from "preact/hooks";
 import { api } from "../lib/api.js";
 import { navigate } from "../lib/router.js";
 import { useAsyncResource } from "../lib/use-api-resource.js";
@@ -24,19 +24,24 @@ export function isAdminLike(user) {
   return user?.role === "admin" || user?.role === "owner";
 }
 
-// Fetch every admin panel together so switching tabs is immediate.
-async function loadAdminData(signal) {
-  const options = { signal };
-  const [overview, settings, users, categories, failedUploads, deadJobs, recentErrors] = await Promise.all([
-    api("/api/v1/admin/overview", options),
-    api("/api/v1/admin/settings", options),
-    api("/api/v1/users", options),
-    api("/api/v1/admin/game-categories", options),
-    api("/api/v1/admin/uploads/failed?limit=50", options),
-    api("/api/v1/admin/jobs/dead?limit=50", options),
-    api("/api/v1/admin/jobs/recent-errors?limit=50", options),
-  ]);
-  return { overview, settings, users, categories, failedUploads, deadJobs, recentErrors };
+const PANEL_RESOURCES = {
+  overview: ["overview", "failedUploads", "deadJobs"],
+  users: ["users", "settings"],
+  settings: ["settings"],
+  categories: ["categories"],
+  jobs: ["failedUploads", "deadJobs", "recentErrors"],
+};
+const RESOURCE_PATHS = {
+  overview: "/api/v1/admin/overview", settings: "/api/v1/admin/settings",
+  users: "/api/v1/users", categories: "/api/v1/admin/game-categories",
+  failedUploads: "/api/v1/admin/uploads/failed?limit=50",
+  deadJobs: "/api/v1/admin/jobs/dead?limit=50",
+  recentErrors: "/api/v1/admin/jobs/recent-errors?limit=50",
+};
+export async function loadAdminPanel(tab, signal) {
+  const entries = await Promise.all(PANEL_RESOURCES[tab].map(async (name) =>
+    [name, await api(RESOURCE_PATHS[name], { signal })]));
+  return Object.fromEntries(entries);
 }
 
 export function AdminPage({ route }) {
@@ -46,11 +51,24 @@ export function AdminPage({ route }) {
   const tab = TABS.some(([key]) => key === route.tab) ? route.tab : "overview";
   const [resetLink, setResetLink] = useState(null);
   const [reloadTick, setReloadTick] = useState(0);
+  const [panels, setPanels] = useState({});
+  const load = useCallback(async (signal) => {
+    if (panels[tab]) return panels[tab];
+    const data = await loadAdminPanel(tab, signal);
+    if (!signal.aborted) setPanels((current) => ({ ...current, [tab]: data }));
+    return data;
+  }, [tab, reloadTick]);
   const { data, error } = useAsyncResource(
-    canUseAdmin ? `admin:${reloadTick}` : null,
-    loadAdminData
+    canUseAdmin ? `admin:${tab}:${reloadTick}` : null,
+    load,
+    panels[tab] || null
   );
-  const reload = () => setReloadTick((t) => t + 1);
+  const reload = () => {
+    // Mutations can affect another panel's summary; invalidate cached panels
+    // while immediately fetching only the panel the user is viewing.
+    setPanels({});
+    setReloadTick((t) => t + 1);
+  };
 
   useEffect(() => {
     if (!shouldRedirect) return;

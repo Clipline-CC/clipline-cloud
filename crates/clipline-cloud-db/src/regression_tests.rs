@@ -2,6 +2,80 @@ use crate::*;
 use chrono::Duration;
 
 #[tokio::test]
+async fn sqlite_upgrade_rebuilds_existing_search_candidates_with_unicode_casefolding() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!("sqlite://{}", directory.path().join("upgrade.db").display());
+    let options = SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .create_if_missing(true);
+    let old_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let old_migrations = Migrator {
+        migrations: std::borrow::Cow::Owned(
+            SQLITE_MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 202610010003)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    old_migrations.run(&old_pool).await.unwrap();
+    let now = now_utc();
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, is_disabled, created_at, updated_at) VALUES (?, ?, ?, ?, FALSE, ?, ?)")
+        .bind("upgrade-user").bind("owner").bind("hash").bind("user").bind(now).bind(now)
+        .execute(&old_pool).await.unwrap();
+    let old_repos = Repositories::new(Database::Sqlite(old_pool.clone()));
+    let mut clip = NewClip::new("upgrade-user", "Über École", "local");
+    clip.status = "ready".into();
+    let clip = old_repos.clips.create(&clip).await.unwrap();
+    let before: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM clip_search WHERE clip_search MATCH '\"über\"'")
+            .fetch_one(&old_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        before.0, 0,
+        "old ASCII tokens miss the lowercase Unicode query"
+    );
+    old_pool.close().await;
+
+    let database = Database::connect_and_migrate(&url).await.unwrap();
+    let repos = Repositories::new(database);
+    for query in ["Über", "über", "École", "école"] {
+        let rows = repos
+            .clips
+            .list_for_owner(&ClipListParams {
+                owner_user_id: "upgrade-user".into(),
+                query: Some(query.into()),
+                limit: 10,
+                offset: 0,
+                game: None,
+                game_category_id: None,
+                source_type: None,
+                visibility: None,
+                status: None,
+                from: None,
+                to: None,
+                min_duration_ms: None,
+                max_duration_ms: None,
+                min_size_bytes: None,
+                max_size_bytes: None,
+                sort: ClipSort::UploadedAtDesc,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            vec![&clip.id]
+        );
+    }
+}
+
+#[tokio::test]
 async fn account_password_limits_are_atomic_durable_and_separate_from_reauth() {
     let (_directory, databases) = backends().await;
     for database in databases {
