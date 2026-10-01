@@ -50,6 +50,7 @@ const MIB: u64 = 1024 * 1024;
 const GAME_CATEGORY_MAP_TTL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPLOAD_MIN_PROGRESS_BYTES: usize = 64 * 1024;
 const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
 
 #[derive(Clone)]
@@ -638,6 +639,8 @@ async fn request_timeout(mut request: Request<Body>, next: Next) -> Response {
             inner,
             deadline: deadline.clone(),
             reading: false,
+            progress_deadline: tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT,
+            progress_bytes: 0,
         });
         let response = next.run(request);
         tokio::pin!(response);
@@ -656,11 +659,15 @@ async fn request_timeout(mut request: Request<Body>, next: Next) -> Response {
 }
 
 // Auth runs before the first body poll. While receiving, each nonempty data
-// frame renews the idle deadline; EOF restores the normal processing deadline.
+// frame renews the idle deadline. Receiving 64 KiB also renews the progress
+// deadline, so trickling tiny frames cannot keep a slot forever. EOF restores
+// the normal processing deadline.
 struct UploadProgressBody {
     inner: Body,
     deadline: watch::Sender<tokio::time::Instant>,
     reading: bool,
+    progress_deadline: tokio::time::Instant,
+    progress_bytes: usize,
 }
 
 impl http_body::Body for UploadProgressBody {
@@ -674,6 +681,7 @@ impl http_body::Body for UploadProgressBody {
         let body = self.get_mut();
         if !body.reading {
             body.reading = true;
+            body.progress_deadline = tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT;
             body.deadline
                 .send_replace(tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT);
         }
@@ -682,14 +690,19 @@ impl http_body::Body for UploadProgressBody {
             std::task::Poll::Ready(Some(Ok(frame)))
                 if frame.data_ref().is_some_and(|data| !data.is_empty()) =>
             {
-                body.deadline.send_replace(
-                    tokio::time::Instant::now()
-                        + if body.inner.is_end_stream() {
-                            REQUEST_TIMEOUT
-                        } else {
-                            UPLOAD_IDLE_TIMEOUT
-                        },
-                );
+                let now = tokio::time::Instant::now();
+                body.progress_bytes = body
+                    .progress_bytes
+                    .saturating_add(frame.data_ref().unwrap().len());
+                if body.progress_bytes >= UPLOAD_MIN_PROGRESS_BYTES {
+                    body.progress_bytes = 0;
+                    body.progress_deadline = now + UPLOAD_IDLE_TIMEOUT;
+                }
+                body.deadline.send_replace(if body.inner.is_end_stream() {
+                    now + REQUEST_TIMEOUT
+                } else {
+                    (now + UPLOAD_IDLE_TIMEOUT).min(body.progress_deadline)
+                });
             }
             std::task::Poll::Ready(None | Some(Err(_))) => {
                 body.deadline
@@ -1029,15 +1042,18 @@ mod tests {
             .route(
                 "/api/v1/uploads/{id}/content",
                 axum::routing::put(|body: axum::body::Bytes| async move {
-                    assert_eq!(body.len(), 8);
+                    assert_eq!(body.len(), 8 * UPLOAD_MIN_PROGRESS_BYTES);
                     StatusCode::OK
                 }),
             )
             .layer(middleware::from_fn(request_timeout));
-        let (mut writer, reader) = tokio::io::duplex(8);
+        let (mut writer, reader) = tokio::io::duplex(UPLOAD_MIN_PROGRESS_BYTES);
         let sender = tokio::spawn(async move {
             for _ in 0..8 {
-                writer.write_all(b"x").await.unwrap();
+                writer
+                    .write_all(&vec![b'x'; UPLOAD_MIN_PROGRESS_BYTES])
+                    .await
+                    .unwrap();
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
         });
@@ -1056,6 +1072,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(started.elapsed() > REQUEST_TIMEOUT);
         sender.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickling_uploads_time_out_and_release_capacity() {
+        use tokio::io::AsyncWriteExt;
+        let workers = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler_workers = workers.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/uploads/{id}/content",
+                axum::routing::put(move |body: Body| {
+                    let workers = handler_workers.clone();
+                    async move {
+                        let _permit = workers.try_acquire().unwrap();
+                        axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(request_timeout));
+        let (mut writer, reader) = tokio::io::duplex(8);
+        let sender = tokio::spawn(async move {
+            writer.write_all(b"x").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            writer.write_all(b"x").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(29)).await;
+        });
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/uploads/test/content")
+                    .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(started.elapsed(), UPLOAD_IDLE_TIMEOUT);
+        assert_eq!(workers.available_permits(), 1);
+        sender.abort();
     }
 
     #[tokio::test(start_paused = true)]

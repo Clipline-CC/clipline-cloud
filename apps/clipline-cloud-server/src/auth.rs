@@ -2836,16 +2836,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(busy.message(), "password service is busy; retry shortly");
 
+        let worker = app.state.auth.acquire_password_worker().unwrap();
+        drop(worker);
+        writer.rollback().await.unwrap();
+        // Drive both waiters together. One can own SQLite's write lock while
+        // the other waits, so awaiting them sequentially can deadlock the test.
+        let second = checks.pop().unwrap();
+        let first = checks.pop().unwrap();
+        assert!(checks.is_empty());
+        let (first, second) = tokio::join!(first, second);
+        assert!(!first.unwrap());
+        assert!(!second.unwrap());
         assert!(!app
             .state
             .auth
             .verify_login_password(&app.state.repositories, "wrong".into(), None,)
             .await
             .unwrap());
-        writer.rollback().await.unwrap();
-        for check in checks {
-            assert!(!check.await.unwrap());
-        }
         assert!(app
             .state
             .auth

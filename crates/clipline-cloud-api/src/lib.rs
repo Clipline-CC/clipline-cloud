@@ -353,12 +353,9 @@ impl CloudClient {
             on_progress(&progress);
             return Ok(progress);
         }
-        if upload.mode != "chunked"
-            || upload.part_size_bytes == 0
-            || upload.part_size_bytes > 64 * 1024 * 1024
-        {
+        if upload.mode != "chunked" || upload.part_size_bytes == 0 {
             return Err(CloudApiError::InvalidUpload(
-                "file uploads require a supported mode and parts of at most 64 MiB".into(),
+                "file uploads require a supported mode and a nonzero part size".into(),
             ));
         }
         for batch in progress.missing_parts.chunks(4) {
@@ -380,13 +377,9 @@ impl CloudClient {
                         .ok_or_else(|| {
                             CloudApiError::InvalidUpload("invalid part offset".into())
                         })?;
-                    let count = (size - offset).min(upload.part_size_bytes) as usize;
-                    let mut file = tokio::fs::File::open(path).await?;
-                    file.seek(SeekFrom::Start(offset)).await?;
-                    let mut bytes = vec![0; count];
-                    file.read_exact(&mut bytes).await?;
+                    let count = (size - offset).min(upload.part_size_bytes);
                     client
-                        .put_upload_part(&upload, part_number, Bytes::from(bytes))
+                        .put_upload_file_part(&upload, part_number, &path, offset, count)
                         .await
                 });
             }
@@ -416,17 +409,97 @@ impl CloudClient {
         let checksum = tokio::task::spawn_blocking(move || sha256_hex(&hash_bytes))
             .await
             .map_err(|error| CloudApiError::Worker(error.to_string()))?;
+        self.put_direct_part_body(
+            upload,
+            part_number,
+            size_bytes,
+            checksum,
+            reqwest::Body::from(bytes),
+        )
+        .await
+    }
+
+    async fn put_upload_file_part(
+        &self,
+        upload: &CreateUploadResponse,
+        part_number: u16,
+        path: &Path,
+        offset: u64,
+        size_bytes: u64,
+    ) -> CloudApiResult<PartUploadResponse> {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        let mut remaining = size_bytes;
+        while remaining > 0 {
+            let limit = remaining.min(buffer.len() as u64) as usize;
+            let read = file.read(&mut buffer[..limit]).await?;
+            if read == 0 {
+                return Err(CloudApiError::InvalidUpload(
+                    "file ended before the expected part size".into(),
+                ));
+            }
+            digest.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        let checksum = format!("{:x}", digest.finalize());
+        file.seek(SeekFrom::Start(offset)).await?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file.take(size_bytes)));
+        if upload.direct_part_presign_url_template.is_some()
+            && upload.direct_part_ack_url_template.is_some()
+        {
+            return self
+                .put_direct_part_body(upload, part_number, size_bytes, checksum, body)
+                .await;
+        }
+        self.send_json(
+            self.request(
+                reqwest::Method::PUT,
+                &format!(
+                    "/api/v1/uploads/{encoded_upload_id}/parts/{part_number}",
+                    encoded_upload_id = encode_path_segment(&upload.upload_id)?
+                ),
+            )?
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, size_bytes)
+            .header(PART_SHA256_HEADER, checksum)
+            .body(body),
+        )
+        .await
+    }
+
+    async fn put_direct_part_body(
+        &self,
+        upload: &CreateUploadResponse,
+        part_number: u16,
+        size_bytes: u64,
+        checksum: String,
+        body: reqwest::Body,
+    ) -> CloudApiResult<PartUploadResponse> {
         let presigned: types::DirectPartUploadUrlResponse = self
             .post_json(
                 &format!(
                     "/api/v1/uploads/{}/parts/{part_number}/presign",
-                    upload.upload_id
+                    encode_path_segment(&upload.upload_id)?
                 ),
                 &serde_json_value_empty(),
             )
             .await?;
         // This request has no Clipline credential: S3 receives only its signed URL and advertised headers.
-        let mut request = self.http.put(&presigned.url).body(bytes);
+        if presigned.expected_size_bytes != size_bytes {
+            return Err(CloudApiError::InvalidUpload(
+                "signed part size does not match file part".into(),
+            ));
+        }
+        let signed_content_length = presigned
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"));
+        let mut request = self.http.put(&presigned.url).body(body);
+        if !signed_content_length {
+            request = request.header(header::CONTENT_LENGTH, size_bytes);
+        }
         for header in presigned.headers {
             request = request.header(header.name, header.value);
         }
@@ -448,7 +521,7 @@ impl CloudClient {
         self.post_json(
             &format!(
                 "/api/v1/uploads/{}/parts/{part_number}/ack",
-                upload.upload_id
+                encode_path_segment(&upload.upload_id)?
             ),
             &types::DirectPartUploadAckRequest {
                 etag,

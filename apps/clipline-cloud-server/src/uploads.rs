@@ -24,7 +24,10 @@ use clipline_cloud_storage::{
 };
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex, Weak},
+};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
@@ -41,8 +44,54 @@ use crate::{
 
 // Acquired before reading any request body. The blocking worker retains
 // the same permit on cancellation, so abandoned blocking work stays bounded.
-static UPLOAD_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+// Preserve four-part clients while reserving capacity for another owner.
+static UPLOAD_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
+static OWNER_UPLOADS: LazyLock<OwnerUploadCapacity> = LazyLock::new(|| OwnerUploadCapacity::new(4));
 static ENRICHMENT_WORKERS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+struct OwnerUploadCapacity {
+    limit: usize,
+    owners: Mutex<HashMap<String, Weak<Semaphore>>>,
+}
+
+impl OwnerUploadCapacity {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            owners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn acquire(&self, owner_id: &str) -> Result<OwnedSemaphorePermit, ApiError> {
+        let semaphore = {
+            let mut owners = self
+                .owners
+                .lock()
+                .map_err(|_| ApiError::internal("upload capacity lock failed"))?;
+            owners.retain(|_, semaphore| semaphore.strong_count() > 0);
+            match owners.get(owner_id).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(self.limit));
+                    owners.insert(owner_id.to_string(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        semaphore.try_acquire_owned().map_err(|_| {
+            ApiError::too_many_requests_after(
+                "your upload capacity is busy",
+                std::time::Duration::from_secs(1),
+            )
+        })
+    }
+}
+
+struct UploadPermit {
+    // Return owner capacity before waking a waiter for global capacity.
+    _owner: OwnedSemaphorePermit,
+    _global: Arc<OwnedSemaphorePermit>,
+}
 
 #[derive(Clone)]
 struct UploadAdmission {
@@ -88,7 +137,7 @@ struct StagedUpload {
 async fn stage_upload(
     mut body: Body,
     expected_size: u64,
-    permit: Arc<OwnedSemaphorePermit>,
+    permit: Arc<UploadPermit>,
 ) -> Result<StagedUpload, ApiError> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(2);
     let worker = tokio::task::spawn_blocking(move || {
@@ -503,7 +552,11 @@ async fn put_content(
     }
 
     let expected_size = expected_size(&session)?;
-    let staged = stage_upload(body, expected_size, permit).await?;
+    let permit = Arc::new(UploadPermit {
+        _global: permit,
+        _owner: OWNER_UPLOADS.acquire(&auth.user.id)?,
+    });
+    let staged = stage_upload(body, expected_size, permit.clone()).await?;
     let checksum = staged.checksum.clone();
     if Some(checksum.as_str()) != session.checksum_sha256.as_deref() {
         return Err(ApiError::bad_request("whole-file SHA-256 mismatch"));
@@ -558,7 +611,11 @@ async fn put_part(
 
     let expected = expected_size_for_part(&session, part_number)?;
     validate_part_size(&state.config, &session, part_number, expected)?;
-    let staged = stage_upload(body, expected, permit).await?;
+    let permit = Arc::new(UploadPermit {
+        _global: permit,
+        _owner: OWNER_UPLOADS.acquire(&auth.user.id)?,
+    });
+    let staged = stage_upload(body, expected, permit.clone()).await?;
     let checksum = staged.checksum.clone();
     if let Some(supplied_checksum) = optional_checksum_header(&headers)? {
         if supplied_checksum != checksum {
@@ -1800,7 +1857,6 @@ fn validate_checksum(checksum: &str) -> Result<(), ApiError> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_bytes(&digest)
@@ -2222,9 +2278,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_owner_cannot_occupy_all_upload_capacity() {
+        let workers = Arc::new(Semaphore::new(8));
+        let owners = OwnerUploadCapacity::new(4);
+        let mut occupied = Vec::new();
+        for _ in 0..4 {
+            occupied.push(UploadPermit {
+                _global: Arc::new(workers.clone().try_acquire_owned().unwrap()),
+                _owner: owners.acquire("slow-owner").unwrap(),
+            });
+        }
+        assert_eq!(
+            owners.acquire("slow-owner").unwrap_err().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for _ in 0..4 {
+            occupied.push(UploadPermit {
+                _global: Arc::new(workers.clone().try_acquire_owned().unwrap()),
+                _owner: owners.acquire("other-owner").unwrap(),
+            });
+        }
+        assert_eq!(workers.available_permits(), 0);
+        drop(occupied);
+        for index in 0..1000 {
+            drop(owners.acquire(&format!("owner-{index}")).unwrap());
+        }
+        assert_eq!(owners.owners.lock().unwrap().len(), 1);
+        assert_eq!(workers.available_permits(), 8);
+    }
+
+    async fn staging_permit(workers: &Arc<Semaphore>) -> Arc<UploadPermit> {
+        Arc::new(UploadPermit {
+            _global: Arc::new(workers.clone().acquire_owned().await.unwrap()),
+            _owner: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
+        })
+    }
+
+    #[tokio::test]
     async fn streamed_upload_checks_size_checksum_and_removes_scratch() {
         let workers = Arc::new(Semaphore::new(1));
-        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let permit = staging_permit(&workers).await;
         let staged = stage_upload(Body::from("streamed upload"), 15, permit)
             .await
             .unwrap();
@@ -2234,7 +2327,7 @@ mod tests {
         drop(staged);
         assert!(!path.exists());
         for expected in [10, 20] {
-            let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+            let permit = staging_permit(&workers).await;
             let error = stage_upload(Body::from("streamed upload"), expected, permit)
                 .await
                 .err()
@@ -2246,7 +2339,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_upload_releases_worker_and_admission_permit() {
         let workers = Arc::new(Semaphore::new(1));
-        let permit = Arc::new(workers.clone().acquire_owned().await.unwrap());
+        let owners = OwnerUploadCapacity::new(1);
+        let permit = Arc::new(UploadPermit {
+            _global: Arc::new(workers.clone().acquire_owned().await.unwrap()),
+            _owner: owners.acquire("cancelled-owner").unwrap(),
+        });
         let (_writer, reader) = tokio::io::duplex(1024);
         let task = tokio::spawn(stage_upload(
             Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
@@ -2261,6 +2358,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(owners.acquire("cancelled-owner").is_ok());
     }
 
     #[test]

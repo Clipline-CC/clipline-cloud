@@ -435,9 +435,11 @@ Password verification allows four concurrent hashing workers and two database ad
 per server process. Saturated hashing workers reject new password checks before account lookup or
 reservation writes; database lock waits do not occupy hashing workers or consume password attempts.
 
-Upload handlers authenticate before reading the body. Uploads can continue while data arrives at least
-once every 30 seconds; stalled transfers return 408. Once the body is received, processing has the
-normal 120-second request deadline.
+Upload handlers authenticate before reading the body. Each server process admits at most eight uploads,
+with at most four per owner so one account cannot occupy every slot. Uploads must receive at least
+64 KiB every 30 seconds while the body is incomplete; smaller completed bodies are allowed. Idle or
+trickling transfers return 408. Once the body is received, processing has the normal 120-second request
+deadline. Cancellation retains both capacity permits until the staging worker exits.
 
 Failed uploads and pending deletions retain their storage reservation until cleanup confirms that
 objects and multipart bytes are gone. Cleanup then releases a failed upload's reservation while keeping
