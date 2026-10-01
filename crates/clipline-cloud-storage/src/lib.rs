@@ -948,11 +948,6 @@ impl StorageBackend for LocalStorage {
             let path = entry.path();
             let relative_key =
                 path_to_object_key(path.strip_prefix(&self.data_dir).expect("storage path"))?;
-            if after.is_some_and(|after| {
-                relative_key.as_str() < after && !after.starts_with(&format!("{relative_key}/"))
-            }) {
-                continue;
-            }
             if candidates.len() > limit
                 && candidates
                     .last_key_value()
@@ -962,6 +957,14 @@ impl StorageBackend for LocalStorage {
             }
             let file_type = entry.file_type().await?;
             if file_type.is_dir() {
+                // Descendants sort by the prefix including '/': a-/source sorts
+                // before a/source even though the directory name a sorts first.
+                let directory_prefix = format!("{relative_key}/");
+                if after.is_some_and(|after| {
+                    directory_prefix.as_str() <= after && !after.starts_with(&directory_prefix)
+                }) {
+                    continue;
+                }
                 match fs::read_dir(entry.path()).await {
                     Ok(dir) => stack.push(dir),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2602,6 +2605,54 @@ mod tests {
             S3_MULTIPART_MAX_PARTS
         );
         assert!(validate_s3_multipart_size(maximum_size + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_pages_preserve_directory_prefix_ordering() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(temp.path());
+        for directory in ["a-", "a", "a0", "a.", "aa", "a_/nested"] {
+            for file in ["source.mp4", "poster.jpg"] {
+                let key = ObjectKey::parse(format!("objects/media/{directory}/{file}")).unwrap();
+                storage
+                    .put_object(
+                        &key,
+                        Bytes::from_static(b"source"),
+                        PutObjectMetadata::new("application/octet-stream"),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let expected = storage
+            .list_objects("objects/media/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|object| object.key.to_string())
+            .collect::<Vec<_>>();
+        for limit in [1, 2, 3, 5, 1000] {
+            let mut actual = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = storage
+                    .list_objects_page("objects/media/", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                assert!(page.objects.len() <= limit);
+                actual.extend(
+                    page.objects
+                        .into_iter()
+                        .map(|object| object.key.to_string()),
+                );
+                assert!(actual.len() <= expected.len(), "pagination must advance");
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected, "page size {limit}");
+        }
     }
 
     #[tokio::test]

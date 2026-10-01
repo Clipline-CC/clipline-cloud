@@ -121,6 +121,10 @@ ends at response headers, so streaming transfer duration must be measured separa
   direct parts, peak concurrency four, fewer progress polls, and credential isolation.
 - Disposable HTTP checks verify identical cursor/OFFSET clips, gzip JSON equality,
   and exact full/range video bytes and headers.
+- PR review regression checks compare local inventory pages with complete listings
+  across adjacent directory prefixes and page sizes. Request-event tests exercise
+  the server router's API, parameterized, and static routes, checking route labels,
+  status, latency, and exclusion of share IDs and query tokens.
 
 ## Reproducible benchmark
 

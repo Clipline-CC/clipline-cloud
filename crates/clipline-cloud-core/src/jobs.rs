@@ -1244,6 +1244,8 @@ impl JobRunner {
         };
         for clip in ready_clips {
             let source_key = clip_source_key(&clip)?;
+            // Recheck only missing sources before marking a clip failed: the source
+            // may reappear after the first lookup. Healthy sources need one lookup.
             if source_is_confirmed_missing(&self.storage, &source_key, object_sizes).await?
                 && !self.storage.object_exists(&source_key).await?
             {
