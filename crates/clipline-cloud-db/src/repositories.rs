@@ -3,7 +3,7 @@ use sqlx::{Postgres, QueryBuilder, Sqlite};
 
 mod password_attempts;
 mod transactions;
-pub use password_attempts::PASSWORD_ATTEMPT_MAX;
+pub use password_attempts::{PasswordAttemptAdmission, PASSWORD_ATTEMPT_MAX};
 
 use crate::{
     db_execute, db_execute_rows, db_fetch_all, db_fetch_optional, now_utc, AppSettings,

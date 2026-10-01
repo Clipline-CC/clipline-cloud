@@ -5,6 +5,12 @@ use crate::{Database, DbResult};
 
 pub const PASSWORD_ATTEMPT_MAX: u32 = 5;
 
+pub enum PasswordAttemptAdmission<T> {
+    Admitted(T),
+    RateLimited(DateTime<Utc>),
+    Busy,
+}
+
 impl UserRepository {
     /// Reserve before hashing so concurrent requests share the account's limit.
     /// Rows belong to real accounts, survive process restarts, and are never
@@ -15,6 +21,26 @@ impl UserRepository {
         scope: &str,
         now: DateTime<Utc>,
     ) -> DbResult<Option<DateTime<Utc>>> {
+        match self
+            .reserve_password_attempt_with_admission(user_id, scope, now, || Some(()))
+            .await?
+        {
+            PasswordAttemptAdmission::Admitted(()) => Ok(None),
+            PasswordAttemptAdmission::RateLimited(until) => Ok(Some(until)),
+            PasswordAttemptAdmission::Busy => unreachable!("unconditional password admission"),
+        }
+    }
+
+    /// Acquire database locks before asking the caller for a hashing worker.
+    /// Admission must be synchronous and nonblocking. A busy caller rolls back
+    /// without advancing attempts; an admitted worker is returned after commit.
+    pub async fn reserve_password_attempt_with_admission<T>(
+        &self,
+        user_id: &str,
+        scope: &str,
+        now: DateTime<Utc>,
+        admit: impl FnOnce() -> Option<T>,
+    ) -> DbResult<PasswordAttemptAdmission<T>> {
         let reset_at = now + Duration::minutes(15);
         macro_rules! reserve {
             ($begin:expr, $insert:expr, $select:expr, $update:expr) => {{
@@ -34,9 +60,13 @@ impl UserRepository {
                 if old_reset > now {
                     if let Some(until) = blocked.filter(|until| *until > now) {
                         tx.commit().await?;
-                        return Ok(Some(until.min(old_reset)));
+                        return Ok(PasswordAttemptAdmission::RateLimited(until.min(old_reset)));
                     }
                 }
+                let Some(worker) = admit() else {
+                    tx.rollback().await?;
+                    return Ok(PasswordAttemptAdmission::Busy);
+                };
                 let attempts = if old_reset <= now {
                     1
                 } else {
@@ -60,7 +90,7 @@ impl UserRepository {
                     .execute(&mut *tx)
                     .await?;
                 tx.commit().await?;
-                Ok(None)
+                Ok(PasswordAttemptAdmission::Admitted(worker))
             }};
         }
         match &self.database {

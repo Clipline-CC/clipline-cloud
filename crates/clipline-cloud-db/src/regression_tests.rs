@@ -12,6 +12,16 @@ async fn account_password_limits_are_atomic_durable_and_separate_from_reauth() {
             .await
             .unwrap();
         let now = now_utc();
+        for _ in 0..PASSWORD_ATTEMPT_MAX * 2 {
+            assert!(matches!(
+                repos
+                    .users
+                    .reserve_password_attempt_with_admission(&user.id, "login", now, || None::<()>,)
+                    .await
+                    .unwrap(),
+                PasswordAttemptAdmission::Busy,
+            ));
+        }
         let mut attempts = tokio::task::JoinSet::new();
         for _ in 0..12 {
             let users = repos.users.clone();
@@ -34,6 +44,22 @@ async fn account_password_limits_are_atomic_durable_and_separate_from_reauth() {
             .await
             .unwrap()
             .is_none());
+        for _ in 0..PASSWORD_ATTEMPT_MAX * 2 {
+            assert!(matches!(
+                repos.users.reserve_password_attempt_with_admission(
+                    &user.id, "reauth", now, || None::<()>,
+                ).await.unwrap(),
+                PasswordAttemptAdmission::Busy,
+            ));
+        }
+        for _ in 1..PASSWORD_ATTEMPT_MAX {
+            assert!(repos
+                .users
+                .reserve_password_attempt(&user.id, "reauth", now)
+                .await
+                .unwrap()
+                .is_none());
+        }
         assert!(repos
             .users
             .reserve_password_attempt(&user.id, "login", now + Duration::seconds(1))

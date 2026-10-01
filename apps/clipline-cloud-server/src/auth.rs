@@ -29,7 +29,8 @@ use clipline_cloud_api_types::{
 };
 use clipline_cloud_db::{
     now_utc, AppSettings, Clip, DeviceToken, NewAuditLogEntry, NewDeviceToken, NewInvitationToken,
-    NewResetPasswordToken, NewSession, NewUser, Repositories, Session, UploadSession, User,
+    NewResetPasswordToken, NewSession, NewUser, PasswordAttemptAdmission, Repositories, Session,
+    UploadSession, User,
 };
 use clipline_cloud_storage::{ObjectKey, ObjectMetadata, PutObjectMetadata, StorageError};
 use cookie::{Cookie, SameSite};
@@ -219,21 +220,30 @@ impl AuthRuntime {
         password: String,
         scope: &str,
     ) -> Result<bool, ApiError> {
-        // Admission failures must not consume an account's password budget.
-        // Keep this permit through reservation and hashing so availability
-        // cannot change between reserving an attempt and starting the worker.
-        let permit = self.acquire_password_worker()?;
         let now = now_utc();
-        if let Some(until) = repositories
+        // Wait for database locks before acquiring a worker. Worker admission
+        // happens inside the reservation, so a busy service consumes no attempt.
+        let permit = match repositories
             .users
-            .reserve_password_attempt(&user.id, scope, now)
+            .reserve_password_attempt_with_admission(&user.id, scope, now, || {
+                self.acquire_password_worker().ok()
+            })
             .await?
         {
-            return Err(ApiError::too_many_requests_after(
-                "too many password attempts",
-                (until - now).to_std().unwrap_or(Duration::from_secs(1)),
-            ));
-        }
+            PasswordAttemptAdmission::Admitted(permit) => permit,
+            PasswordAttemptAdmission::RateLimited(until) => {
+                return Err(ApiError::too_many_requests_after(
+                    "too many password attempts",
+                    (until - now).to_std().unwrap_or(Duration::from_secs(1)),
+                ));
+            }
+            PasswordAttemptAdmission::Busy => {
+                return Err(ApiError::too_many_requests_after(
+                    "password service is busy; retry shortly",
+                    Duration::from_secs(1),
+                ));
+            }
+        };
         let verified =
             Self::verify_password_with_worker(password, user.password_hash.clone(), permit).await?;
         if verified {
@@ -2747,6 +2757,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app.state.repositories.users.count_all().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn database_lock_waits_leave_password_workers_available() {
+        let app = test_app().await;
+        let user = insert_user(&app.state, "database-lock").await;
+        set_user_password(&app.state, &user.id, "correct-password").await;
+        let user = app
+            .state
+            .repositories
+            .users
+            .get(&user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let clipline_cloud_db::Database::Sqlite(pool) = &app.state.database else {
+            panic!("test uses SQLite");
+        };
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut checks = Vec::new();
+        for _ in 0..PASSWORD_HASH_CONCURRENCY {
+            checks.push(Box::pin(app.state.auth.verify_account_password(
+                &app.state.repositories,
+                &user,
+                "wrong".into(),
+                "login",
+            )));
+        }
+        // Poll every request into its database wait without relying on sleeps.
+        for check in &mut checks {
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(check.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        assert_eq!(
+            app.state.auth.password_workers.available_permits(),
+            PASSWORD_HASH_CONCURRENCY
+        );
+        assert!(!app
+            .state
+            .auth
+            .verify_login_password(&app.state.repositories, "wrong".into(), None,)
+            .await
+            .unwrap());
+        writer.rollback().await.unwrap();
+        for check in checks {
+            assert!(!check.await.unwrap());
+        }
+        assert!(app
+            .state
+            .auth
+            .verify_account_password(
+                &app.state.repositories,
+                &user,
+                "correct-password".into(),
+                "login",
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            app.state.auth.password_workers.available_permits(),
+            PASSWORD_HASH_CONCURRENCY
+        );
     }
 
     #[tokio::test]
