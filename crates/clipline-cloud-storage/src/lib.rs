@@ -254,6 +254,9 @@ impl From<PartResult> for CompletedUploadPart {
     }
 }
 
+// async_trait adds #[must_use] to futures, which Rust 1.99's Clippy also
+// recognizes as must-use. Keep the allowance local to these generated methods.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn probe(&self) -> StorageResult<()>;

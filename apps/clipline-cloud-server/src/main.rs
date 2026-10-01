@@ -48,6 +48,7 @@ use url::Url;
 const MIB: u64 = 1024 * 1024;
 const GAME_CATEGORY_MAP_TTL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
 
 #[derive(Clone)]
@@ -616,10 +617,89 @@ async fn public_read_budget(request: Request<Body>, next: Next) -> Response {
     next.run(request).await
 }
 
-async fn request_timeout(request: Request<Body>, next: Next) -> Response {
+async fn request_timeout(mut request: Request<Body>, next: Next) -> Response {
+    let segments: Vec<_> = request.uri().path().split('/').collect();
+    let upload_body = request.method() == axum::http::Method::PUT
+        && matches!(
+            segments.as_slice(),
+            ["", "api", "v1", "uploads", _, "content"]
+                | ["", "api", "v1", "uploads", _, "parts", _]
+        );
+    if upload_body {
+        let (deadline, mut updates) = watch::channel(tokio::time::Instant::now() + REQUEST_TIMEOUT);
+        let inner = std::mem::replace(request.body_mut(), Body::empty());
+        *request.body_mut() = Body::new(UploadProgressBody {
+            inner,
+            deadline: deadline.clone(),
+            reading: false,
+        });
+        let response = next.run(request);
+        tokio::pin!(response);
+        loop {
+            let until = *updates.borrow_and_update();
+            tokio::select! {
+                response = &mut response => return response,
+                _ = tokio::time::sleep_until(until) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+                _ = updates.changed() => {},
+            }
+        }
+    }
     tokio::time::timeout(REQUEST_TIMEOUT, next.run(request))
         .await
         .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
+}
+
+// Auth runs before the first body poll. While receiving, each nonempty data
+// frame renews the idle deadline; EOF restores the normal processing deadline.
+struct UploadProgressBody {
+    inner: Body,
+    deadline: watch::Sender<tokio::time::Instant>,
+    reading: bool,
+}
+
+impl http_body::Body for UploadProgressBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        if !body.reading {
+            body.reading = true;
+            body.deadline
+                .send_replace(tokio::time::Instant::now() + UPLOAD_IDLE_TIMEOUT);
+        }
+        let frame = std::pin::Pin::new(&mut body.inner).poll_frame(cx);
+        match &frame {
+            std::task::Poll::Ready(Some(Ok(frame)))
+                if frame.data_ref().is_some_and(|data| !data.is_empty()) =>
+            {
+                body.deadline.send_replace(
+                    tokio::time::Instant::now()
+                        + if body.inner.is_end_stream() {
+                            REQUEST_TIMEOUT
+                        } else {
+                            UPLOAD_IDLE_TIMEOUT
+                        },
+                );
+            }
+            std::task::Poll::Ready(None | Some(Err(_))) => {
+                body.deadline
+                    .send_replace(tokio::time::Instant::now() + REQUEST_TIMEOUT);
+            }
+            _ => {}
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 async fn spa_index(State(state): State<AppState>) -> Result<Response, StatusCode> {
@@ -917,6 +997,84 @@ mod tests {
         );
         let response = test.app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uploads_can_progress_past_the_normal_request_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let app = Router::new()
+            .route(
+                "/api/v1/uploads/{id}/content",
+                axum::routing::put(|body: axum::body::Bytes| async move {
+                    assert_eq!(body.len(), 8);
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn(request_timeout));
+        let (mut writer, reader) = tokio::io::duplex(8);
+        let sender = tokio::spawn(async move {
+            for _ in 0..8 {
+                writer.write_all(b"x").await.unwrap();
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+        });
+        let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader));
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/uploads/test/content")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() > REQUEST_TIMEOUT);
+        sender.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_uploads_and_post_upload_processing_are_bounded() {
+        let app = Router::new()
+            .route(
+                "/api/v1/uploads/{id}/parts/{part}",
+                axum::routing::put(|_: axum::body::Bytes| async {
+                    tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn(request_timeout));
+        let (_writer, reader) = tokio::io::duplex(8);
+        let body = Body::from_stream(tokio_util::io::ReaderStream::new(reader));
+        let started = tokio::time::Instant::now();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/uploads/test/parts/1")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(started.elapsed(), UPLOAD_IDLE_TIMEOUT);
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/uploads/test/parts/1")
+                    .body(Body::from("complete body"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
     }
 
     fn headers_with_xff(value: &'static str) -> HeaderMap {

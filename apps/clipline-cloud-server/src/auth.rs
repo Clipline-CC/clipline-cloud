@@ -49,7 +49,7 @@ const CSRF_HEADER: &str = "x-csrf-token";
 const SESSION_TTL_DAYS: i64 = 30;
 const RESET_TOKEN_TTL_HOURS: i64 = 2;
 const LOGIN_LIMIT_WINDOW: Duration = Duration::from_secs(15 * 60);
-const LOGIN_USERNAME_MAX_FAILURES: u32 = 5;
+const LOGIN_USERNAME_MAX_FAILURES: u32 = clipline_cloud_db::PASSWORD_ATTEMPT_MAX;
 const LOGIN_SOURCE_MAX_FAILURES: u32 = 30;
 const LOGIN_LOCKOUT_BASE: Duration = Duration::from_secs(60);
 const LOGIN_LOCKOUT_MAX: Duration = Duration::from_secs(15 * 60);
@@ -79,6 +79,7 @@ struct LoginBucket {
     failures: u32,
     reset_at: Instant,
     blocked_until: Option<Instant>,
+    last_seen: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -165,63 +166,73 @@ impl AuthRuntime {
 
     async fn verify_login_password(
         &self,
+        repositories: &Repositories,
         password: String,
         user: Option<&User>,
     ) -> Result<bool, ApiError> {
         let eligible_user = user.filter(|user| !user.is_disabled);
-        let password_hash = eligible_user
-            .map(|user| user.password_hash.clone())
-            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_string());
-        let verified = self.verify_password(password, password_hash).await?;
-        Ok(eligible_user.is_some() && verified)
+        if let Some(user) = eligible_user {
+            return self
+                .verify_account_password(repositories, user, password, "login")
+                .await;
+        }
+        self.verify_password(password, DUMMY_PASSWORD_HASH.to_string())
+            .await?;
+        Ok(false)
     }
 
-    async fn require_reauth(&self, user: &User, password: String) -> Result<(), ApiError> {
-        if self.verify_user_password(user, password).await? {
+    async fn require_reauth(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+    ) -> Result<(), ApiError> {
+        if self
+            .verify_user_password(repositories, user, password)
+            .await?
+        {
             Ok(())
         } else {
             Err(ApiError::forbidden("reauthentication failed"))
         }
     }
 
-    async fn verify_user_password(&self, user: &User, password: String) -> Result<bool, ApiError> {
-        let key = format!("reauth:{}", user.id);
+    async fn verify_user_password(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+    ) -> Result<bool, ApiError> {
+        self.verify_account_password(repositories, user, password, "reauth")
+            .await
+    }
+
+    async fn verify_account_password(
+        &self,
+        repositories: &Repositories,
+        user: &User,
+        password: String,
+        scope: &str,
+    ) -> Result<bool, ApiError> {
+        let now = now_utc();
+        if let Some(until) = repositories
+            .users
+            .reserve_password_attempt(&user.id, scope, now)
+            .await?
         {
-            let mut buckets = self.login_limiter.lock().expect("login limiter lock");
-            let now = Instant::now();
-            prune_login_buckets(&mut buckets, now);
-            if let Some(retry_after) =
-                limiter_capacity_retry_after(&buckets, &[&key], now).or_else(|| {
-                    login_bucket_retry_after(
-                        &mut buckets,
-                        key.clone(),
-                        now,
-                        LOGIN_USERNAME_MAX_FAILURES,
-                    )
-                })
-            {
-                return Err(ApiError::too_many_requests_after(
-                    "too many password attempts",
-                    retry_after,
-                ));
-            }
-            buckets
-                .entry(key.clone())
-                .or_insert_with(|| new_login_bucket(now));
+            return Err(ApiError::too_many_requests_after(
+                "too many password attempts",
+                (until - now).to_std().unwrap_or(Duration::from_secs(1)),
+            ));
         }
         let verified = self
             .verify_password(password, user.password_hash.clone())
             .await?;
-        let mut buckets = self.login_limiter.lock().expect("login limiter lock");
         if verified {
-            buckets.remove(&key);
-        } else {
-            record_login_bucket_failure(
-                &mut buckets,
-                key,
-                Instant::now(),
-                LOGIN_USERNAME_MAX_FAILURES,
-            );
+            repositories
+                .users
+                .clear_password_attempts(&user.id, scope)
+                .await?;
         }
         Ok(verified)
     }
@@ -248,14 +259,11 @@ impl AuthRuntime {
         let mut buckets = self.login_limiter.lock().expect("login limiter lock");
         let now = Instant::now();
         prune_login_buckets(&mut buckets, now);
-        let username_key = login_username_key(&format!("{}:{username}", login_source_key(source)));
+        let username_key = login_username_key(username);
         let source_key = login_source_key(source);
-        if let Some(retry_after) =
-            limiter_capacity_retry_after(&buckets, &[&username_key, &source_key], now)
-        {
-            return Err(retry_after);
-        }
-        // Reserve space before verification so concurrent attempts cannot exceed the cap.
+        make_login_bucket_room(&mut buckets, &[&username_key, &source_key]);
+        // This bounded cache limits source/unknown-name traffic. Real accounts
+        // also have durable counters, so eviction cannot reset their limits.
         buckets
             .entry(username_key.clone())
             .or_insert_with(|| new_login_bucket(now));
@@ -279,7 +287,7 @@ impl AuthRuntime {
         prune_login_buckets(&mut buckets, now);
         record_login_bucket_failure(
             &mut buckets,
-            login_username_key(&format!("{}:{username}", login_source_key(source))),
+            login_username_key(username),
             now,
             LOGIN_USERNAME_MAX_FAILURES,
         );
@@ -291,14 +299,11 @@ impl AuthRuntime {
         );
     }
 
-    fn record_login_success(&self, username: &str, source: &str) {
+    fn record_login_success(&self, username: &str, _source: &str) {
         self.login_limiter
             .lock()
             .expect("login limiter lock")
-            .remove(&login_username_key(&format!(
-                "{}:{username}",
-                login_source_key(source)
-            )));
+            .remove(&login_username_key(username));
     }
 }
 
@@ -322,6 +327,7 @@ fn new_login_bucket(now: Instant) -> LoginBucket {
         failures: 0,
         reset_at: now + LOGIN_LIMIT_WINDOW,
         blocked_until: None,
+        last_seen: now,
     }
 }
 
@@ -331,29 +337,22 @@ fn prune_login_buckets(buckets: &mut HashMap<String, LoginBucket>, now: Instant)
     });
 }
 
-fn limiter_capacity_retry_after(
-    buckets: &HashMap<String, LoginBucket>,
-    keys: &[&String],
-    now: Instant,
-) -> Option<Duration> {
+fn make_login_bucket_room(buckets: &mut HashMap<String, LoginBucket>, keys: &[&String]) {
     let needed = keys
         .iter()
         .filter(|key| !buckets.contains_key(**key))
         .count();
-    if buckets.len().saturating_add(needed) <= LOGIN_LIMIT_MAX_BUCKETS {
-        return None;
+    while buckets.len().saturating_add(needed) > LOGIN_LIMIT_MAX_BUCKETS {
+        let oldest = buckets
+            .iter()
+            .filter(|(key, _)| !keys.contains(key))
+            .min_by_key(|(_, bucket)| bucket.last_seen)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        buckets.remove(&oldest);
     }
-    // Retain active counters and lockouts; reject new identities until a slot expires.
-    buckets
-        .values()
-        .map(|bucket| {
-            bucket
-                .blocked_until
-                .unwrap_or(bucket.reset_at)
-                .max(bucket.reset_at)
-                .saturating_duration_since(now)
-        })
-        .min()
 }
 
 fn login_bucket_retry_after(
@@ -363,6 +362,7 @@ fn login_bucket_retry_after(
     _max_failures: u32,
 ) -> Option<Duration> {
     let bucket = buckets.get_mut(&key)?;
+    bucket.last_seen = now;
     if now >= bucket.reset_at && bucket.blocked_until.map_or(true, |blocked| blocked <= now) {
         bucket.failures = 0;
         bucket.reset_at = now + LOGIN_LIMIT_WINDOW;
@@ -380,13 +380,12 @@ fn record_login_bucket_failure(
     now: Instant,
     max_failures: u32,
 ) {
-    if !buckets.contains_key(&key) && buckets.len() >= LOGIN_LIMIT_MAX_BUCKETS {
-        return;
-    }
+    make_login_bucket_room(buckets, &[&key]);
     let bucket = buckets.entry(key).or_insert_with(|| new_login_bucket(now));
     if now >= bucket.reset_at && bucket.blocked_until.map_or(true, |blocked| blocked <= now) {
         *bucket = new_login_bucket(now);
     }
+    bucket.last_seen = now;
     bucket.failures = bucket.failures.saturating_add(1);
     if bucket.failures >= max_failures {
         let overage = bucket.failures.saturating_sub(max_failures).min(8);
@@ -569,7 +568,7 @@ async fn login(
         .await?;
     if !state
         .auth
-        .verify_login_password(request.password.clone(), user.as_ref())
+        .verify_login_password(&state.repositories, request.password.clone(), user.as_ref())
         .await?
     {
         state
@@ -685,7 +684,7 @@ async fn create_device_token(
         .await?;
     if !state
         .auth
-        .verify_login_password(request.password.clone(), user.as_ref())
+        .verify_login_password(&state.repositories, request.password.clone(), user.as_ref())
         .await?
     {
         state
@@ -884,7 +883,7 @@ async fn create_user(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password)
+        .require_reauth(&state.repositories, &auth.user, request.reauth_password)
         .await?;
 
     let role = request.role.unwrap_or_else(|| "user".to_string());
@@ -949,7 +948,7 @@ async fn create_invite_link(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password)
+        .require_reauth(&state.repositories, &auth.user, request.reauth_password)
         .await?;
 
     let role = request.role.unwrap_or_else(|| "user".to_string());
@@ -1340,7 +1339,11 @@ async fn disable_user(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(existing) = state.repositories.users.get(&id).await? else {
@@ -1388,7 +1391,11 @@ async fn purge_user(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(existing) = state.repositories.users.get(&id).await? else {
@@ -1610,7 +1617,11 @@ async fn reset_password(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     state
         .auth
-        .require_reauth(&auth.user, request.reauth_password.clone())
+        .require_reauth(
+            &state.repositories,
+            &auth.user,
+            request.reauth_password.clone(),
+        )
         .await?;
 
     let Some(target_user) = state.repositories.users.get(&id).await? else {
@@ -1869,7 +1880,11 @@ async fn change_password(
     require_csrf_for_cookie(&state, &headers, &auth)?;
     if !state
         .auth
-        .verify_user_password(&auth.user, request.current_password.clone())
+        .verify_user_password(
+            &state.repositories,
+            &auth.user,
+            request.current_password.clone(),
+        )
         .await?
     {
         return Err(ApiError::forbidden("current password is incorrect"));
@@ -2242,7 +2257,7 @@ async fn require_reauth_for_privileged_user_patch(
         };
         state
             .auth
-            .require_reauth(actor, password.to_string())
+            .require_reauth(&state.repositories, actor, password.to_string())
             .await?;
     }
     Ok(())
@@ -2655,19 +2670,56 @@ mod tests {
         _temp_dir: TempDir,
     }
 
-    #[test]
-    fn login_limiter_keeps_lockouts_when_capacity_is_exhausted() {
-        let runtime = AuthRuntime::new(Some("secret"));
+    #[tokio::test]
+    async fn login_cache_saturation_keeps_account_limits_and_admits_newcomers() {
+        let app = test_app().await;
+        let victim = insert_user(&app.state, "victim").await;
+        let now = now_utc();
         for _ in 0..LOGIN_USERNAME_MAX_FAILURES {
-            runtime.record_login_failure("victim", "192.0.2.1");
+            assert!(app
+                .state
+                .repositories
+                .users
+                .reserve_password_attempt(&victim.id, "login", now)
+                .await
+                .unwrap()
+                .is_none());
         }
         for index in 0..LOGIN_LIMIT_MAX_BUCKETS * 2 {
-            runtime.record_login_failure(&format!("user-{index}"), &format!("2001:db8::{index:x}"));
+            app.state.auth.record_login_failure(
+                &format!("user-{index}"),
+                &format!(
+                    "198.{}.{}.{}",
+                    index / 65536,
+                    index / 256 % 256,
+                    index % 256
+                ),
+            );
         }
-        assert!(runtime.login_allowed("victim", "192.0.2.1").is_err());
-        assert!(runtime.login_allowed("new-user", "192.0.2.2").is_err());
-        let buckets = runtime.login_limiter.lock().unwrap();
-        assert_eq!(buckets.len(), LOGIN_LIMIT_MAX_BUCKETS);
+        assert!(app
+            .state
+            .auth
+            .login_allowed("new-user", "192.0.2.2")
+            .is_ok());
+        assert!(app
+            .state
+            .repositories
+            .users
+            .reserve_password_attempt(&victim.id, "login", now)
+            .await
+            .unwrap()
+            .is_some());
+        // A fresh process has the same account limit, independent of its source cache.
+        let restarted = AuthRuntime::new(Some("secret"));
+        assert_eq!(
+            restarted
+                .verify_login_password(&app.state.repositories, "wrong".into(), Some(&victim))
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(app.state.auth.login_limiter.lock().unwrap().len() <= LOGIN_LIMIT_MAX_BUCKETS);
         assert_eq!(login_username_key(&"x".repeat(100_000)).len(), 69);
     }
 
@@ -2707,7 +2759,7 @@ mod tests {
                 error_status(
                     app.state
                         .auth
-                        .require_reauth(&user, "wrong".to_string())
+                        .require_reauth(&app.state.repositories, &user, "wrong".to_string())
                         .await
                 ),
                 StatusCode::FORBIDDEN
@@ -2717,7 +2769,11 @@ mod tests {
             error_status(
                 app.state
                     .auth
-                    .verify_user_password(&user, "correct-password".to_string())
+                    .verify_user_password(
+                        &app.state.repositories,
+                        &user,
+                        "correct-password".to_string()
+                    )
                     .await
             ),
             StatusCode::TOO_MANY_REQUESTS
@@ -2979,8 +3035,8 @@ mod tests {
         assert!(retry_after >= Duration::from_secs(1));
 
         assert!(
-            runtime.login_allowed("dain", "198.51.100.11").is_ok(),
-            "a stranger cannot lock out another source"
+            runtime.login_allowed("dain", "198.51.100.11").is_err(),
+            "the username budget must be shared across source addresses"
         );
         runtime.record_login_success("dain", "198.51.100.10");
         assert!(runtime.login_allowed("dain", "198.51.100.11").is_ok());

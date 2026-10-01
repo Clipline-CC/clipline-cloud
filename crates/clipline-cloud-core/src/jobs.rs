@@ -1044,6 +1044,7 @@ impl JobRunner {
         self.delete_orphan_media_objects(now, &media_objects)
             .await?;
         self.abort_orphan_multipart_uploads(now).await?;
+        self.release_cleaned_failed_upload_reservations().await?;
 
         self.enqueue_next_cleanup_sweep_for_kind(CLEANUP_CLIP_KIND, now)
             .await?;
@@ -1077,6 +1078,53 @@ impl JobRunner {
         Ok(())
     }
 
+    async fn release_cleaned_failed_upload_reservations(&self) -> Result<(), JobRunnerError> {
+        let mut after_id = String::new();
+        loop {
+            let clips = self
+                .repositories
+                .clips
+                .list_failed_with_reserved_storage_after(&after_id, CLEANUP_CLIP_BATCH_SIZE)
+                .await?;
+            if clips.is_empty() {
+                break;
+            }
+            for clip in clips {
+                after_id = clip.id.clone();
+                let result = async {
+                    if let Some(session) = self
+                        .repositories
+                        .upload_sessions
+                        .get_by_clip_id(&clip.id)
+                        .await?
+                    {
+                        if let Some(upload_id) = session.storage_upload_id.as_deref() {
+                            let key = ObjectKey::parse(&session.storage_key)?;
+                            self.storage.abort_multipart_upload(upload_id, &key).await?;
+                        }
+                    }
+                    // Missing-source failures can be restored if files reappear.
+                    // Preserve those files and release only a confirmed empty reservation.
+                    for key in clip_storage_keys(&clip)? {
+                        if self.storage.object_exists(&key).await? {
+                            return Ok::<(), JobRunnerError>(());
+                        }
+                    }
+                    self.repositories
+                        .clips
+                        .release_failed_storage_reservation(&clip.id)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    warn!(event = "jobs.failed_upload_quota_cleanup_failed", clip_id = %clip.id, error = %error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn delete_clip_objects(&self, clip: &Clip) -> Result<(), JobRunnerError> {
         // Keep the clip's quota reservation until its multipart bytes are gone.
         if let Some(session) = self
@@ -1090,36 +1138,19 @@ impl JobRunner {
                 self.storage.abort_multipart_upload(upload_id, &key).await?;
             }
         }
-        let mut keys = HashSet::new();
-        for key in [
-            clip.storage_key.as_deref(),
-            clip.poster_key.as_deref(),
-            clip.thumbnail_key.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            keys.insert(key.to_string());
-        }
-        if let Some(storage_key) = clip.storage_key.as_deref() {
-            if let Ok(source_key) = ObjectKey::parse(storage_key) {
-                if let Ok(key) = optimized_candidate_key(&source_key) {
-                    keys.insert(key.as_str().to_string());
-                }
-                if let Ok(key) = original_source_key(&source_key) {
-                    keys.insert(key.as_str().to_string());
-                }
-            }
-        }
+        let keys = clip_storage_keys(clip)?;
 
         for key in keys {
-            let key = ObjectKey::parse(key)?;
             if let Err(error) = self.storage.delete_object(&key).await {
                 if !matches!(error, StorageError::NotFound(_)) {
                     return Err(error.into());
                 }
             }
         }
+        self.repositories
+            .clips
+            .release_failed_storage_reservation(&clip.id)
+            .await?;
         Ok(())
     }
 
@@ -1335,6 +1366,34 @@ impl JobRunner {
     }
 }
 
+fn clip_storage_keys(clip: &Clip) -> Result<Vec<ObjectKey>, JobRunnerError> {
+    let mut keys = HashSet::new();
+    for key in [
+        clip.storage_key.as_deref(),
+        clip.poster_key.as_deref(),
+        clip.thumbnail_key.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        keys.insert(key.to_string());
+    }
+    if let Some(storage_key) = clip.storage_key.as_deref() {
+        if let Ok(source_key) = ObjectKey::parse(storage_key) {
+            if let Ok(key) = optimized_candidate_key(&source_key) {
+                keys.insert(key.as_str().to_string());
+            }
+            if let Ok(key) = original_source_key(&source_key) {
+                keys.insert(key.as_str().to_string());
+            }
+        }
+    }
+
+    keys.into_iter()
+        .map(|key| ObjectKey::parse(key).map_err(Into::into))
+        .collect()
+}
+
 fn clip_source_key(clip: &Clip) -> Result<ObjectKey, JobRunnerError> {
     let storage_key = clip
         .storage_key
@@ -1493,7 +1552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_s3_objects_are_removed_without_releasing_reserved_quota() {
+    async fn invalid_s3_objects_release_quota_after_storage_cleanup() {
         for wrong_size in [false, true] {
             let (temp_dir, repositories) = sqlite_repositories().await;
             let storage = Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
@@ -1562,7 +1621,7 @@ mod tests {
                     .active_storage_bytes_for_owner(&user.id)
                     .await
                     .unwrap(),
-                10
+                0
             );
         }
     }
@@ -2399,6 +2458,14 @@ mod tests {
                 .file_size_bytes,
             Some(8)
         );
+        assert_eq!(
+            repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            recovered_bytes.len() as i64
+        );
 
         assert!(repositories
             .clips
@@ -2471,6 +2538,116 @@ mod tests {
             .expect("get job")
             .expect("job exists");
         assert_eq!(job.status, "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_quota_cleanup_keeps_billable_bytes_and_continues_after_abort_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (temp_dir, repositories) = sqlite_repositories().await;
+        let root = temp_dir.path().join("storage");
+        let storage = Arc::new(LocalStorage::new(&root));
+        storage.probe().await.unwrap();
+        let user = repositories
+            .users
+            .create(&NewUser::new("uploader", "hash", "user"))
+            .await
+            .unwrap();
+        let mut clips = Vec::new();
+        for (title, size) in [
+            ("abort fails", 8),
+            ("already clean", 8),
+            ("object still present", 5),
+        ] {
+            let key = MediaObjectKeys::generate().unwrap().source;
+            let mut clip = NewClip::new(&user.id, title, "local");
+            clip.status = "failed".into();
+            clip.file_size_bytes = Some(size);
+            clip.storage_key = Some(key.as_str().into());
+            clips.push(repositories.clips.create(&clip).await.unwrap());
+        }
+        let key = ObjectKey::parse(clips[0].storage_key.as_ref().unwrap()).unwrap();
+        let upload_id = storage.create_multipart_upload(&key).await.unwrap();
+        storage
+            .upload_part(&upload_id, &key, 1, bytes::Bytes::from_static(b"billable"))
+            .await
+            .unwrap();
+        let mut session = NewUploadSession::new(
+            &clips[0].id,
+            &user.id,
+            8,
+            key.as_str(),
+            now_utc() + chrono::Duration::hours(1),
+        );
+        session.status = "failed".into();
+        session.storage_upload_id = Some(upload_id.clone());
+        repositories.upload_sessions.create(&session).await.unwrap();
+        let upload_dir = root.join("tmp/uploads").join(upload_id);
+        fs::set_permissions(&upload_dir, std::fs::Permissions::from_mode(0o500))
+            .await
+            .unwrap();
+        let present = ObjectKey::parse(clips[2].storage_key.as_ref().unwrap()).unwrap();
+        storage
+            .put_object(
+                &present,
+                bytes::Bytes::from_static(b"bytes"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        let runner = JobRunner::new(
+            repositories.clone(),
+            storage.clone(),
+            JobRunnerConfig::default(),
+        );
+        runner
+            .release_cleaned_failed_upload_reservations()
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            13
+        );
+        fs::set_permissions(&upload_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        runner
+            .release_cleaned_failed_upload_reservations()
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            5
+        );
+        storage.delete_object(&present).await.unwrap();
+        runner
+            .release_cleaned_failed_upload_reservations()
+            .await
+            .unwrap();
+        assert_eq!(
+            repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            0
+        );
+        for clip in clips {
+            let failed = repositories.clips.get(&clip.id).await.unwrap().unwrap();
+            assert_eq!(failed.file_size_bytes, clip.file_size_bytes);
+            assert_eq!(failed.status, "failed");
+        }
     }
 
     #[tokio::test]

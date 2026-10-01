@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
+mod password_attempts;
 mod transactions;
+pub use password_attempts::PASSWORD_ATTEMPT_MAX;
 
 use crate::{
     db_execute, db_execute_rows, db_fetch_all, db_fetch_optional, now_utc, AppSettings,
@@ -1412,6 +1414,14 @@ impl ClipRepository {
         Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE (status = 'deleted' OR deleted_at IS NOT NULL) AND id > ? ORDER BY id ASC LIMIT ?", [after_id, limit])?)
     }
 
+    pub async fn list_failed_with_reserved_storage_after(
+        &self,
+        after_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(&self.database, Clip, CLIP_SELECT_SQL.to_string() + " WHERE status = 'failed' AND deleted_at IS NULL AND COALESCE(quota_bytes, file_size_bytes, 0) > 0 AND id > ? AND NOT EXISTS (SELECT 1 FROM jobs WHERE target_type = 'clip' AND target_id = clips.id AND status = 'running') ORDER BY id ASC LIMIT ?", [after_id, limit])?)
+    }
+
     pub async fn list_deleted(&self, limit: i64) -> DbResult<Vec<Clip>> {
         Ok(db_fetch_all!(
             &self.database,
@@ -1464,12 +1474,12 @@ impl ClipRepository {
     }
 
     pub async fn active_storage_bytes_for_owner(&self, owner_user_id: &str) -> DbResult<i64> {
-        // Retain reservations for failed uploads and pending deletions until cleanup
-        // deletes the row, so storage deletion failures cannot release quota.
+        // Failed uploads retain their reservation until cleanup confirms their
+        // storage is gone. Keep file_size_bytes intact for retry diagnostics.
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
+            "SELECT CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
              FROM clips
              WHERE owner_user_id = ?",
             [owner_user_id]
@@ -1482,7 +1492,7 @@ impl ClipRepository {
         Ok(db_fetch_all!(
             &self.database,
             (String, i64),
-            "SELECT owner_user_id, CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT)
+            "SELECT owner_user_id, CAST(COALESCE(SUM(COALESCE(quota_bytes, file_size_bytes)), 0) AS BIGINT)
              FROM clips
              GROUP BY owner_user_id
              ORDER BY owner_user_id ASC",
@@ -1502,9 +1512,16 @@ impl ClipRepository {
     pub async fn reserve_storage_bytes(&self, id: &str, size_bytes: i64) -> DbResult<()> {
         db_execute!(
             &self.database,
-            "UPDATE clips SET file_size_bytes = CASE WHEN COALESCE(file_size_bytes, 0) < ? THEN ? ELSE file_size_bytes END, updated_at = ? WHERE id = ?",
+            "UPDATE clips SET file_size_bytes = CASE WHEN COALESCE(file_size_bytes, 0) < ? THEN ? ELSE file_size_bytes END, quota_bytes = NULL, updated_at = ? WHERE id = ?",
             [size_bytes, size_bytes, now_utc(), id]
         )?;
+        Ok(())
+    }
+
+    /// Call only after both objects and multipart bytes have been cleaned.
+    pub async fn release_failed_storage_reservation(&self, id: &str) -> DbResult<()> {
+        db_execute!(&self.database,
+            "UPDATE clips SET quota_bytes = 0 WHERE id = ? AND status = 'failed' AND deleted_at IS NULL", [id])?;
         Ok(())
     }
 
@@ -1524,7 +1541,7 @@ impl ClipRepository {
         let rows = db_execute_rows!(
             &self.database,
             "UPDATE clips
-             SET status = 'ready', updated_at = ?
+             SET status = 'ready', quota_bytes = NULL, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL AND status IN ('processing','ready')",
             [now_utc(), id]
         )?;

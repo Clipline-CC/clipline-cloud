@@ -1,6 +1,151 @@
 use crate::*;
 use chrono::Duration;
 
+#[tokio::test]
+async fn account_password_limits_are_atomic_durable_and_separate_from_reauth() {
+    let (_directory, databases) = backends().await;
+    for database in databases {
+        let repos = Repositories::new(database);
+        let user = repos
+            .users
+            .create(&NewUser::new("account", "hash", "user"))
+            .await
+            .unwrap();
+        let now = now_utc();
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let users = repos.users.clone();
+            let id = user.id.clone();
+            attempts.spawn(async move {
+                users
+                    .reserve_password_attempt(&id, "login", now)
+                    .await
+                    .unwrap()
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = attempts.join_next().await {
+            admitted += usize::from(result.unwrap().is_none());
+        }
+        assert_eq!(admitted, PASSWORD_ATTEMPT_MAX as usize);
+        assert!(repos
+            .users
+            .reserve_password_attempt(&user.id, "reauth", now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repos
+            .users
+            .reserve_password_attempt(&user.id, "login", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repos
+            .users
+            .reserve_password_attempt(&user.id, "login", now + Duration::minutes(16))
+            .await
+            .unwrap()
+            .is_none());
+        repos
+            .users
+            .clear_password_attempts(&user.id, "login")
+            .await
+            .unwrap();
+        assert!(repos
+            .users
+            .reserve_password_attempt(&user.id, "login", now)
+            .await
+            .unwrap()
+            .is_none());
+        repos
+            .update_password_and_revoke_credentials(&user.id, "new-hash")
+            .await
+            .unwrap();
+        assert!(repos
+            .users
+            .reserve_password_attempt(&user.id, "reauth", now)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_upload_quota_can_be_released_and_restored_without_losing_diagnostics() {
+    let (_directory, databases) = backends().await;
+    for database in databases {
+        let repos = Repositories::new(database);
+        let user = repos
+            .users
+            .create(&NewUser::new("uploader", "hash", "user"))
+            .await
+            .unwrap();
+        let mut clip = NewClip::new(&user.id, "failed", "local");
+        clip.status = "failed".into();
+        clip.file_size_bytes = Some(100);
+        let clip = repos.clips.create(&clip).await.unwrap();
+        let mut session = NewUploadSession::new(
+            &clip.id,
+            &user.id,
+            100,
+            "objects/media/token/source.mp4",
+            now_utc() + Duration::hours(1),
+        );
+        session.status = "failed".into();
+        session.failure_reason = Some("missing".into());
+        let session = repos.upload_sessions.create(&session).await.unwrap();
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            100
+        );
+        repos
+            .clips
+            .release_failed_storage_reservation(&clip.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            0
+        );
+        let failed = repos.clips.get(&clip.id).await.unwrap().unwrap();
+        assert_eq!(failed.file_size_bytes, Some(100));
+        assert_eq!(failed.status, "failed");
+        assert!(repos
+            .restore_failed_upload_bundle(&session.id, &clip.id, "missing")
+            .await
+            .unwrap());
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            100
+        );
+        repos
+            .clips
+            .release_failed_storage_reservation(&clip.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            repos
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            100
+        );
+    }
+}
+
 async fn backends() -> (tempfile::TempDir, Vec<Database>) {
     let (directory, sqlite) = crate::tests::sqlite_test_database().await;
     let mut databases = vec![sqlite];

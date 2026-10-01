@@ -182,7 +182,7 @@ An empty secret file stops startup instead of creating an owner with an empty pa
 - [x] Owner guardrails: only owner can create/disable admins, modify the owner account, and edit About text
 - [x] Re-authentication required for sensitive admin actions (create/disable user, reset password)
 - [x] Reset-password tokens: short-lived, random, stored hashed; redeeming one changes the password and revokes existing sessions/device tokens
-- [x] Login rate limiting by username/source and source, with bounded in-memory buckets
+- [x] Login and re-authentication have separate durable per-account limits; bounded in-memory buckets limit username/source traffic
 - [x] Audit-log writes for admin actions, password resets, token revocation
 
 ## Definition of done

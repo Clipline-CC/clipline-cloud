@@ -819,7 +819,7 @@ impl Repositories {
                 let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let clip_rows = sqlx::query(
                     "UPDATE clips
-                     SET status = 'ready', updated_at = ?
+                     SET status = 'ready', quota_bytes = NULL, updated_at = ?
                      WHERE id = ? AND status = 'failed' AND deleted_at IS NULL",
                 )
                 .bind(now)
@@ -851,7 +851,7 @@ impl Repositories {
                 let mut transaction = pool.begin().await?;
                 let clip_rows = sqlx::query(
                     "UPDATE clips
-                     SET status = 'ready', updated_at = $1
+                     SET status = 'ready', quota_bytes = NULL, updated_at = $1
                      WHERE id = $2 AND status = 'failed' AND deleted_at IS NULL",
                 )
                 .bind(now)
@@ -1258,6 +1258,10 @@ async fn update_password_and_revoke_sqlite(
         .bind(user_id)
         .execute(&mut **transaction)
         .await?;
+    sqlx::query("DELETE FROM auth_password_attempts WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut **transaction)
+        .await?;
     sqlx::query("UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?")
         .bind(now)
         .bind(user_id)
@@ -1287,6 +1291,10 @@ async fn update_password_and_revoke_postgres(
     sqlx::query("UPDATE users SET password_hash = $1, password_change_required = FALSE, updated_at = $2 WHERE id = $3")
         .bind(password_hash)
         .bind(now)
+        .bind(user_id)
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM auth_password_attempts WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut **transaction)
         .await?;

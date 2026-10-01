@@ -741,6 +741,7 @@ dependencies = [
  "clipline-cloud-storage",
  "cookie",
  "hmac 0.12.1",
+ "http-body 1.0.1",
  "lettre",
  "rand 0.8.6",
  "reqwest",

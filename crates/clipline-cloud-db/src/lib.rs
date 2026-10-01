@@ -463,6 +463,7 @@ mod tests {
             vec![
                 "app_settings",
                 "audit_log",
+                "auth_password_attempts",
                 "clip_comments",
                 "clip_markers",
                 "clips",

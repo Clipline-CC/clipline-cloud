@@ -421,5 +421,15 @@ local test profile are intended for clients on the Compose network; use an exter
 endpoint for desktop clients.
 
 Public reads, views and search, authenticated comments, and automatic SteamGridDB enrichment have
-separate bounded request budgets. Failed uploads and pending deletions retain their storage reservation until
-cleanup, and failed client upload IDs can be retried with a fresh session.
+separate bounded request budgets. Login and session password checks have separate per-account budgets
+stored in the database, shared across client addresses and server processes. Successful password checks
+clear that budget, and password replacement clears both budgets. The bounded source cache can evict
+old entries without resetting account limits or denying all new clients when it fills.
+
+Upload handlers authenticate before reading the body. Uploads can continue while data arrives at least
+once every 30 seconds; stalled transfers return 408. Once the body is received, processing has the
+normal 120-second request deadline.
+
+Failed uploads and pending deletions retain their storage reservation until cleanup confirms that
+objects and multipart bytes are gone. Cleanup then releases a failed upload's reservation while keeping
+its size and failure diagnostics. Failed client upload IDs can be retried with a fresh session.
