@@ -270,6 +270,8 @@ impl From<PartResult> for CompletedUploadPart {
     }
 }
 
+// async_trait adds #[must_use] to boxed futures, which Clippy 1.99 flags as redundant.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn probe(&self) -> StorageResult<()>;
