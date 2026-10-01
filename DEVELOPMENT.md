@@ -42,6 +42,10 @@ The full deployment smoke suite requires Docker:
 RUN_PROFILES="default minio postgres" deploy/compose/smoke.sh
 ```
 
+The MinIO profile builds its server and client images from upstream commits pinned in
+`deploy/compose/minio/Dockerfile`. The first run downloads the Go toolchain image and modules;
+later runs reuse Docker's build cache. CI's S3 integration job uses the same Dockerfile.
+
 The ignored S3 integration test expects the `CLIPLINE_TEST_S3_*` environment variables documented
 in `.github/workflows/ci.yml`. Postgres repository tests run when
 `CLIPLINE_TEST_POSTGRES_URL` is set; SQLite always runs.

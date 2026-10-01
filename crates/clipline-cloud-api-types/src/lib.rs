@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,24 +89,50 @@ pub struct UserResponse {
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeResponse {
     pub user: UserResponse,
     pub auth_kind: String,
     pub csrf_token: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for MeResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeResponse")
+            .field("user", &self.user)
+            .field("auth_kind", &self.auth_kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDeviceTokenRequest {
     pub username: String,
     pub password: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for CreateDeviceTokenRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateDeviceTokenRequest")
+            .field("username", &self.username)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateDeviceTokenResponse {
     pub token: String,
     pub device_token: DeviceTokenResponse,
+}
+
+impl fmt::Debug for CreateDeviceTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateDeviceTokenResponse")
+            .field("device_token", &self.device_token)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +188,7 @@ pub struct CreateMarkerRequest {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUploadResponse {
     pub clip_id: String,
     pub upload_id: String,
@@ -172,6 +200,17 @@ pub struct CreateUploadResponse {
     pub direct_part_presign_url_template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_part_ack_url_template: Option<String>,
+}
+
+impl fmt::Debug for CreateUploadResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateUploadResponse")
+            .field("clip_id", &self.clip_id)
+            .field("upload_id", &self.upload_id)
+            .field("mode", &self.mode)
+            .field("part_size_bytes", &self.part_size_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,13 +250,21 @@ pub struct PartUploadResponse {
     pub idempotent: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectUploadHeader {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for DirectUploadHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectUploadHeader")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectPartUploadUrlResponse {
     pub upload_id: String,
     pub part_number: u16,
@@ -226,6 +273,19 @@ pub struct DirectPartUploadUrlResponse {
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub expected_size_bytes: u64,
     pub headers: Vec<DirectUploadHeader>,
+}
+
+impl fmt::Debug for DirectPartUploadUrlResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectPartUploadUrlResponse")
+            .field("upload_id", &self.upload_id)
+            .field("part_number", &self.part_number)
+            .field("method", &self.method)
+            .field("expires_at", &self.expires_at)
+            .field("expected_size_bytes", &self.expected_size_bytes)
+            .field("headers", &self.headers)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
