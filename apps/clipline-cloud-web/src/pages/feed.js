@@ -1,3 +1,4 @@
+import { useRef } from "preact/hooks";
 import { html } from "../lib/html.js";
 import { navigate } from "../lib/router.js";
 import { useApiResource } from "../lib/use-api-resource.js";
@@ -37,6 +38,7 @@ export function publicFeedParams(query) {
   }
   if (query.q) params.set("q", query.q);
   if (Number(query.page) > 1) params.set("page", String(query.page));
+  if (query.cursor) params.set("cursor", query.cursor);
   return params;
 }
 
@@ -67,12 +69,19 @@ export function FeedPage({ route }) {
     ...route.query,
     game: route.name === "publicGame" ? route.game : route.query?.game || "",
   };
+  const cursorKey = JSON.stringify([query.sort, query.game, query.q]);
+  const cursors = useRef({ key: cursorKey, pages: new Map() });
+  if (cursors.current.key !== cursorKey) cursors.current = { key: cursorKey, pages: new Map() };
+  const page = Math.max(1, Number(query.page || 1));
+  if (!query.cursor) query.cursor = cursors.current.pages.get(page);
   const feedResource = `/api/v1/public/clips?${publicFeedParams(query)}`;
   const { data, error } = useApiResource(feedResource);
   const { data: gameData } = useApiResource("/api/v1/public/games", 0, { games: [] });
   const games = gameData?.games || [];
 
-  const setQ = (patch) => navigate(feedPath({ ...query, page: 1, ...patch }));
+  if (data?.next_cursor) cursors.current.pages.set(page + 1, data.next_cursor);
+  const setQ = (patch) => navigate(feedPath({ ...query, page: 1, cursor: null,
+    ...patch, ...(patch.page ? { cursor: cursors.current.pages.get(patch.page) || null } : {}) }));
 
   if (error) {
     return html`<main class="page">
@@ -167,11 +176,12 @@ function shareHref(clip) {
 // Keep public feed URLs compact: the default sort is omitted; a `q` filter routes to /search
 // (carrying `game` along as a query param if present); a bare `game` filter
 // routes to /game/<name>; otherwise falls back to /search or / when empty.
-export function feedPath({ sort = "uploaded_at_desc", game = "", q = "", page = 1 } = {}) {
+export function feedPath({ sort = "uploaded_at_desc", game = "", q = "", page = 1, cursor = null } = {}) {
   const params = new URLSearchParams();
   const normalizedSort = sort || "uploaded_at_desc";
   const normalizedGame = String(game || "").trim();
   const normalizedQuery = String(q || "").trim();
+  if (cursor && Number(page) > 1) params.set("cursor", cursor);
   const normalizedPage = Math.max(1, Number(page || 1));
   if (normalizedSort !== "uploaded_at_desc") {
     params.set("sort", normalizedSort);

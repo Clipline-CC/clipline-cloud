@@ -138,6 +138,64 @@ impl MediaProcessor {
         self.probe_file(&input_path).await
     }
 
+    /// One job owns the staged source and its lifetime; retries stage current bytes again.
+    pub async fn refresh_artifacts(
+        &self,
+        storage: &SharedStorageBackend,
+        source_key: &ObjectKey,
+        thumbnail_key: &ObjectKey,
+        poster_key: &ObjectKey,
+        expected_checksum: Option<&str>,
+    ) -> Result<ValidatedMediaMetadata, MediaProcessingError> {
+        let scratch = ScratchDir::create().await?;
+        let input_path = scratch.path().join("source.mp4");
+        let checksum = stage_source_object(storage, source_key, &input_path).await?;
+        if expected_checksum.is_some_and(|expected| expected != checksum) {
+            return Err(MediaProcessingError::Validation(
+                "staged source SHA-256 mismatch".to_string(),
+            ));
+        }
+        scratch.prepare_for_sandbox(&self.config).await?;
+        let metadata = self.probe_file(&input_path).await?;
+        let mut args = vec![
+            os("-v"), os("error"), os("-nostdin"),
+            os("-protocol_whitelist"), os("file,pipe"),
+            os("-threads"), os("1"), os("-i"), input_path.as_os_str().to_os_string(),
+            os("-filter_complex_threads"), os("1"), os("-filter_complex"),
+            os("[0:v:0]split=2[a][b];[a]scale=320:-2:force_original_aspect_ratio=decrease[thumb];[b]scale=1280:-2:force_original_aspect_ratio=decrease[poster]"),
+        ];
+        for (label, filename) in [("[thumb]", "thumbnail.jpg"), ("[poster]", "poster.jpg")] {
+            args.extend([
+                os("-map"),
+                os(label),
+                os("-an"),
+                os("-frames:v"),
+                os("1"),
+                os("-c:v"),
+                os("mjpeg"),
+                os("-threads:v"),
+                os("1"),
+                os("-q:v"),
+                os("4"),
+                scratch.path().join(filename).as_os_str().to_os_string(),
+            ]);
+        }
+        self.run_media_command(&self.config.ffmpeg_bin, args)
+            .await?;
+        for (filename, key) in [("thumbnail.jpg", thumbnail_key), ("poster.jpg", poster_key)] {
+            let path = scratch.path().join(filename);
+            if fs::metadata(&path).await?.len() == 0 {
+                return Err(MediaProcessingError::Validation(
+                    "image generation produced an empty image".to_string(),
+                ));
+            }
+            storage
+                .put_file(key, &path, PutObjectMetadata::new("image/jpeg"))
+                .await?;
+        }
+        Ok(metadata)
+    }
+
     pub async fn optimize_video(
         &self,
         storage: &SharedStorageBackend,
@@ -609,13 +667,44 @@ fn install_no_network_seccomp() -> std::io::Result<()> {
 async fn write_source_object(
     storage: &SharedStorageBackend,
     source_key: &ObjectKey,
-    input_path: &Path,
+    target_path: &Path,
 ) -> Result<(), MediaProcessingError> {
+    stage_source_object(storage, source_key, target_path)
+        .await
+        .map(|_| ())
+}
+
+async fn stage_source_object(
+    storage: &SharedStorageBackend,
+    source_key: &ObjectKey,
+    target_path: &Path,
+) -> Result<String, MediaProcessingError> {
     let mut object = storage.get_object_stream(source_key, None).await?;
-    let mut file = fs::File::create(input_path).await?;
-    tokio::io::copy(&mut object.reader, &mut file).await?;
+    let mut file = fs::File::create(target_path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let count = object.reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+        file.write_all(&buffer[..count]).await?;
+        copied += count as u64;
+    }
+    if copied != object.content_length {
+        return Err(MediaProcessingError::Validation(
+            "source stream ended early".to_string(),
+        ));
+    }
     file.flush().await?;
-    Ok(())
+    tracing::debug!(event = "media.source_staged", scratch_bytes = copied, source_key = %source_key);
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn stderr_string(stderr: &[u8]) -> String {
@@ -625,6 +714,7 @@ fn stderr_string(stderr: &[u8]) -> String {
 #[derive(Debug)]
 struct ScratchDir {
     path: PathBuf,
+    created_at: std::time::Instant,
 }
 
 impl ScratchDir {
@@ -637,7 +727,10 @@ impl ScratchDir {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            created_at: std::time::Instant::now(),
+        })
     }
 
     fn path(&self) -> &Path {
@@ -690,6 +783,19 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
+        let bytes: u64 = std::fs::read_dir(&self.path)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        tracing::debug!(
+            event = "media.scratch_released",
+            scratch_bytes = bytes,
+            lifetime_ms = self.created_at.elapsed().as_millis() as u64
+        );
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
@@ -862,6 +968,71 @@ pub fn media_keys_for_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe"]
+    async fn shared_artifact_processing_probes_and_generates_both_images() {
+        use clipline_cloud_storage::LocalStorage;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("fixture.mp4");
+        let result = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:size=640x360:rate=10",
+                "-t",
+                "0.2",
+                "-c:v",
+                "mpeg4",
+                "-threads",
+                "1",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .unwrap();
+        assert!(result.status.success(), "{}", stderr_string(&result.stderr));
+        let storage: SharedStorageBackend =
+            std::sync::Arc::new(LocalStorage::new(temp.path().join("storage")));
+        let keys = MediaObjectKeys::generate().unwrap();
+        storage
+            .put_file(&keys.source, &source, PutObjectMetadata::new("video/mp4"))
+            .await
+            .unwrap();
+        let checksum = sha256_file_hex(&source).await.unwrap();
+        let processor = MediaProcessor::default();
+        assert!(processor
+            .refresh_artifacts(
+                &storage,
+                &keys.source,
+                &keys.thumbnail,
+                &keys.poster,
+                Some("wrong")
+            )
+            .await
+            .is_err());
+        assert!(!storage.object_exists(&keys.thumbnail).await.unwrap());
+        for _ in 0..2 {
+            let metadata = processor
+                .refresh_artifacts(
+                    &storage,
+                    &keys.source,
+                    &keys.thumbnail,
+                    &keys.poster,
+                    Some(&checksum),
+                )
+                .await
+                .unwrap();
+            assert_eq!(metadata.width, Some(640));
+            for (key, width) in [(&keys.thumbnail, 320), (&keys.poster, 1280)] {
+                let image = processor.probe_metadata(&storage, key).await.unwrap();
+                assert_eq!(image.width, Some(width));
+            }
+        }
+    }
 
     #[test]
     fn validates_sane_ffprobe_metadata() {

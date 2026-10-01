@@ -1,5 +1,9 @@
 # Clipline Cloud — Implementation Docs
 
+The [2026-10-01 optimization implementation](optimization-review-implementation.md)
+records the completed review changes, deployment requirements, validation, and
+synthetic benchmark results.
+
 This folder is the [`clipline-cloud-design.md`](../clipline-cloud-design.md) design split into
 **implementation milestones, ordered the way they should be built**. Each milestone is a
 self-contained working document: it carries the design content relevant to it, a status, a task

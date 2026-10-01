@@ -294,12 +294,18 @@ fn api_url(segments: &[&str]) -> Result<Url, ApiError> {
 }
 
 fn http_client() -> Result<Client, ApiError> {
-    Client::builder()
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("clipline-cloud/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|_| ApiError::internal("HTTP client could not be initialized"))
+        .map_err(|_| ApiError::internal("HTTP client could not be initialized"))?;
+    let _ = CLIENT.set(client.clone());
+    Ok(CLIENT.get().cloned().unwrap_or(client))
 }
 
 fn valid_artwork_url(value: &str) -> bool {

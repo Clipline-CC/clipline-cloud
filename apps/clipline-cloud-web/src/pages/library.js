@@ -1,7 +1,7 @@
 import { html } from "../lib/html.js";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { api } from "../lib/api.js";
-import { useApiResource } from "../lib/use-api-resource.js";
+import { useApiResource, useAsyncResource } from "../lib/use-api-resource.js";
 import { toast } from "../lib/store.js";
 import { formatBytes, formatDate, formatDuration } from "../lib/format.js";
 import { deriveShareLink, ownedMediaPath, ownedThumbPath } from "../lib/media.js";
@@ -145,25 +145,9 @@ export function bulkShareLinks(clips, origin) {
     .filter(Boolean);
 }
 
-// Simple bounded-concurrency runner for the sequential-but-parallel-ish bulk
-// visibility requests (spec: "sequentially, <=4 in flight").
-async function runPool(items, limit, worker) {
-  let index = 0;
-  async function next() {
-    const current = index++;
-    if (current >= items.length) return;
-    await worker(items[current]);
-    return next();
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, next));
-}
-
 function readStoredView() {
-  try {
-    return localStorage.getItem(VIEW_STORAGE_KEY) === "rows" ? "rows" : "grid";
-  } catch {
-    return "grid";
-  }
+  try { return localStorage.getItem(VIEW_STORAGE_KEY) === "rows" ? "rows" : "grid"; }
+  catch { return "grid"; }
 }
 
 export function LibraryPage() {
@@ -174,8 +158,37 @@ export function LibraryPage() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
-  const libraryResource = `/api/v1/clips?${libraryParams(query)}`;
-  const { data, error, setData } = useApiResource(libraryResource, reloadTick);
+  const params = libraryParams(query);
+  const page = Math.max(1, Number(query.page || 1));
+  const pagingFilters = new URLSearchParams(params);
+  pagingFilters.delete("page");
+  const cursorKey = `${pagingFilters}:${reloadTick}`;
+  const cursors = useRef({ key: cursorKey, pages: new Map() });
+  if (cursors.current.key !== cursorKey) cursors.current = { key: cursorKey, pages: new Map() };
+  const cursor = cursors.current.pages.get(page);
+  if (cursor) params.set("cursor", cursor);
+  const libraryResource = `/api/v1/clips/page?${params}`;
+  const { data: pageData, error, setData } = useApiResource(libraryResource, reloadTick);
+  if (pageData?.next_cursor) cursors.current.pages.set(page + 1, pageData.next_cursor);
+  const filters = new URLSearchParams(pagingFilters);
+  filters.delete("sort");
+  filters.delete("page_size");
+  const totalsResource = `/api/v1/clips/totals?${filters}`;
+  const totalsCache = useRef(new Map());
+  const loadTotals = useCallback(async (signal) => {
+    const cached = totalsCache.current.get(totalsResource);
+    if (cached && cached.tick === reloadTick && Date.now() - cached.at < 30000) return cached.data;
+    const data = await api(totalsResource, { signal });
+    if (!signal.aborted) {
+      // Bound entries during a long session of changing filters.
+      if (totalsCache.current.size >= 20) totalsCache.current.clear();
+      totalsCache.current.set(totalsResource, { at: Date.now(), tick: reloadTick, data });
+    }
+    return data;
+  }, [totalsResource, reloadTick]);
+  // Page changes can refresh expired totals but do not recalculate fresh ones.
+  const { data: totals, error: totalsError } = useAsyncResource(`${totalsResource}:${reloadTick}:${page}`, loadTotals);
+  const data = pageData && { ...pageData, total: totals?.total, total_size_bytes: totals?.total_size_bytes };
   const bulkBusyRef = useRef(false);
   const searchTimer = useRef(null);
 
@@ -261,23 +274,19 @@ export function LibraryPage() {
     // same as the local `newVisibility` patch above).
     const confirmedState = new Map();
     try {
-      await runPool(ids, 4, async (id) => {
-        try {
-          const updated = await api(`/api/v1/clips/${encodeURIComponent(id)}/visibility`, {
-            method: "POST",
-            body: { visibility: newVisibility },
-          });
-          const patch = {
-            visibility: updated.visibility,
-            public_url: updated.public_url,
-            public_share_id: updated.public_share_id,
-          };
-          patchClip(id, patch);
-          confirmedState.set(id, patch);
-        } catch (e) {
-          failed.push({ id, message: e.message });
+      try {
+        const updated = await api("/api/v1/clips/bulk-visibility", {
+          method: "POST", body: { ids, visibility: newVisibility },
+        });
+        for (const clip of updated.clips) {
+          const patch = { visibility: clip.visibility, public_url: clip.public_url, public_share_id: clip.public_share_id };
+          patchClip(clip.id, patch);
+          confirmedState.set(clip.id, patch);
         }
-      });
+      } catch (e) {
+        // The endpoint commits every selected clip in one transaction.
+        failed.push(...ids.map((id) => ({ id, message: e.message })));
+      }
 
       const { succeeded, message } = summarizeBulkOutcome(ids, failed, {
         verb: "update",
@@ -296,6 +305,7 @@ export function LibraryPage() {
       }
 
       if (succeeded.length) {
+        reload();
         setSelected(new Set());
         toast(`Made ${succeeded.length} clip${succeeded.length === 1 ? "" : "s"} ${newVisibility}`, {
           actionLabel: "Undo",
@@ -324,23 +334,27 @@ export function LibraryPage() {
       }
 
       const failed = [];
-      await runPool(ids, 4, async (id) => {
-        const original = snapshot.get(id);
-        if (!original) return;
+      const groups = new Map();
+      for (const id of ids) {
+        const visibility = snapshot.get(id)?.visibility;
+        if (!visibility) continue;
+        if (!groups.has(visibility)) groups.set(visibility, []);
+        groups.get(visibility).push(id);
+      }
+      await Promise.all(Array.from(groups, async ([visibility, groupIds]) => {
         try {
-          const updated = await api(`/api/v1/clips/${encodeURIComponent(id)}/visibility`, {
-            method: "POST",
-            body: { visibility: original.visibility },
+          const updated = await api("/api/v1/clips/bulk-visibility", {
+            method: "POST", body: { ids: groupIds, visibility },
           });
-          patchClip(id, {
-            visibility: updated.visibility,
-            public_url: updated.public_url,
-            public_share_id: updated.public_share_id,
+          for (const clip of updated.clips) patchClip(clip.id, {
+            visibility: clip.visibility, public_url: clip.public_url, public_share_id: clip.public_share_id,
           });
         } catch (e) {
-          failed.push({ id, message: e.message });
+          failed.push(...groupIds.map((id) => ({ id, message: e.message })));
         }
-      });
+      }));
+
+      if (failed.length < ids.length) reload();
 
       const { message } = summarizeBulkOutcome(ids, failed, {
         verb: "undo",
@@ -409,8 +423,8 @@ export function LibraryPage() {
   const activeFilterCount = countActiveFilters(query);
   const hasFilter = Boolean(query.q || query.game) || activeFilterCount > 0;
   const chips = deriveGameChips(clips || []);
-  const totalClips = Number(data?.total ?? (clips || []).length);
-  const totalBytes = Number(data?.total_size_bytes ?? (clips || []).reduce((sum, c) => sum + (c.file_size_bytes || 0), 0));
+  const totalClips = Number(data?.total || 0);
+  const totalBytes = Number(data?.total_size_bytes || 0);
   const currentPage = Number(data?.page || query.page || 1);
   const showPager = currentPage > 1 || Boolean(data?.has_more);
 
@@ -463,7 +477,7 @@ export function LibraryPage() {
     <div class="lib-header">
       <div>
         <h1>Library</h1>
-        <p>${totalClips} clip${totalClips === 1 ? "" : "s"} · ${formatBytes(totalBytes)} used</p>
+        <p>${totals ? `${totalClips} clip${totalClips === 1 ? "" : "s"} · ${formatBytes(totalBytes)} used` : totalsError ? "Totals unavailable" : "Loading totals…"}</p>
       </div>
       <div class="seg" role="group" aria-label="View">
         <button type="button" class=${`seg-item ${view === "grid" ? "seg-on" : ""}`}

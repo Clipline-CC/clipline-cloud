@@ -1,0 +1,344 @@
+{
+  "scope": "synthetic fixture; not a production load profile",
+  "sqlite": {
+    "sqlite_version": "3.46.1",
+    "fixture": {
+      "clips": 100000,
+      "users": 10,
+      "public": 75000,
+      "null_uploaded": 991
+    },
+    "stages": {
+      "existing": {
+        "migration_ms": 0,
+        "database_bytes": 82497536,
+        "insert_1000_median_ms": 13.372545829042792,
+        "queries": {
+          "public_first_page": {
+            "median_ms": 74.25949582830071,
+            "rows": 61,
+            "plan": [
+              "SCAN clips",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          },
+          "owner_first_page": {
+            "median_ms": 13.441262068226933,
+            "rows": 61,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_updated_at_idx (owner_user_id=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          },
+          "public_deep_page": {
+            "median_ms": 110.1448368281126,
+            "rows": 61,
+            "plan": [
+              "SCAN clips",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          },
+          "public_rare_search": {
+            "median_ms": 81.06593694537878,
+            "rows": 1,
+            "plan": [
+              "SCAN clips",
+              "CORRELATED SCALAR SUBQUERY 1",
+              "SEARCH n USING INDEX game_category_names_reported_name_ux (<expr>=?)",
+              "SEARCH c USING INDEX sqlite_autoindex_game_categories_1 (id=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          },
+          "owner_totals": {
+            "median_ms": 3.094414947554469,
+            "rows": 1,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_updated_at_idx (owner_user_id=?)"
+            ]
+          }
+        }
+      },
+      "sort_indexes": {
+        "migration_ms": 87.02312991954386,
+        "database_bytes": 94175232,
+        "insert_1000_median_ms": 15.340124955400825,
+        "queries": {
+          "public_first_page": {
+            "median_ms": 0.13632397167384624,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "owner_first_page": {
+            "median_ms": 0.1321248710155487,
+            "rows": 61,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_uploaded_order_idx (owner_user_id=?)"
+            ]
+          },
+          "public_deep_page": {
+            "median_ms": 0.6032430101186037,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "public_rare_search": {
+            "median_ms": 81.82985987514257,
+            "rows": 1,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx",
+              "CORRELATED SCALAR SUBQUERY 1",
+              "SEARCH n USING INDEX game_category_names_reported_name_ux (<expr>=?)",
+              "SEARCH c USING INDEX sqlite_autoindex_game_categories_1 (id=?)"
+            ]
+          },
+          "owner_totals": {
+            "median_ms": 4.524555057287216,
+            "rows": 1,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_updated_at_idx (owner_user_id=?)"
+            ]
+          }
+        }
+      },
+      "maintenance_indexes": {
+        "migration_ms": 65.25710201822221,
+        "database_bytes": 100425728,
+        "insert_1000_median_ms": 17.963940044865012,
+        "queries": {
+          "public_first_page": {
+            "median_ms": 0.13080984354019165,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "owner_first_page": {
+            "median_ms": 0.1332040410488844,
+            "rows": 61,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_uploaded_order_idx (owner_user_id=?)"
+            ]
+          },
+          "public_deep_page": {
+            "median_ms": 0.6045799236744642,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "public_rare_search": {
+            "median_ms": 84.26203997805715,
+            "rows": 1,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx",
+              "CORRELATED SCALAR SUBQUERY 1",
+              "SEARCH n USING INDEX game_category_names_reported_name_ux (<expr>=?)",
+              "SEARCH c USING INDEX sqlite_autoindex_game_categories_1 (id=?)"
+            ]
+          },
+          "owner_totals": {
+            "median_ms": 3.7466769572347403,
+            "rows": 1,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_updated_at_idx (owner_user_id=?)"
+            ]
+          }
+        }
+      },
+      "search_indexes": {
+        "migration_ms": 241.50328896939754,
+        "database_bytes": 118689792,
+        "insert_1000_median_ms": 138.9979999512434,
+        "queries": {
+          "public_first_page": {
+            "median_ms": 0.12997700832784176,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "owner_first_page": {
+            "median_ms": 0.13387599028646946,
+            "rows": 61,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_uploaded_order_idx (owner_user_id=?)"
+            ]
+          },
+          "public_deep_page": {
+            "median_ms": 0.6037119310349226,
+            "rows": 61,
+            "plan": [
+              "SCAN clips USING INDEX clips_public_uploaded_order_idx"
+            ]
+          },
+          "public_rare_search": {
+            "median_ms": 0.1257769763469696,
+            "rows": 1,
+            "plan": [
+              "SEARCH clips USING INDEX sqlite_autoindex_clips_1 (id=?)",
+              "LIST SUBQUERY 2",
+              "COMPOUND QUERY",
+              "LEFT-MOST SUBQUERY",
+              "SCAN clip_search VIRTUAL TABLE INDEX 0:M3",
+              "SEARCH document USING INTEGER PRIMARY KEY (rowid=?)",
+              "UNION USING TEMP B-TREE",
+              "SCAN c",
+              "SEARCH n USING INDEX game_category_names_category_idx (category_id=?)",
+              "SEARCH category_clip USING INDEX clips_game_name_lower_idx (<expr>=?)",
+              "CORRELATED SCALAR SUBQUERY 3",
+              "SEARCH n USING INDEX game_category_names_reported_name_ux (<expr>=?)",
+              "SEARCH c USING INDEX sqlite_autoindex_game_categories_1 (id=?)",
+              "USE TEMP B-TREE FOR ORDER BY"
+            ]
+          },
+          "owner_totals": {
+            "median_ms": 3.2975468784570694,
+            "rows": 1,
+            "plan": [
+              "SEARCH clips USING INDEX clips_owner_updated_at_idx (owner_user_id=?)"
+            ]
+          }
+        }
+      }
+    },
+    "cursor_at_30000": {
+      "median_ms": 0.13410602696239948,
+      "rows": 61,
+      "plan": [
+        "SEARCH clips USING INDEX clips_public_uploaded_order_idx (<expr>=? AND (uploaded_at,id)<(?,?))"
+      ]
+    },
+    "object_bytes": {
+      "app_settings": 4096,
+      "audit_log": 4096,
+      "clip_comments": 4096,
+      "clip_comments_clip_created_idx": 4096,
+      "clip_comments_parent_created_idx": 4096,
+      "clip_markers": 4096,
+      "clip_search_config": 4096,
+      "clip_search_data": 7913472,
+      "clip_search_docsize": 1196032,
+      "clip_search_documents": 3526656,
+      "clip_search_idx": 16384,
+      "clips": 25210880,
+      "clips_game_name_lower_idx": 1531904,
+      "clips_owner_client_clip_id_ux": 4096,
+      "clips_owner_created_at_idx": 4747264,
+      "clips_owner_duration_idx": 1875968,
+      "clips_owner_file_size_idx": 2215936,
+      "clips_owner_game_idx": 2048000,
+      "clips_owner_game_name_idx": 2580480,
+      "clips_owner_recorded_at_idx": 1875968,
+      "clips_owner_source_type_idx": 1875968,
+      "clips_owner_status_idx": 2449408,
+      "clips_owner_title_idx": 4079616,
+      "clips_owner_updated_at_idx": 4747264,
+      "clips_owner_uploaded_at_idx": 7966720,
+      "clips_owner_uploaded_order_idx": 7008256,
+      "clips_owner_visibility_idx": 2572288,
+      "clips_poster_key_idx": 872448,
+      "clips_public_owner_uploaded_idx": 9719808,
+      "clips_public_share_id_idx": 2166784,
+      "clips_public_uploaded_order_idx": 4669440,
+      "clips_storage_key_idx": 4489216,
+      "clips_thumbnail_key_idx": 872448,
+      "device_tokens": 4096,
+      "game_categories": 4096,
+      "game_category_names": 4096,
+      "game_category_names_category_idx": 4096,
+      "game_category_names_reported_name_ux": 4096,
+      "invitation_tokens": 4096,
+      "invitation_tokens_claim_token_hash_idx": 4096,
+      "invitation_tokens_created_by_idx": 4096,
+      "invitation_tokens_expires_at_idx": 4096,
+      "jobs": 4096,
+      "jobs_active_global_kind_ux": 4096,
+      "jobs_active_target_kind_ux": 4096,
+      "jobs_status_next_run_idx": 4096,
+      "jobs_succeeded_retention_idx": 4096,
+      "maintenance_cursors": 4096,
+      "reset_password_tokens": 4096,
+      "reset_password_tokens_expires_at_idx": 4096,
+      "reset_password_tokens_user_idx": 4096,
+      "sessions": 4096,
+      "sqlite_autoindex_audit_log_1": 4096,
+      "sqlite_autoindex_clip_comments_1": 4096,
+      "sqlite_autoindex_clip_markers_1": 4096,
+      "sqlite_autoindex_clip_search_documents_1": 3985408,
+      "sqlite_autoindex_clips_1": 3985408,
+      "sqlite_autoindex_clips_2": 2166784,
+      "sqlite_autoindex_device_tokens_1": 4096,
+      "sqlite_autoindex_device_tokens_2": 4096,
+      "sqlite_autoindex_game_categories_1": 4096,
+      "sqlite_autoindex_game_category_names_1": 4096,
+      "sqlite_autoindex_invitation_tokens_1": 4096,
+      "sqlite_autoindex_invitation_tokens_2": 4096,
+      "sqlite_autoindex_jobs_1": 4096,
+      "sqlite_autoindex_maintenance_cursors_1": 4096,
+      "sqlite_autoindex_reset_password_tokens_1": 4096,
+      "sqlite_autoindex_reset_password_tokens_2": 4096,
+      "sqlite_autoindex_sessions_1": 4096,
+      "sqlite_autoindex_sessions_2": 4096,
+      "sqlite_autoindex_upload_parts_1": 4096,
+      "sqlite_autoindex_upload_sessions_1": 4096,
+      "sqlite_autoindex_users_1": 4096,
+      "sqlite_autoindex_users_2": 4096,
+      "sqlite_schema": 24576,
+      "sqlite_stat1": 4096,
+      "upload_parts": 4096,
+      "upload_sessions": 4096,
+      "upload_sessions_storage_upload_id_idx": 4096,
+      "users": 4096,
+      "users_email_unique_idx": 4096
+    }
+  },
+  "http": {
+    "backend": "disk-backed SQLite, loopback HTTP, debug build",
+    "baseline_comparison": false,
+    "endpoints": {
+      "public_first_page": {
+        "median_ms": 2.97447107732296,
+        "response_bytes": 31475
+      },
+      "owner_page_without_totals": {
+        "median_ms": 2.8609170112758875,
+        "response_bytes": 35547
+      },
+      "owner_legacy_page_with_totals": {
+        "median_ms": 14.96468298137188,
+        "response_bytes": 35436
+      },
+      "owner_totals": {
+        "median_ms": 13.749514007940888,
+        "response_bytes": 46
+      },
+      "public_rare_search": {
+        "median_ms": 1.1677211150527,
+        "response_bytes": 594
+      },
+      "public_offset_30000": {
+        "median_ms": 4.713938105851412,
+        "response_bytes": 31477
+      },
+      "public_cursor_30000": {
+        "median_ms": 2.9277100693434477,
+        "response_bytes": 31477
+      },
+      "auth_me": {
+        "median_ms": 0.7355730049312115,
+        "response_bytes": 318
+      }
+    },
+    "response_checks": [
+      "JSON gzip equals identity response",
+      "video range bytes and headers preserved",
+      "full video remains uncompressed"
+    ]
+  },
+  "review_date": "2026-10-01",
+  "baseline_commit": "789466c56554e7b958234fc4aa811fc3d2d24a0a",
+  "architecture": "x86_64"
+}

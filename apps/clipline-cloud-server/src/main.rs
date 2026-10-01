@@ -40,8 +40,9 @@ use tokio::{
     net::TcpListener,
     sync::{watch, RwLock},
 };
-use tower_http::{catch_panic::CatchPanicLayer, services::ServeDir};
-use tracing::{info, warn};
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer, services::ServeDir};
+use tracing::{info, warn, Instrument};
 use url::Url;
 
 const MIB: u64 = 1024 * 1024;
@@ -531,8 +532,29 @@ fn router(
             config.clone(),
             attach_client_ip,
         ))
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("video/"))),
+        )
         .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(trace_request))
         .with_state(state)
+}
+
+async fn trace_request(request: Request<Body>, next: Next) -> Response {
+    let started = Instant::now();
+    let method = request.method().clone();
+    // Router::layer runs after Axum matches the route and inserts MatchedPath.
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| "static".to_string());
+    let span = tracing::info_span!("http.request", method = %method, route = %route);
+    let response = next.run(request).instrument(span).await;
+    info!(event = "http.response", method = %method, route = %route,
+        status = response.status().as_u16(), latency_us = started.elapsed().as_micros() as u64);
+    response
 }
 
 async fn spa_index(State(state): State<AppState>) -> Result<Response, StatusCode> {
@@ -750,6 +772,7 @@ mod tests {
     use clipline_cloud_db::NewUser;
     use serde_json::{json, Value};
     use tower::ServiceExt;
+    use tracing::instrument::WithSubscriber;
 
     struct TestRouter {
         app: Router,
@@ -848,6 +871,76 @@ mod tests {
             storage_presigned_media_sources(&storage, PublicMediaMode::Presigned),
             vec!["https://r2.example.com".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn request_metrics_keep_matched_routes_and_redact_request_values() {
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let test = test_router().await;
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(move || LogWriter(writer_output.clone()))
+            .finish();
+        let cases = [
+            ("/healthz", "/healthz", StatusCode::OK),
+            (
+                "/api/v1/clips/page?token=private-query-token",
+                "/api/v1/clips/page",
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/api/v1/public/clips/private-share-id?token=private-query-token",
+                "/api/v1/public/clips/{share_id}",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/assets/missing.js?token=private-query-token",
+                "static",
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        async {
+            for (uri, _, status) in cases {
+                let request = request_with_connect_info(
+                    Request::builder().uri(uri).body(Body::empty()).unwrap(),
+                );
+                let response = test.app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), status, "{uri}");
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let responses = logs
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["fields"]["event"] == "http.response")
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), cases.len(), "{logs}");
+        for (event, (_, route, status)) in responses.iter().zip(cases) {
+            assert_eq!(event["fields"]["route"], route);
+            assert_eq!(event["fields"]["status"], status.as_u16());
+            assert!(event["fields"]["latency_us"].is_u64());
+        }
+        assert!(!logs.contains("private-share-id"), "{logs}");
+        assert!(!logs.contains("private-query-token"), "{logs}");
     }
 
     #[tokio::test]
