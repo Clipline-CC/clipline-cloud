@@ -57,7 +57,7 @@ HTTPS; the desktop app enforces the stricter connect-time rule (doc 10).
 ```yaml
 services:
   clipline-cloud:
-    image: ghcr.io/clipline-cc/clipline-cloud:1.3.6
+    image: ghcr.io/clipline-cc/clipline-cloud:1.3.7
     restart: unless-stopped
     ports: ["8080:8080"]
     environment:
@@ -85,7 +85,7 @@ secret in a named volume so browser sessions and CSRF tokens survive container r
 ```yaml
 services:
   clipline-cloud:
-    image: ghcr.io/clipline-cc/clipline-cloud:1.3.6
+    image: ghcr.io/clipline-cc/clipline-cloud:1.3.7
     restart: unless-stopped
     ports: ["8080:8080"]
     environment:

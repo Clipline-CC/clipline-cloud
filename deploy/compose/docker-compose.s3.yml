@@ -2,7 +2,7 @@ name: clipline-cloud-s3
 
 services:
   clipline-cloud:
-    image: ${CLIPLINE_IMAGE:-ghcr.io/clipline-cc/clipline-cloud:1.3.6}
+    image: ${CLIPLINE_IMAGE:-ghcr.io/clipline-cc/clipline-cloud:1.3.7}
     restart: unless-stopped
     ports:
       - "${CLIPLINE_HTTP_PORT:-8080}:8080"
@@ -64,7 +64,7 @@ services:
 
   clipline-worker:
     profiles: ["worker"]
-    image: ${CLIPLINE_IMAGE:-ghcr.io/clipline-cc/clipline-cloud:1.3.6}
+    image: ${CLIPLINE_IMAGE:-ghcr.io/clipline-cc/clipline-cloud:1.3.7}
     restart: unless-stopped
     depends_on:
       clipline-cloud:
