@@ -161,7 +161,7 @@ Useful variants:
 
 ```sh
 CONFIG_ONLY=1 BUILD_IMAGE=0 deploy/compose/smoke.sh
-BUILD_IMAGE=0 CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.6 deploy/compose/smoke.sh
+BUILD_IMAGE=0 CLIPLINE_IMAGE=ghcr.io/clipline-cc/clipline-cloud:1.3.6 deploy/compose/smoke.sh
 RUN_PROFILES="default minio" deploy/compose/smoke.sh
 RUN_DIRECT_S3=0 RUN_PROFILES=minio deploy/compose/smoke.sh
 RUN_VIDEO_OPTIMIZATION=1 RUN_PROFILES="default minio" deploy/compose/smoke.sh
@@ -263,7 +263,13 @@ Defaults:
 | `CLIPLINE_GLOBAL_STORAGE_WARNING_THRESHOLD_BYTES` | unset / `0` disables warning |
 
 The server enforces the per-user storage quota when an upload session is created. The global warning
-threshold is surfaced in admin diagnostics and does not block uploads.
+threshold is surfaced in admin diagnostics and does not block uploads. Failed clips and clips awaiting
+storage cleanup continue to reserve quota until their database rows are removed. Oversized rejected
+objects reserve their actual size, and cleanup retries storage deletions that fail.
+
+Upload routes authenticate and check ownership before reading media bodies. Each body is limited to
+the session's expected file or part size, with a 120-second request deadline. Direct S3 part URLs sign
+the exact expected Content-Length.
 
 Upload body limits are enforced by the app's configured maximum upload size and Axum body limit.
 Caddy's `reverse_proxy` does not add a separate request-body cap.
@@ -370,3 +376,50 @@ Migration is explicit and not automatic.
 - Object without row: object is ignored by the API; restore/migration runbooks preserve DB as source of truth.
 
 Back up before every upgrade that may run migrations.
+
+## Security hardening and upgrade requirements
+
+Media workers require Linux Landlock ABI 3 (normally Linux 6.2 or newer), with Docker's seccomp profile
+allowing the Landlock syscalls. Workers check this at startup and refuse to start without filesystem
+confinement. A `web` process can run separately from the media workers. The media child can read its
+scratch files and runtime libraries, while server data and credentials remain outside its filesystem
+allowlist. Network access, process inspection, and process creation are blocked; codec threads remain
+available.
+
+The processing limits are configurable in every Compose profile:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CLIPLINE_JOB_CONCURRENCY` | `4` | Concurrent jobs, from 1 to 16. Each owner gets at most one active clip job. |
+| `CLIPLINE_MEDIA_TIMEOUT_SECONDS` | `30` | Probe, thumbnail, and poster command timeout. |
+| `CLIPLINE_ENCODE_TIMEOUT_SECONDS` | `1800` | Full video re-encode timeout. |
+| `CLIPLINE_MEDIA_MEMORY_LIMIT_BYTES` | `536870912` | Probe and image command address-space limit. |
+| `CLIPLINE_ENCODE_MEMORY_LIMIT_BYTES` | `2147483648` | Re-encode address-space limit. |
+
+Command timeouts must be between 1 and 86400 seconds; memory limits must be at least 64 MiB.
+Invalid media and command timeouts stop after one failed attempt. Transient storage/database failures
+retain their retries. Source downloads are reused through a bounded scratch cache. Cleanup sweeps use
+pagination so an undeletable old row cannot prevent later rows from being checked.
+
+Generated bootstrap and operator reset passwords require replacement in the Account page before the
+account can use other APIs or create a desktop token. Password changes, new resets, disabling users, and role changes
+invalidate the relevant reset links, invitations, and credentials. Admin patches reject stale updates.
+
+Back up the database before upgrading. The migrations add case-insensitive username and email
+uniqueness and Unicode-aware SQLite category/search comparisons. Existing case-only identity or
+category-name collisions cause a migration error; resolve the ambiguous records explicitly before
+retrying. The migrations preserve records rather than silently renaming or merging accounts.
+
+Generated links use `CLIPLINE_PUBLIC_URL` and `CLIPLINE_ADDITIONAL_PUBLIC_URLS`. Add every supported
+public hostname to that allowlist; an arbitrary `Host` header cannot become a generated link.
+
+The MinIO profile uses a bucket-scoped app account. Its root credential files remain owned and readable
+only by root for the MinIO server and provisioning helper. Existing installations preserve their root
+identity while provisioning the separate app account. Public media uses the app proxy by default so
+browser playback does not depend on Docker's internal `minio` hostname. Direct-upload URLs in this
+local test profile are intended for clients on the Compose network; use an externally reachable S3
+endpoint for desktop clients.
+
+Public reads, views and search, authenticated comments, and automatic SteamGridDB enrichment have
+separate bounded request budgets. Failed uploads and pending deletions retain their storage reservation until
+cleanup, and failed client upload IDs can be retried with a fresh session.

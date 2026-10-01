@@ -3,7 +3,7 @@ import { useState } from "preact/hooks";
 import { api, setCsrfToken } from "../lib/api.js";
 import { useAsyncResource } from "../lib/use-api-resource.js";
 import { navigate } from "../lib/router.js";
-import { session, toast } from "../lib/store.js";
+import { session, toast, useStore } from "../lib/store.js";
 import { formatDate } from "../lib/format.js";
 import { icon } from "../lib/icons.js";
 import { EmptyState } from "../components/EmptyState.js";
@@ -55,8 +55,33 @@ function DeviceTokenItem({ item, onRevoke }) {
 }
 
 export function AccountPage() {
+  const { user } = useStore(session);
+  const [changingPassword, setChangingPassword] = useState(false);
+  async function changePassword(event) {
+    event.preventDefault();
+    if (changingPassword) return;
+    setChangingPassword(true);
+    const form = new FormData(event.currentTarget);
+    try {
+      const result = await api("/api/v1/me/change-password", { method: "POST", body: {
+        current_password: String(form.get("current_password")), new_password: String(form.get("new_password")),
+      }});
+      setCsrfToken(result.csrf_token);
+      const me = await api("/api/v1/auth/me");
+      session.set({ user: me.user, csrfToken: result.csrf_token, ready: true });
+      toast("Password changed.");
+      navigate("/library");
+    } catch (error) { toast(error.message); }
+    finally { setChangingPassword(false); }
+  }
+  const passwordForm = html`<form class="profile-form" onSubmit=${changePassword}>
+    <h2>Change password</h2>
+    <label class="field"><span>Current password</span><input class="input" name="current_password" type="password" autocomplete="current-password" required /></label>
+    <label class="field"><span>New password</span><input class="input" name="new_password" type="password" autocomplete="new-password" minlength="8" required /></label>
+    <button class="btn btn-primary" type="submit" disabled=${changingPassword}>Change password</button>
+  </form>`;
   const [reloadTick, setReloadTick] = useState(0);
-  const { data, error } = useAsyncResource(reloadTick, loadAccountData);
+  const { data, error } = useAsyncResource(user?.password_change_required ? null : reloadTick, loadAccountData);
   const [confirmTarget, setConfirmTarget] = useState(null); // { kind: "session" | "device", item }
 
   const reload = () => setReloadTick((t) => t + 1);
@@ -85,13 +110,17 @@ export function AccountPage() {
     }
   }
 
+  if (user?.password_change_required) return html`<main class="page"><h1>Set your password</h1><p>Choose a new password to finish setting up your account.</p>${passwordForm}</main>`;
+
   if (error) {
     return html`<main class="page"><${EmptyState} name="alert" title="Couldn't load account data" body=${error.message} /></main>`;
   }
 
   return html`<main class="page">
     <h1>Account</h1>
+    ${user?.password_change_required && html`<p class="notice">Set a new password to finish setting up your account.</p>`}
     <p class="page-subtitle">Sessions and device tokens.</p>
+    ${passwordForm}
     ${!data
       ? html`<p class="empty-state">Loading account data…</p>`
       : html`<div class="account-grid">

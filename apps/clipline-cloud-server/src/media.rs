@@ -821,6 +821,7 @@ async fn create_public_comment(
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let clip = load_public_clip(&state, &share_id).await?;
+    crate::limits::check("comments", &auth.user.id, 30, Duration::from_secs(60))?;
     let body = normalize_comment_body(request.body)?;
     let parent_comment_id = normalize_parent_comment_id(request.parent_comment_id);
     if let Some(parent_comment_id) = parent_comment_id.as_deref() {
@@ -912,6 +913,14 @@ async fn record_public_view(
     Extension(client_ip): Extension<ClientIp>,
     Path(share_id): Path<String>,
 ) -> Result<Json<PublicViewResponse>, ApiError> {
+    let source = match client_ip.as_str().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => {
+            std::net::Ipv6Addr::from(u128::from(ip) & (!0u128 << 64)).to_string()
+        }
+        _ => client_ip.as_str().to_string(),
+    };
+    crate::limits::check("views-source", &source, 60, Duration::from_secs(60))?;
+    crate::limits::check("views-global", "all", 2000, Duration::from_secs(60))?;
     let clip = load_public_clip(&state, &share_id).await?;
     if !public_view_allowed(client_ip.as_str(), &clip.id) {
         return Err(ApiError::too_many_requests_after(
@@ -937,7 +946,13 @@ fn public_view_allowed(client_ip: &str, clip_id: &str) -> bool {
     if limiter.len() >= PUBLIC_VIEW_LIMITER_MAX_ENTRIES {
         limiter.retain(|_, expires_at| *expires_at > now);
         if limiter.len() >= PUBLIC_VIEW_LIMITER_MAX_ENTRIES && !limiter.contains_key(&key) {
-            return false;
+            if let Some(oldest) = limiter
+                .iter()
+                .min_by_key(|(_, expires)| *expires)
+                .map(|(key, _)| key.clone())
+            {
+                limiter.remove(&oldest);
+            }
         }
     }
 
@@ -1338,9 +1353,11 @@ fn parse_range_header(headers: &HeaderMap, size: u64) -> Result<Option<ByteRange
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| ())?;
-    let spec = value.strip_prefix("bytes=").ok_or(())?;
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return Ok(None);
+    };
     if spec.contains(',') {
-        return Err(());
+        return Ok(None);
     }
     let (start, end) = spec.split_once('-').ok_or(())?;
 
@@ -2049,8 +2066,14 @@ mod tests {
     fn rejects_invalid_or_unsupported_ranges() {
         assert!(parse_range_header(&headers_with_range("bytes=12-"), 10).is_err());
         assert!(parse_range_header(&headers_with_range("bytes=5-3"), 10).is_err());
-        assert!(parse_range_header(&headers_with_range("bytes=0-1,3-4"), 10).is_err());
-        assert!(parse_range_header(&headers_with_range("items=0-1"), 10).is_err());
+        assert_eq!(
+            parse_range_header(&headers_with_range("bytes=0-1,3-4"), 10),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_range_header(&headers_with_range("items=0-1"), 10),
+            Ok(None)
+        );
         assert!(parse_range_header(&headers_with_range("bytes=-0"), 10).is_err());
     }
 
@@ -2319,6 +2342,7 @@ mod tests {
             bio: None,
             avatar_key: None,
             password_hash: "hash".to_string(),
+            password_change_required: false,
             role: role.to_string(),
             is_disabled: false,
             storage_quota_bytes: None,

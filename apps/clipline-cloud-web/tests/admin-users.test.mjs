@@ -5,11 +5,19 @@ import {
   canEnableUser,
   canChangeRole,
   canPurgeUser,
+  canResetPassword,
   perUserQuotaLabel,
 } from "../src/pages/admin/users.js";
 
 const owner = { id: "owner-1", role: "owner" };
 const admin = { id: "admin-1", role: "admin" };
+
+test("only the owner can reset admin passwords", () => {
+  assert.equal(canResetPassword(admin, admin), false);
+  assert.equal(canResetPassword(owner, admin), false);
+  assert.equal(canResetPassword(admin, owner), true);
+  assert.equal(canResetPassword({ id: "user-1", role: "user" }, admin), true);
+});
 
 test("a user who is already disabled cannot be disabled again", () => {
   const target = { id: "u1", role: "user", is_disabled: true };

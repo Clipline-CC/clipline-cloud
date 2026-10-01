@@ -5,7 +5,7 @@ use sqlx::{types::Json, FromRow};
 
 use crate::{new_ulid, now_utc};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct User {
     pub id: String,
     pub username: String,
@@ -14,6 +14,7 @@ pub struct User {
     pub bio: Option<String>,
     pub avatar_key: Option<String>,
     pub password_hash: String,
+    pub password_change_required: bool,
     pub role: String,
     pub is_disabled: bool,
     pub storage_quota_bytes: Option<i64>,
@@ -22,7 +23,7 @@ pub struct User {
     pub last_login_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NewUser {
     pub id: String,
     pub username: String,
@@ -31,6 +32,7 @@ pub struct NewUser {
     pub bio: Option<String>,
     pub avatar_key: Option<String>,
     pub password_hash: String,
+    pub password_change_required: bool,
     pub role: String,
     pub is_disabled: bool,
     pub storage_quota_bytes: Option<i64>,
@@ -54,6 +56,7 @@ impl NewUser {
             bio: None,
             avatar_key: None,
             password_hash: password_hash.into(),
+            password_change_required: false,
             role: role.into(),
             is_disabled: false,
             storage_quota_bytes: None,
@@ -64,7 +67,7 @@ impl NewUser {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
 pub struct AppSettings {
     pub id: i64,
     pub owner_user_id: Option<String>,
@@ -736,5 +739,23 @@ impl NewAuditLogEntry {
             metadata_json: None,
             created_at: now_utc(),
         }
+    }
+}
+
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for NewUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUser").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AppSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppSettings").finish_non_exhaustive()
     }
 }

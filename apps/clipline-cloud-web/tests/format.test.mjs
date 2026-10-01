@@ -15,3 +15,10 @@ test("formatViews pluralizes", () => {
   assert.equal(formatViews(1), "1 view");
   assert.equal(formatViews(405), "405 views");
 });
+
+test("relative times do not round across minute boundaries", async () => {
+  const { formatRelativeTime } = await import("../src/lib/format.js");
+  const now = Date.now();
+  assert.equal(formatRelativeTime(new Date(now + 500).toISOString()), "just now");
+  assert.equal(formatRelativeTime(new Date(now - 3599500).toISOString()), "59 minutes ago");
+});

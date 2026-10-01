@@ -1,2 +1,7 @@
 target/
 .git/
+**/node_modules/
+**/.clipline-data/
+**/.env
+**/data/
+**/secrets/

@@ -102,8 +102,7 @@ pub(crate) async fn reset_password(
         .map_err(|error| anyhow::anyhow!("{}", error.message()))?;
 
     repositories
-        .users
-        .update_password_hash(&target.id, &password_hash)
+        .reset_password_and_revoke_credentials(&target.id, &password_hash, resolved.generated)
         .await?;
 
     println!("Password reset for user: {}", target.username);

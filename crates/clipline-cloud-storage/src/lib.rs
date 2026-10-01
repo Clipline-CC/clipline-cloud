@@ -306,6 +306,7 @@ pub trait StorageBackend: Send + Sync {
         upload_id: &str,
         key: &ObjectKey,
         part_number: u16,
+        size_bytes: u64,
         ttl: Duration,
     ) -> StorageResult<Option<PresignedUploadPartUrl>>;
     async fn complete_multipart_upload(
@@ -371,6 +372,7 @@ impl LocalStorage {
         let sorted_parts = validate_completed_parts(parts)?;
         let final_path = self.path_for_key(key);
         let tmp_path = unique_tmp_path(&final_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
 
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -468,7 +470,14 @@ impl LocalStorage {
         }
         let bytes = serde_json::to_vec(&sidecar)
             .map_err(|error| StorageError::InvalidPart(error.to_string()))?;
-        fs::write(sidecar_path, bytes).await?;
+        let tmp_path = unique_tmp_path(&sidecar_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
+        fs::write(&tmp_path, bytes).await?;
+        let file = OpenOptions::new().write(true).open(&tmp_path).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&tmp_path, &sidecar_path).await?;
+        sync_parent_dir(&sidecar_path).await;
 
         Ok(metadata)
     }
@@ -490,6 +499,17 @@ impl StorageBackend for LocalStorage {
     async fn probe(&self) -> StorageResult<()> {
         fs::create_dir_all(&self.data_dir).await?;
         fs::create_dir_all(&self.tmp_uploads_dir).await?;
+        let path = self
+            .tmp_uploads_dir
+            .join(format!("readiness-{}", generate_upload_id()));
+        let _guard = TemporaryFile(path.clone());
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await?;
+        file.sync_all().await?;
+        fs::remove_file(path).await?;
         Ok(())
     }
 
@@ -502,6 +522,7 @@ impl StorageBackend for LocalStorage {
         self.probe().await?;
         let final_path = self.path_for_key(key);
         let tmp_path = unique_tmp_path(&final_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
 
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -534,6 +555,7 @@ impl StorageBackend for LocalStorage {
         self.probe().await?;
         let final_path = self.path_for_key(key);
         let tmp_path = unique_tmp_path(&final_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -646,6 +668,7 @@ impl StorageBackend for LocalStorage {
         let source_path = self.path_for_key(source_key);
         let final_path = self.path_for_key(target_key);
         let tmp_path = unique_tmp_path(&final_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
 
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -734,7 +757,7 @@ impl StorageBackend for LocalStorage {
                     continue;
                 };
                 let key = path_to_object_key(relative)?;
-                if key.as_str().ends_with(".meta.json") || key.as_str().ends_with(".tmp") {
+                if key.as_str().ends_with(".meta.json") {
                     continue;
                 }
                 summaries.push(ObjectSummary {
@@ -816,6 +839,7 @@ impl StorageBackend for LocalStorage {
         validate_part_number(part_number)?;
         let part_path = self.part_path(upload_id, part_number)?;
         let tmp_path = unique_tmp_path(&part_path);
+        let _temp_file = TemporaryFile(tmp_path.clone());
         if let Some(parent) = part_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -844,6 +868,7 @@ impl StorageBackend for LocalStorage {
         _upload_id: &str,
         _key: &ObjectKey,
         part_number: u16,
+        _size_bytes: u64,
         _ttl: Duration,
     ) -> StorageResult<Option<PresignedUploadPartUrl>> {
         validate_part_number(part_number)?;
@@ -877,7 +902,7 @@ impl StorageBackend for LocalStorage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3StorageConfig {
     pub endpoint: String,
     pub bucket: String,
@@ -1090,6 +1115,14 @@ impl StorageBackend for S3Storage {
             request = request.prefix(format!("{prefix}/"));
         }
         request.send().await.map_err(s3_error)?;
+        let key = ObjectKey::parse("objects/readiness/probe")?;
+        self.put_object(
+            &key,
+            Bytes::new(),
+            PutObjectMetadata::new("application/octet-stream"),
+        )
+        .await?;
+        self.delete_object(&key).await?;
         Ok(())
     }
 
@@ -1396,7 +1429,10 @@ impl StorageBackend for S3Storage {
                 let Some(logical_key) = self.logical_key(physical_key) else {
                     continue;
                 };
-                let key = ObjectKey::parse(logical_key)?;
+                // Buckets can contain folder markers and keys created outside Clipline.
+                let Ok(key) = ObjectKey::parse(logical_key) else {
+                    continue;
+                };
                 summaries.push(ObjectSummary {
                     key,
                     size_bytes: object.size().unwrap_or(0).max(0) as u64,
@@ -1515,9 +1551,13 @@ impl StorageBackend for S3Storage {
         upload_id: &str,
         key: &ObjectKey,
         part_number: u16,
+        size_bytes: u64,
         ttl: Duration,
     ) -> StorageResult<Option<PresignedUploadPartUrl>> {
         validate_part_number(part_number)?;
+        let content_length = i64::try_from(size_bytes).map_err(|_| {
+            StorageError::S3("upload part size exceeds supported range".to_string())
+        })?;
         let presigned = self
             .client
             .upload_part()
@@ -1525,6 +1565,7 @@ impl StorageBackend for S3Storage {
             .key(self.physical_key(key))
             .upload_id(upload_id)
             .part_number(i32::from(part_number))
+            .content_length(content_length)
             .presigned(
                 PresigningConfig::expires_in(ttl)
                     .map_err(|error| StorageError::S3(error.to_string()))?,
@@ -1648,9 +1689,9 @@ impl From<&ObjectMetadata> for LocalMetadataSidecar {
 async fn read_local_sidecar(path: &Path) -> StorageResult<Option<LocalMetadataSidecar>> {
     let sidecar_path = sidecar_path(path);
     match fs::read(sidecar_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| StorageError::InvalidPart(error.to_string())),
+        // Older releases could truncate the sidecar. The object itself is still
+        // usable: head_object derives its size, type and ETag from the file.
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -1857,6 +1898,15 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// A dropped or cancelled write must not leave its assembly file behind.
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn unique_tmp_path(path: &Path) -> PathBuf {
     append_suffix(path, &format!(".{}.tmp", generate_upload_id()))
 }
@@ -1957,6 +2007,12 @@ where
 
 fn smithy_datetime_to_chrono(value: &aws_sdk_s3::primitives::DateTime) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp(value.secs(), value.subsec_nanos())
+}
+
+impl std::fmt::Debug for S3StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3StorageConfig").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -2190,6 +2246,11 @@ mod tests {
             .expect_err("interrupt");
         assert!(matches!(interrupted, StorageError::CompletionInterrupted));
         assert!(!storage.object_exists(&key).await.expect("not visible"));
+        assert!(storage
+            .list_objects("objects/media/")
+            .await
+            .unwrap()
+            .is_empty());
 
         storage
             .complete_multipart_upload(&upload_id, &key, &parts)
@@ -2247,6 +2308,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_object_remains_readable_with_truncated_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(temp_dir.path());
+        let key = MediaObjectKeys::generate().unwrap().source;
+        storage
+            .put_object(
+                &key,
+                Bytes::from_static(b"clip bytes"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        fs::write(
+            sidecar_path(&storage.path_for_key(&key)),
+            b"{\"content_type\":",
+        )
+        .await
+        .unwrap();
+        let metadata = storage.head_object(&key).await.unwrap();
+        assert_eq!(metadata.size_bytes, 10);
+        assert_eq!(metadata.content_type, "video/mp4");
+        assert!(metadata.etag.is_some());
+        assert_eq!(
+            storage.get_object(&key, None).await.unwrap().bytes,
+            b"clip bytes"[..]
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires CLIPLINE_TEST_S3_* env vars pointing at MinIO"]
     async fn s3_round_trip_against_minio() {
         let endpoint = std::env::var("CLIPLINE_TEST_S3_ENDPOINT").expect("endpoint");
@@ -2283,6 +2373,61 @@ mod tests {
         }
 
         storage.probe().await.expect("probe");
+
+        let folder_key = storage.physical_prefix("objects/media/");
+        storage
+            .client
+            .put_object()
+            .bucket(&storage.bucket)
+            .key(&folder_key)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .unwrap();
+        storage
+            .list_objects("objects/media/")
+            .await
+            .expect("folder markers do not break cleanup");
+        storage
+            .client
+            .delete_object()
+            .bucket(&storage.bucket)
+            .key(&folder_key)
+            .send()
+            .await
+            .unwrap();
+
+        let direct_key = MediaObjectKeys::generate().unwrap().source;
+        let direct_id = storage.create_multipart_upload(&direct_key).await.unwrap();
+        let presigned = storage
+            .create_upload_part_url(&direct_id, &direct_key, 1, 4, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(presigned
+            .url
+            .query_pairs()
+            .any(|(name, value)| name == "X-Amz-SignedHeaders"
+                && value.split(';').any(|header| header == "content-length")));
+        let client = reqwest::Client::new();
+        let oversized = client
+            .put(presigned.url.as_str())
+            .body("oversized")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), reqwest::StatusCode::FORBIDDEN);
+        let accepted = client
+            .put(presigned.url.as_str())
+            .body("part")
+            .send()
+            .await
+            .unwrap();
+        assert!(accepted.status().is_success());
+        storage
+            .abort_multipart_upload(&direct_id, &direct_key)
+            .await
+            .unwrap();
 
         let missing_key = MediaObjectKeys::generate().expect("keys").source;
         assert!(!storage

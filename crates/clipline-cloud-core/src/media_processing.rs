@@ -1,7 +1,9 @@
 use std::{
+    collections::VecDeque,
     ffi::{CString, OsString},
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
@@ -17,6 +19,13 @@ use tokio::{
     time,
 };
 
+/// Worker startup must verify that its host can enforce the media sandbox.
+pub fn check_sandbox_support() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    crate::filesystem_sandbox::check_support()?;
+    Ok(())
+}
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_DIMENSION: i64 = 16_384;
@@ -31,6 +40,8 @@ pub struct MediaProcessingConfig {
     pub ffmpeg_bin: String,
     pub ffprobe_bin: String,
     pub timeout: Duration,
+    pub optimization_timeout: Duration,
+    pub optimization_memory_limit_bytes: u64,
     pub sandbox_uid: u32,
     pub sandbox_gid: u32,
     pub memory_limit_bytes: u64,
@@ -43,6 +54,8 @@ impl Default for MediaProcessingConfig {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             timeout: DEFAULT_TIMEOUT,
+            optimization_timeout: Duration::from_secs(30 * 60),
+            optimization_memory_limit_bytes: 2 * 1024 * 1024 * 1024,
             sandbox_uid: 65_534,
             sandbox_gid: 65_534,
             memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
@@ -109,9 +122,19 @@ pub enum MediaProcessingError {
     Validation(String),
 }
 
+type SourceCache = Arc<tokio::sync::Mutex<VecDeque<CachedSource>>>;
+
+#[derive(Debug)]
+struct CachedSource {
+    key: String,
+    version: String,
+    directory: Arc<ScratchDir>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaProcessor {
     config: MediaProcessingConfig,
+    source_cache: SourceCache,
 }
 
 impl Default for MediaProcessor {
@@ -122,7 +145,62 @@ impl Default for MediaProcessor {
 
 impl MediaProcessor {
     pub fn new(config: MediaProcessingConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            source_cache: Default::default(),
+        }
+    }
+
+    async fn materialize_source(
+        &self,
+        storage: &SharedStorageBackend,
+        key: &ObjectKey,
+        input: &Path,
+    ) -> Result<(), MediaProcessingError> {
+        let metadata = storage.head_object(key).await?;
+        let version = format!(
+            "{}:{}:{:?}:{:?}",
+            metadata.size_bytes,
+            metadata.etag.as_deref().unwrap_or(""),
+            metadata.last_modified,
+            metadata.checksum_sha256
+        );
+        let cached_directory = {
+            let mut cache = self.source_cache.lock().await;
+            if let Some(index) = cache
+                .iter()
+                .position(|entry| entry.key == key.as_str() && entry.version == version)
+            {
+                let entry = cache.remove(index).expect("cache index");
+                let directory = entry.directory.clone();
+                cache.push_back(entry);
+                Some(directory)
+            } else {
+                None
+            }
+        };
+        if let Some(directory) = cached_directory {
+            fs::hard_link(directory.path().join("source.mp4"), input).await?;
+            return Ok(());
+        }
+        // Network downloads run outside the cache lock so another owner's
+        // short clip can progress while a large source is being downloaded.
+        let scratch = Arc::new(ScratchDir::create().await?);
+        let cached = scratch.path().join("source.mp4");
+        write_source_object(storage, key, &cached).await?;
+        fs::hard_link(&cached, input).await?;
+        let mut cache = self.source_cache.lock().await;
+        // Keep at most two immutable source downloads. Each attempt and each
+        // derivative gets a hard link, so retries do not recopy multi-GiB media.
+        while cache.len() >= 2 {
+            cache.pop_front();
+        }
+        cache.push_back(CachedSource {
+            key: key.as_str().into(),
+            version,
+            directory: scratch,
+        });
+        Ok(())
     }
 
     pub async fn probe_metadata(
@@ -132,7 +210,8 @@ impl MediaProcessor {
     ) -> Result<ValidatedMediaMetadata, MediaProcessingError> {
         let scratch = ScratchDir::create().await?;
         let input_path = scratch.path().join("source.mp4");
-        write_source_object(storage, source_key, &input_path).await?;
+        self.materialize_source(storage, source_key, &input_path)
+            .await?;
         scratch.prepare_for_sandbox(&self.config).await?;
 
         self.probe_file(&input_path).await
@@ -147,7 +226,8 @@ impl MediaProcessor {
         let scratch = ScratchDir::create().await?;
         let input_path = scratch.path().join("source.mp4");
         let output_path = scratch.path().join("optimized.mp4");
-        write_source_object(storage, source_key, &input_path).await?;
+        self.materialize_source(storage, source_key, &input_path)
+            .await?;
         scratch.prepare_for_sandbox(&self.config).await?;
 
         let mut args = vec![
@@ -193,8 +273,10 @@ impl MediaProcessor {
             output_path.as_os_str().to_os_string(),
         ]);
 
-        self.run_media_command(&self.config.ffmpeg_bin, args)
-            .await?;
+        let mut encoding_config = self.config.clone();
+        encoding_config.timeout = self.config.optimization_timeout;
+        encoding_config.memory_limit_bytes = self.config.optimization_memory_limit_bytes;
+        run_media_command(&encoding_config, &self.config.ffmpeg_bin, args).await?;
 
         let size_bytes = fs::metadata(&output_path).await?.len();
         if size_bytes == 0 {
@@ -247,7 +329,8 @@ impl MediaProcessor {
         let input_path = scratch.path().join("source.mp4");
         let output_path = scratch.path().join(format!("{label}.jpg"));
         let vf = format!("scale={scale}:force_original_aspect_ratio=decrease");
-        write_source_object(storage, source_key, &input_path).await?;
+        self.materialize_source(storage, source_key, &input_path)
+            .await?;
         scratch.prepare_for_sandbox(&self.config).await?;
 
         self.run_media_command(
@@ -355,11 +438,23 @@ async fn run_media_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let scratch = args
+        .iter()
+        .map(Path::new)
+        .filter_map(|path| path.parent())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("clipline-media-"))
+        })
+        .map(Path::to_path_buf);
+    if let Some(path) = &scratch {
+        command.current_dir(path);
+    }
     for arg in args {
         command.arg(arg);
     }
 
-    harden_command(&mut command, config);
+    harden_command(&mut command, config, program, scratch.as_deref())?;
 
     let mut child = command.spawn()?;
     let stdout = child
@@ -438,26 +533,62 @@ fn os(value: &str) -> OsString {
 }
 
 #[cfg(unix)]
-fn harden_command(command: &mut Command, config: &MediaProcessingConfig) {
-    if unsafe { libc::geteuid() } == 0 {
+fn harden_command(
+    command: &mut Command,
+    config: &MediaProcessingConfig,
+    _program: &str,
+    _scratch: Option<&Path>,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let ruleset = crate::filesystem_sandbox::prepare(_program, _scratch)?;
+    let drops_uid = unsafe { libc::geteuid() } == 0;
+    if drops_uid {
         command.uid(config.sandbox_uid);
         command.gid(config.sandbox_gid);
     }
 
     let memory_limit_bytes = config.memory_limit_bytes;
     let process_limit = config.process_limit;
+    #[cfg(target_os = "linux")]
+    let parent_pid = unsafe { libc::getpid() };
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Close the race where the parent exited before prctl.
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::other(
+                        "media worker exited before child setup",
+                    ));
+                }
+            }
             set_rlimit(libc::RLIMIT_AS, memory_limit_bytes)?;
-            set_rlimit(libc::RLIMIT_NPROC, process_limit)?;
+            // NPROC counts every process/thread of a uid, including the server.
+            // Enforce it only when the child uses a separate uid.
+            if drops_uid {
+                set_rlimit(libc::RLIMIT_NPROC, process_limit)?;
+            }
+            #[cfg(target_os = "linux")]
+            crate::filesystem_sandbox::restrict(&ruleset)?;
             install_no_network_seccomp()?;
             Ok(())
         });
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn harden_command(_command: &mut Command, _config: &MediaProcessingConfig) {}
+fn harden_command(
+    _command: &mut Command,
+    _config: &MediaProcessingConfig,
+    _program: &str,
+    _scratch: Option<&Path>,
+) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(unix)]
 fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
@@ -530,6 +661,19 @@ fn install_no_network_seccomp() -> std::io::Result<()> {
             SYSCALL_NR_OFFSET,
         ),
     ];
+    #[cfg(target_arch = "x86_64")]
+    filter.extend([
+        sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: 0x4000_0000,
+        },
+        stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            SECCOMP_RET_KILL_PROCESS,
+        ),
+    ]);
     for pair in [
         jump_eq(libc::SYS_socket),
         jump_eq(libc::SYS_socketpair),
@@ -538,9 +682,58 @@ fn install_no_network_seccomp() -> std::io::Result<()> {
         jump_eq(libc::SYS_accept4),
         jump_eq(libc::SYS_bind),
         jump_eq(libc::SYS_listen),
+        jump_eq(libc::SYS_ptrace),
+        jump_eq(libc::SYS_kcmp),
+        jump_eq(libc::SYS_unshare),
+        jump_eq(libc::SYS_setns),
+        jump_eq(libc::SYS_process_vm_readv),
+        jump_eq(libc::SYS_process_vm_writev),
+        jump_eq(libc::SYS_pidfd_getfd),
+        jump_eq(libc::SYS_mount),
+        jump_eq(libc::SYS_bpf),
+        jump_eq(libc::SYS_io_uring_setup),
     ] {
         filter.extend(pair);
     }
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm"))]
+    for syscall in [libc::SYS_fork, libc::SYS_vfork] {
+        filter.extend(jump_eq(syscall));
+    }
+    // Force libc's clone3 fallback, then allow clone only for threads. The
+    // child cannot fork a process tree under the server's uid.
+    filter.extend([
+        sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_clone3 as u32,
+        },
+        stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+        ),
+        sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 4,
+            k: libc::SYS_clone as u32,
+        },
+        stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 16),
+        sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16,
+            jt: 1,
+            jf: 0,
+            k: libc::CLONE_THREAD as u32,
+        },
+        stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_ALLOW,
+        ),
+    ]);
     filter.push(stmt(
         (libc::BPF_RET | libc::BPF_K) as u16,
         libc::SECCOMP_RET_ALLOW,
@@ -625,6 +818,8 @@ fn stderr_string(stderr: &[u8]) -> String {
 #[derive(Debug)]
 struct ScratchDir {
     path: PathBuf,
+    #[cfg(unix)]
+    _lease: std::fs::File,
 }
 
 impl ScratchDir {
@@ -637,7 +832,25 @@ impl ScratchDir {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
         }
-        Ok(Self { path })
+        #[cfg(unix)]
+        let lease = {
+            use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.join(".lease"))?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            file
+        };
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            _lease: lease,
+        })
     }
 
     fn path(&self) -> &Path {
@@ -859,9 +1072,80 @@ pub fn media_keys_for_clip(
     MediaObjectKeys::from_source_key(source_key).map_err(Into::into)
 }
 
+/// Delete scratch from dead workers without touching active workers' files.
+/// The kernel releases the lease on process exit, including SIGKILL.
+pub async fn cleanup_abandoned_scratch() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let mut entries = fs::read_dir(std::env::temp_dir()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("clipline-media-")
+                || !entry.file_type().await?.is_dir()
+            {
+                continue;
+            }
+            let path = entry.path();
+            let lease_path = path.join(".lease");
+            let Ok(metadata) = std::fs::symlink_metadata(&lease_path) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let uid = unsafe { libc::geteuid() };
+            if uid != 0 && metadata.uid() != uid {
+                continue;
+            }
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lease_path)
+            else {
+                continue;
+            };
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                if let Err(error) = fs::remove_dir_all(path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scratch_cleanup_preserves_live_leases_and_removes_abandoned_files() {
+        use std::os::fd::AsRawFd;
+
+        let scratch = ScratchDir::create().await.unwrap();
+        fs::write(scratch.path().join("source.mp4"), b"cached source")
+            .await
+            .unwrap();
+        cleanup_abandoned_scratch().await.unwrap();
+        assert!(scratch.path().join("source.mp4").exists());
+        // Releasing the lease simulates the kernel closing it on worker death.
+        assert_eq!(
+            unsafe { libc::flock(scratch._lease.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        cleanup_abandoned_scratch().await.unwrap();
+        assert!(!scratch.path().exists());
+    }
 
     #[test]
     fn validates_sane_ffprobe_metadata() {
@@ -986,5 +1270,108 @@ mod tests {
 
         assert_eq!(captured.bytes, b"abc");
         assert!(captured.truncated);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_regressions {
+    use super::*;
+    use clipline_cloud_storage::LocalStorage;
+
+    #[tokio::test]
+    async fn same_uid_sandbox_denies_secrets_network_ptrace_and_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("session-secret");
+        fs::write(&secret, "private credential").await.unwrap();
+        let script = format!(
+            r#"
+import os, socket, ctypes, errno
+try:
+    open({:?}).read()
+    raise AssertionError('sandbox read the server secret')
+except PermissionError:
+    pass
+try:
+    socket.socket()
+    raise AssertionError('sandbox opened a network socket')
+except PermissionError:
+    pass
+try:
+    os.fork()
+    raise AssertionError('sandbox forked')
+except PermissionError:
+    pass
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.ptrace(0, 0, 0, 0) == -1 and ctypes.get_errno() == errno.EPERM
+"#,
+            secret.to_str().unwrap()
+        );
+        let config = MediaProcessingConfig {
+            sandbox_uid: unsafe { libc::geteuid() },
+            sandbox_gid: unsafe { libc::getegid() },
+            ..Default::default()
+        };
+        run_media_command(&config, "/usr/bin/python3", vec![os("-c"), os(&script)])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_processes_real_video_and_reuses_the_source_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("sample.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=15",
+                "-t",
+                "0.3",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        let storage: SharedStorageBackend = Arc::new(LocalStorage::new(dir.path().join("objects")));
+        let keys = clipline_cloud_storage::MediaObjectKeys::generate().unwrap();
+        storage
+            .put_file(&keys.source, &source, PutObjectMetadata::new("video/mp4"))
+            .await
+            .unwrap();
+        let processor = MediaProcessor::default();
+        let metadata = processor
+            .probe_metadata(&storage, &keys.source)
+            .await
+            .unwrap();
+        assert_eq!(metadata.width, Some(320));
+        processor
+            .generate_thumbnail(&storage, &keys.source, &keys.thumbnail)
+            .await
+            .unwrap();
+        processor
+            .generate_poster(&storage, &keys.source, &keys.poster)
+            .await
+            .unwrap();
+        let candidate = processor
+            .optimize_video(
+                &storage,
+                &keys.source,
+                &VideoOptimizationSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert!(candidate.size_bytes > 0);
+        assert_eq!(processor.source_cache.lock().await.len(), 1);
+        assert!(storage.object_exists(&keys.thumbnail).await.unwrap());
     }
 }

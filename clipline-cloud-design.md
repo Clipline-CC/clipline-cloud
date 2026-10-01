@@ -707,7 +707,7 @@ Config is validated at startup; the app fails loudly on invalid storage/DB setti
 ```yaml
 services:
   clipline-cloud:
-    image: ghcr.io/dain98/clipline-cloud:latest
+    image: ghcr.io/clipline-cc/clipline-cloud:1.3.6
     restart: unless-stopped
     ports: ["8080:8080"]
     environment:
@@ -727,7 +727,7 @@ This points the public URL at `localhost` because the minimal example has no rev
 ```yaml
 services:
   clipline-cloud:
-    image: ghcr.io/dain98/clipline-cloud:latest
+    image: ghcr.io/clipline-cc/clipline-cloud:1.3.6
     restart: unless-stopped
     ports: ["8080:8080"]
     environment:

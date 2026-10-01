@@ -9,38 +9,49 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
-    pub status: &'static str,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadinessResponse {
-    pub status: &'static str,
-    pub database: &'static str,
-    pub storage: &'static str,
+    pub status: String,
+    pub database: String,
+    pub storage: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
-    pub status: &'static str,
+    pub status: String,
 }
 
 impl StatusResponse {
-    pub const fn ok() -> Self {
-        Self { status: "ok" }
+    pub fn ok() -> Self {
+        Self {
+            status: "ok".to_string(),
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangePasswordResponse {
-    pub status: &'static str,
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub csrf_token: Option<String>,
 }
 
+impl fmt::Debug for ChangePasswordResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangePasswordResponse")
+            .field("status", &self.status)
+            .field("has_csrf_token", &self.csrf_token.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ChangePasswordResponse {
-    pub const fn ok(csrf_token: Option<String>) -> Self {
+    pub fn ok(csrf_token: Option<String>) -> Self {
         Self {
-            status: "ok",
+            status: "ok".to_string(),
             csrf_token,
         }
     }
@@ -80,6 +91,8 @@ pub struct UserResponse {
     pub avatar_url: Option<String>,
     pub role: String,
     pub is_disabled: bool,
+    #[serde(default)]
+    pub password_change_required: bool,
     #[serde(default)]
     pub storage_bytes: u64,
     #[serde(default)]

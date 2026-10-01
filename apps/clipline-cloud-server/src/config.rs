@@ -41,7 +41,7 @@ const DEFAULT_PUBLIC_READ_URL_TTL_SECONDS: u64 = 5 * 60;
 const DEFAULT_MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER: u64 = 16;
 const S3_MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub process_role: ProcessRole,
     pub public_url: Url,
@@ -58,10 +58,12 @@ pub struct Config {
     pub upload_session_ttl: Duration,
     pub direct_s3_uploads: bool,
     pub job_poll_interval: Duration,
+    pub job_concurrency: usize,
     pub job_lock_timeout: Duration,
     pub job_retry_base_delay: Duration,
     pub job_retry_max_delay: Duration,
     pub video_optimization: VideoOptimizationConfig,
+    pub media_processing: clipline_cloud_core::media_processing::MediaProcessingConfig,
     pub public_media_mode: PublicMediaMode,
     pub public_read_url_ttl: Duration,
     pub max_active_upload_sessions_per_user: i64,
@@ -74,7 +76,7 @@ pub struct Config {
     startup_warnings: Vec<StartupWarning>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum StorageConfig {
     Local {
         data_dir: PathBuf,
@@ -221,7 +223,7 @@ impl Config {
 
     /// Build the public base URL for this request.
     ///
-    /// A safe `Host` value wins so generated share/discovery/invite URLs match the hostname the
+    /// A configured `Host` value wins so generated share/discovery/invite URLs match the hostname the
     /// client used. `CLIPLINE_PUBLIC_URL` is the fallback when `Host` is missing or invalid.
     /// `X-Forwarded-Host` is ignored; scheme comes from a matching `Origin`, then
     /// `X-Forwarded-Proto`, then the configured public URL.
@@ -243,7 +245,9 @@ impl Config {
                 .or_else(|| parse_forwarded_proto(forwarded_proto))
                 .unwrap_or_else(|| self.public_url.scheme());
             if let Some(url) = url_from_scheme_and_host(scheme, host, self.public_url.path()) {
-                return url;
+                if self.allows_origin(&public_origin(&url)) {
+                    return url;
+                }
             }
         }
         if let Some(origin) = origin.as_deref() {
@@ -305,11 +309,26 @@ impl Config {
             optional(source, "CLIPLINE_UPLOAD_SESSION_TTL_SECONDS"),
             DEFAULT_UPLOAD_SESSION_TTL_SECONDS,
         )?;
+        if upload_session_ttl_seconds == 0 || upload_session_ttl_seconds > 90 * 24 * 60 * 60 {
+            return Err(ConfigError::Validation(
+                "CLIPLINE_UPLOAD_SESSION_TTL_SECONDS must be between 1 and 7776000".into(),
+            ));
+        }
         let direct_s3_uploads = parse_bool(
             "CLIPLINE_DIRECT_S3_UPLOADS",
             optional(source, "CLIPLINE_DIRECT_S3_UPLOADS"),
             DEFAULT_DIRECT_S3_UPLOADS,
         )?;
+        let job_concurrency = parse_u64(
+            "CLIPLINE_JOB_CONCURRENCY",
+            optional(source, "CLIPLINE_JOB_CONCURRENCY"),
+            4,
+        )?;
+        if !(1..=16).contains(&job_concurrency) {
+            return Err(ConfigError::Validation(
+                "CLIPLINE_JOB_CONCURRENCY must be 1..16".into(),
+            ));
+        }
         let job_poll_interval_seconds = parse_u64(
             "CLIPLINE_JOB_POLL_INTERVAL_SECONDS",
             optional(source, "CLIPLINE_JOB_POLL_INTERVAL_SECONDS"),
@@ -330,6 +349,40 @@ impl Config {
             optional(source, "CLIPLINE_JOB_RETRY_MAX_DELAY_SECONDS"),
             DEFAULT_JOB_RETRY_MAX_DELAY_SECONDS,
         )?;
+        let media_processing = clipline_cloud_core::media_processing::MediaProcessingConfig {
+            timeout: Duration::from_secs(parse_u64(
+                "CLIPLINE_MEDIA_TIMEOUT_SECONDS",
+                optional(source, "CLIPLINE_MEDIA_TIMEOUT_SECONDS"),
+                30,
+            )?),
+            optimization_timeout: Duration::from_secs(parse_u64(
+                "CLIPLINE_ENCODE_TIMEOUT_SECONDS",
+                optional(source, "CLIPLINE_ENCODE_TIMEOUT_SECONDS"),
+                1800,
+            )?),
+            memory_limit_bytes: parse_u64(
+                "CLIPLINE_MEDIA_MEMORY_LIMIT_BYTES",
+                optional(source, "CLIPLINE_MEDIA_MEMORY_LIMIT_BYTES"),
+                512 * 1024 * 1024,
+            )?,
+            optimization_memory_limit_bytes: parse_u64(
+                "CLIPLINE_ENCODE_MEMORY_LIMIT_BYTES",
+                optional(source, "CLIPLINE_ENCODE_MEMORY_LIMIT_BYTES"),
+                2 * 1024 * 1024 * 1024,
+            )?,
+            ..Default::default()
+        };
+        if media_processing.timeout.is_zero()
+            || media_processing.timeout.as_secs() > 86400
+            || media_processing.optimization_timeout.is_zero()
+            || media_processing.optimization_timeout.as_secs() > 86400
+            || media_processing.memory_limit_bytes < 64 * 1024 * 1024
+            || media_processing.optimization_memory_limit_bytes < 64 * 1024 * 1024
+        {
+            return Err(ConfigError::Validation(
+                "media timeouts must be 1..86400 seconds and memory limits at least 64 MiB".into(),
+            ));
+        }
         let video_optimization_enabled = parse_video_optimization_mode(
             optional(source, "CLIPLINE_VIDEO_OPTIMIZATION").unwrap_or_else(|| "off".to_string()),
         )?;
@@ -363,6 +416,11 @@ impl Config {
             optional(source, "CLIPLINE_PUBLIC_READ_URL_TTL_SECONDS"),
             DEFAULT_PUBLIC_READ_URL_TTL_SECONDS,
         )?;
+        if !(1..=604800).contains(&public_read_url_ttl_seconds) {
+            return Err(ConfigError::Validation(
+                "CLIPLINE_PUBLIC_READ_URL_TTL_SECONDS must be between 1 and 604800".into(),
+            ));
+        }
         let max_active_upload_sessions_per_user = parse_u64(
             "CLIPLINE_MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER",
             optional(source, "CLIPLINE_MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER"),
@@ -438,9 +496,11 @@ impl Config {
             upload_session_ttl: Duration::from_secs(upload_session_ttl_seconds),
             direct_s3_uploads,
             job_poll_interval: Duration::from_secs(job_poll_interval_seconds),
+            job_concurrency: job_concurrency as usize,
             job_lock_timeout: Duration::from_secs(job_lock_timeout_seconds),
             job_retry_base_delay: Duration::from_secs(job_retry_base_delay_seconds),
             job_retry_max_delay: Duration::from_secs(job_retry_max_delay_seconds),
+            media_processing,
             video_optimization: VideoOptimizationConfig {
                 enabled: video_optimization_enabled,
                 settings: VideoOptimizationSettings {
@@ -678,7 +738,13 @@ fn secret(source: &impl EnvSource, name: &'static str) -> Result<Option<String>,
             path: path.clone(),
             source,
         })?;
-        return Ok(Some(value.trim_end_matches(['\r', '\n']).to_string()));
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
+        if value.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{file_name} must not be empty"
+            )));
+        }
+        return Ok(Some(value));
     }
 
     Ok(optional(source, name))
@@ -839,19 +905,19 @@ fn validate_job_limits(
     retry_base_delay_seconds: u64,
     retry_max_delay_seconds: u64,
 ) -> Result<(), ConfigError> {
-    if poll_interval_seconds == 0 {
+    if poll_interval_seconds == 0 || poll_interval_seconds > 86400 {
         return Err(ConfigError::Validation(
-            "CLIPLINE_JOB_POLL_INTERVAL_SECONDS must be greater than zero".to_string(),
+            "CLIPLINE_JOB_POLL_INTERVAL_SECONDS must be between 1 and 86400".to_string(),
         ));
     }
-    if lock_timeout_seconds == 0 {
+    if lock_timeout_seconds == 0 || lock_timeout_seconds > 86400 {
         return Err(ConfigError::Validation(
-            "CLIPLINE_JOB_LOCK_TIMEOUT_SECONDS must be greater than zero".to_string(),
+            "CLIPLINE_JOB_LOCK_TIMEOUT_SECONDS must be between 1 and 86400".to_string(),
         ));
     }
-    if retry_base_delay_seconds == 0 {
+    if retry_base_delay_seconds == 0 || retry_max_delay_seconds > 86400 {
         return Err(ConfigError::Validation(
-            "CLIPLINE_JOB_RETRY_BASE_DELAY_SECONDS must be greater than zero".to_string(),
+            "job retry delays must be between 1 and 86400 seconds".to_string(),
         ));
     }
     if retry_max_delay_seconds < retry_base_delay_seconds {
@@ -1044,6 +1110,18 @@ fn default_static_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../clipline-cloud-web/dist")
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1238,10 @@ mod tests {
             "CLIPLINE_PUBLIC_URL",
             "https://clips.petrichor.one".to_string(),
         );
+        env.insert(
+            "CLIPLINE_ADDITIONAL_PUBLIC_URLS",
+            "https://watch.clipline.cc".to_string(),
+        );
         let config = Config::from_source(&env).expect("config");
 
         assert_eq!(
@@ -1187,6 +1269,12 @@ mod tests {
                 )
                 .as_str(),
             "https://watch.clipline.cc/"
+        );
+        assert_eq!(
+            config
+                .public_url_for_parts(None, Some("evil.example"), Some("https"))
+                .as_str(),
+            "https://clips.petrichor.one/"
         );
         assert_eq!(
             config.public_url_for_parts(None, None, None).as_str(),
@@ -1481,6 +1569,23 @@ mod tests {
             Some("from-file")
         );
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn empty_bootstrap_secret_files_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin_password.txt");
+        let mut env = valid_local_env();
+        env.insert(
+            "CLIPLINE_BOOTSTRAP_ADMIN_PASSWORD_FILE",
+            path.display().to_string(),
+        );
+        for contents in ["", "\n", "\r\n"] {
+            fs::write(&path, contents).unwrap();
+            assert!(
+                matches!(Config::from_source(&env), Err(ConfigError::Validation(message)) if message.contains("CLIPLINE_BOOTSTRAP_ADMIN_PASSWORD_FILE"))
+            );
+        }
     }
 
     #[test]

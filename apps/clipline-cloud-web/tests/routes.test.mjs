@@ -37,3 +37,10 @@ test("tabNavKeyForRoute highlights Search for /search while top nav stays on Fee
 test("tabNavKeyForRoute highlights Games for /games", () => {
   assert.equal(tabNavKeyForRoute(parseRoute("/games", "")), "games");
 });
+
+test("feed pages reject fractional, infinite, and unsafe page numbers", () => {
+  for (const value of ["1.5", "Infinity", "9007199254740992", "nope"]) {
+    assert.equal(parseRoute("/", `?page=${value}`).query.page, 1);
+  }
+  assert.equal(parseRoute("/", "?page=3").query.page, 3);
+});

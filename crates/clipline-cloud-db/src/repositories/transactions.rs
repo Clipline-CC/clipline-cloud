@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     now_utc, Database, DbResult, NewAuditLogEntry, NewClip, NewClipMarker, NewGameCategory,
-    NewGameCategoryName, NewJob, NewUploadSession, NewUser,
+    NewGameCategoryName, NewJob, NewUploadSession, NewUser, UploadSession, User,
 };
 
 impl Repositories {
@@ -22,7 +22,7 @@ impl Repositories {
     pub async fn ensure_game_category(&self, reported_name: &str) -> DbResult<()> {
         match &self.game_categories.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let _ = ensure_game_category_sqlite(&mut transaction, reported_name).await?;
                 transaction.commit().await?;
             }
@@ -43,7 +43,7 @@ impl Repositories {
     ) -> DbResult<bool> {
         match &self.game_categories.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let rows = sqlx::query(
                     "UPDATE game_categories
                      SET display_name = ?, steamgriddb_game_id = ?, artwork_kind = ?,
@@ -128,7 +128,7 @@ impl Repositories {
     ) -> DbResult<(u64, u64)> {
         match &self.jobs.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let cutoff = now_utc();
                 let deleted = sqlx::query("DELETE FROM jobs WHERE status IN ('dead', 'failed')")
                     .execute(&mut *transaction)
@@ -188,7 +188,7 @@ impl Repositories {
     ) -> DbResult<MergeGameCategoryOutcome> {
         match &self.game_categories.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let outcome =
                     merge_game_categories_sqlite(&mut transaction, source_id, destination_id)
                         .await?;
@@ -228,7 +228,7 @@ impl Repositories {
     ) -> DbResult<SeparateGameCategoryNameOutcome> {
         match &self.game_categories.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let outcome =
                     separate_game_category_name_sqlite(&mut transaction, category_id, name_id)
                         .await?;
@@ -269,7 +269,7 @@ impl Repositories {
     ) -> DbResult<usize> {
         match &self.clips.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for clip_id in clip_ids {
                     let now = now_utc();
                     let rows = sqlx::query(
@@ -346,7 +346,7 @@ impl Repositories {
     ) -> DbResult<usize> {
         match &self.clips.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 for update in updates {
                     let rows = sqlx::query(
                         "UPDATE clips
@@ -418,11 +418,26 @@ impl Repositories {
         user_id: &str,
         password_hash: &str,
     ) -> DbResult<()> {
+        self.reset_password_and_revoke_credentials(user_id, password_hash, false)
+            .await
+    }
+
+    pub async fn reset_password_and_revoke_credentials(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+        requires_setup: bool,
+    ) -> DbResult<()> {
         let now = now_utc();
         match &self.users.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 update_password_and_revoke_sqlite(&mut transaction, user_id, password_hash, now)
+                    .await?;
+                sqlx::query("UPDATE users SET password_change_required = ? WHERE id = ?")
+                    .bind(requires_setup)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;
             }
@@ -430,10 +445,59 @@ impl Repositories {
                 let mut transaction = pool.begin().await?;
                 update_password_and_revoke_postgres(&mut transaction, user_id, password_hash, now)
                     .await?;
+                sqlx::query("UPDATE users SET password_change_required = $1 WHERE id = $2")
+                    .bind(requires_setup)
+                    .bind(user_id)
+                    .execute(&mut *transaction)
+                    .await?;
                 transaction.commit().await?;
             }
         }
         Ok(())
+    }
+
+    pub async fn update_user_if_current(
+        &self,
+        existing: &User,
+        display_name: Option<&str>,
+        role: &str,
+        disabled: bool,
+        quota: Option<i64>,
+    ) -> DbResult<bool> {
+        let now = now_utc();
+        match &self.users.database {
+            Database::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                let changed = sqlx::query("UPDATE users SET display_name = ?, role = ?, is_disabled = ?, storage_quota_bytes = ?, updated_at = ? WHERE id = ? AND updated_at = ?")
+                    .bind(display_name).bind(role).bind(disabled).bind(quota).bind(now).bind(&existing.id).bind(existing.updated_at).execute(&mut *tx).await?.rows_affected();
+                if changed != 1 {
+                    return Ok(false);
+                }
+                if disabled || role != existing.role {
+                    sqlx::query("UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE reset_password_tokens SET used_at = COALESCE(used_at, ?) WHERE user_id = ?").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE invitation_tokens SET used_at = COALESCE(used_at, ?) WHERE created_by_user_id = ?").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+            Database::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let changed = sqlx::query("UPDATE users SET display_name = $1, role = $2, is_disabled = $3, storage_quota_bytes = $4, updated_at = $5 WHERE id = $6 AND updated_at = $7")
+                    .bind(display_name).bind(role).bind(disabled).bind(quota).bind(now).bind(&existing.id).bind(existing.updated_at).execute(&mut *tx).await?.rows_affected();
+                if changed != 1 {
+                    return Ok(false);
+                }
+                if disabled || role != existing.role {
+                    sqlx::query("UPDATE sessions SET revoked_at = COALESCE(revoked_at, $1) WHERE user_id = $2").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, $1) WHERE user_id = $2").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE reset_password_tokens SET used_at = COALESCE(used_at, $1) WHERE user_id = $2").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE invitation_tokens SET used_at = COALESCE(used_at, $1) WHERE created_by_user_id = $2").bind(now).bind(&existing.id).execute(&mut *tx).await?;
+                }
+                tx.commit().await?;
+            }
+        }
+        Ok(true)
     }
 
     pub async fn redeem_reset_password_token(
@@ -445,11 +509,11 @@ impl Repositories {
     ) -> DbResult<bool> {
         match &self.users.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let consumed = sqlx::query(
                     "UPDATE reset_password_tokens
                      SET used_at = ?
-                     WHERE id = ? AND user_id = ? AND used_at IS NULL AND expires_at > ?",
+                     WHERE id = ? AND user_id = ? AND used_at IS NULL AND expires_at > ? AND EXISTS (SELECT 1 FROM users WHERE users.id = reset_password_tokens.user_id AND users.is_disabled = FALSE)",
                 )
                 .bind(now)
                 .bind(token_id)
@@ -467,10 +531,14 @@ impl Repositories {
             }
             Database::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
+                sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                    .bind(user_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
                 let consumed = sqlx::query(
                     "UPDATE reset_password_tokens
                      SET used_at = $1
-                     WHERE id = $2 AND user_id = $3 AND used_at IS NULL AND expires_at > $4",
+                     WHERE id = $2 AND user_id = $3 AND used_at IS NULL AND expires_at > $4 AND EXISTS (SELECT 1 FROM users WHERE users.id = reset_password_tokens.user_id AND users.is_disabled = FALSE)",
                 )
                 .bind(now)
                 .bind(token_id)
@@ -499,11 +567,12 @@ impl Repositories {
     ) -> DbResult<bool> {
         match &self.users.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let consumed = sqlx::query(
                     "UPDATE invitation_tokens
                      SET claimed_at = COALESCE(claimed_at, ?), used_at = ?
                      WHERE id = ? AND used_at IS NULL AND expires_at > ?
+                       AND EXISTS (SELECT 1 FROM users WHERE users.id = invitation_tokens.created_by_user_id AND users.is_disabled = FALSE AND users.role = 'admin')
                        AND (
                          (token_hash = ? AND claim_token_hash IS NULL AND claimed_at IS NULL)
                          OR claim_token_hash = ?
@@ -521,6 +590,20 @@ impl Repositories {
                 if consumed != 1 {
                     return Ok(false);
                 }
+                if let Some(email) = &new_user.email {
+                    let taken: (bool,) = sqlx::query_as(
+                        "SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email) = LOWER(?))",
+                    )
+                    .bind(email)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    if taken.0 {
+                        // A conflicting email consumes the submitted invitation;
+                        // it cannot be reused as an account-enumeration oracle.
+                        transaction.commit().await?;
+                        return Ok(false);
+                    }
+                }
                 insert_user_sqlite(&mut transaction, new_user).await?;
                 transaction.commit().await?;
             }
@@ -530,6 +613,7 @@ impl Repositories {
                     "UPDATE invitation_tokens
                      SET claimed_at = COALESCE(claimed_at, $1), used_at = $2
                      WHERE id = $3 AND used_at IS NULL AND expires_at > $4
+                       AND EXISTS (SELECT 1 FROM users WHERE users.id = invitation_tokens.created_by_user_id AND users.is_disabled = FALSE AND users.role = 'admin')
                        AND (
                          (token_hash = $5 AND claim_token_hash IS NULL AND claimed_at IS NULL)
                          OR claim_token_hash = $6
@@ -547,6 +631,20 @@ impl Repositories {
                 if consumed != 1 {
                     return Ok(false);
                 }
+                if let Some(email) = &new_user.email {
+                    let taken: (bool,) = sqlx::query_as(
+                        "SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(email) = LOWER($1))",
+                    )
+                    .bind(email)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    if taken.0 {
+                        // A conflicting email consumes the submitted invitation;
+                        // it cannot be reused as an account-enumeration oracle.
+                        transaction.commit().await?;
+                        return Ok(false);
+                    }
+                }
                 insert_user_postgres(&mut transaction, new_user).await?;
                 transaction.commit().await?;
             }
@@ -562,7 +660,7 @@ impl Repositories {
     ) -> DbResult<CreateUploadBundleOutcome> {
         let created_game_category = match &self.clips.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let created = if let Some(game_name) = clip.game_name.as_deref() {
                     ensure_game_category_sqlite(&mut transaction, game_name).await?
                 } else {
@@ -606,7 +704,7 @@ impl Repositories {
     ) -> DbResult<FinalizeUploadOutcome> {
         match &self.upload_sessions.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let outcome = finalize_upload_sqlite(
                     &mut transaction,
                     session_id,
@@ -642,6 +740,44 @@ impl Repositories {
         }
     }
 
+    pub async fn expire_upload(
+        &self,
+        session: &UploadSession,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        match &self.users.database {
+            Database::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                let changed = sqlx::query("UPDATE upload_sessions SET status = 'aborted', updated_at = ? WHERE id = ? AND status IN ('created','uploading') AND expires_at <= ?")
+                    .bind(now).bind(&session.id).bind(now).execute(&mut *tx).await?.rows_affected();
+                if changed != 1 {
+                    return Ok(false);
+                }
+                sqlx::query("DELETE FROM upload_parts WHERE upload_session_id = ?")
+                    .bind(&session.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE clips SET status = 'deleted', deleted_at = ?, updated_at = ? WHERE id = ?").bind(now).bind(now).bind(&session.clip_id).execute(&mut *tx).await?;
+                tx.commit().await?;
+            }
+            Database::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                let changed = sqlx::query("UPDATE upload_sessions SET status = 'aborted', updated_at = $1 WHERE id = $2 AND status IN ('created','uploading') AND expires_at <= $3")
+                    .bind(now).bind(&session.id).bind(now).execute(&mut *tx).await?.rows_affected();
+                if changed != 1 {
+                    return Ok(false);
+                }
+                sqlx::query("DELETE FROM upload_parts WHERE upload_session_id = $1")
+                    .bind(&session.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE clips SET status = 'deleted', deleted_at = $1, updated_at = $2 WHERE id = $3").bind(now).bind(now).bind(&session.clip_id).execute(&mut *tx).await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn abort_upload(
         &self,
         session_id: &str,
@@ -649,7 +785,7 @@ impl Repositories {
     ) -> DbResult<AbortUploadOutcome> {
         match &self.upload_sessions.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let outcome = abort_upload_sqlite(&mut transaction, session_id, clip_id).await?;
                 if outcome != AbortUploadOutcome::NotMutable {
                     transaction.commit().await?;
@@ -680,7 +816,7 @@ impl Repositories {
         let now = now_utc();
         match &self.upload_sessions.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 let clip_rows = sqlx::query(
                     "UPDATE clips
                      SET status = 'ready', updated_at = ?
@@ -749,7 +885,7 @@ impl Repositories {
     pub async fn delete_upload_bundle(&self, session_id: &str, clip_id: &str) -> DbResult<()> {
         match &self.upload_sessions.database {
             Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
                 sqlx::query("DELETE FROM upload_sessions WHERE id = ? AND clip_id = ?")
                     .bind(session_id)
                     .bind(clip_id)
@@ -1000,7 +1136,12 @@ async fn separate_game_category_name_postgres(
     category_id: &str,
     name_id: &str,
 ) -> Result<SeparateGameCategoryNameOutcome, sqlx::Error> {
-    if !category_exists_postgres(transaction, category_id).await? {
+    if sqlx::query_scalar::<_, String>("SELECT id FROM game_categories WHERE id = $1 FOR UPDATE")
+        .bind(category_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_none()
+    {
         return Ok(SeparateGameCategoryNameOutcome::CategoryNotFound);
     }
     let name = sqlx::query_as::<_, (String, String)>(
@@ -1111,7 +1252,7 @@ async fn update_password_and_revoke_sqlite(
     password_hash: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE users SET password_hash = ?, password_change_required = FALSE, updated_at = ? WHERE id = ?")
         .bind(password_hash)
         .bind(now)
         .bind(user_id)
@@ -1127,6 +1268,13 @@ async fn update_password_and_revoke_sqlite(
         .bind(user_id)
         .execute(&mut **transaction)
         .await?;
+    sqlx::query(
+        "UPDATE reset_password_tokens SET used_at = COALESCE(used_at, ?) WHERE user_id = ?",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 
@@ -1136,7 +1284,7 @@ async fn update_password_and_revoke_postgres(
     password_hash: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3")
+    sqlx::query("UPDATE users SET password_hash = $1, password_change_required = FALSE, updated_at = $2 WHERE id = $3")
         .bind(password_hash)
         .bind(now)
         .bind(user_id)
@@ -1154,6 +1302,13 @@ async fn update_password_and_revoke_postgres(
     .bind(user_id)
     .execute(&mut **transaction)
     .await?;
+    sqlx::query(
+        "UPDATE reset_password_tokens SET used_at = COALESCE(used_at, $1) WHERE user_id = $2",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 
@@ -1162,8 +1317,8 @@ async fn insert_user_sqlite(
     new: &NewUser,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&new.id)
     .bind(&new.username)
@@ -1178,6 +1333,7 @@ async fn insert_user_sqlite(
     .bind(new.created_at)
     .bind(new.updated_at)
     .bind(new.last_login_at)
+    .bind(new.password_change_required)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -1188,8 +1344,8 @@ async fn insert_user_postgres(
     new: &NewUser,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        "INSERT INTO users (id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at, password_change_required)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(&new.id)
     .bind(&new.username)
@@ -1204,6 +1360,7 @@ async fn insert_user_postgres(
     .bind(new.created_at)
     .bind(new.updated_at)
     .bind(new.last_login_at)
+    .bind(new.password_change_required)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -1464,7 +1621,7 @@ async fn finalize_upload_sqlite(
         "UPDATE upload_sessions
          SET status = 'completed', received_size_bytes = ?, completed_at = ?,
              failure_reason = NULL, failed_at = NULL, updated_at = ?
-         WHERE id = ? AND clip_id = ? AND status IN ('created','uploading')",
+         WHERE id = ? AND clip_id = ? AND status IN ('created','uploading','failed')",
     )
     .bind(expected_size_bytes)
     .bind(now)
@@ -1527,7 +1684,7 @@ async fn finalize_upload_postgres(
         "UPDATE upload_sessions
          SET status = 'completed', received_size_bytes = $1, completed_at = $2,
              failure_reason = NULL, failed_at = NULL, updated_at = $3
-         WHERE id = $4 AND clip_id = $5 AND status IN ('created','uploading')",
+         WHERE id = $4 AND clip_id = $5 AND status IN ('created','uploading','failed')",
     )
     .bind(expected_size_bytes)
     .bind(now)
@@ -1586,7 +1743,7 @@ async fn abort_upload_sqlite(
     let now = now_utc();
     let updated = sqlx::query(
         "UPDATE upload_sessions SET status = 'aborted', updated_at = ?
-         WHERE id = ? AND clip_id = ? AND status IN ('created','uploading')",
+         WHERE id = ? AND clip_id = ? AND status IN ('created','uploading','failed')",
     )
     .bind(now)
     .bind(session_id)
@@ -1633,7 +1790,7 @@ async fn abort_upload_postgres(
     let now = now_utc();
     let updated = sqlx::query(
         "UPDATE upload_sessions SET status = 'aborted', updated_at = $1
-         WHERE id = $2 AND clip_id = $3 AND status IN ('created','uploading')",
+         WHERE id = $2 AND clip_id = $3 AND status IN ('created','uploading','failed')",
     )
     .bind(now)
     .bind(session_id)

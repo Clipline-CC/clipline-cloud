@@ -15,8 +15,12 @@ use clipline_cloud_db::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth, config::StorageConfig, error::ApiError, mail, media, steamgriddb,
-    validation::normalized_optional, AppState, ClientIp,
+    auth::{self, deserialize_patch_field, PatchField},
+    config::StorageConfig,
+    error::ApiError,
+    mail, media, steamgriddb,
+    validation::normalized_optional,
+    AppState, ClientIp,
 };
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -92,21 +96,26 @@ struct AdminSettingsResponse {
     updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct UpdateAdminSettingsRequest {
     allow_vod_uploads: Option<bool>,
     vod_threshold_minutes: Option<i64>,
     about_text: Option<String>,
     smtp_enabled: Option<bool>,
-    smtp_host: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    smtp_host: PatchField<String>,
     smtp_port: Option<i64>,
     smtp_tls_mode: Option<String>,
-    smtp_username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    smtp_username: PatchField<String>,
     smtp_password: Option<String>,
     smtp_password_clear: Option<bool>,
-    smtp_from_email: Option<Option<String>>,
-    smtp_from_name: Option<Option<String>>,
-    user_storage_quota_bytes: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    smtp_from_email: PatchField<String>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    smtp_from_name: PatchField<String>,
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
+    user_storage_quota_bytes: PatchField<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -739,7 +748,7 @@ async fn update_settings(
         update.vod_threshold_minutes = Some(threshold);
     }
 
-    if let Some(quota) = request.user_storage_quota_bytes {
+    if let PatchField::Set(quota) = request.user_storage_quota_bytes {
         let stored = match quota {
             None => None,
             Some(bytes) => {
@@ -771,14 +780,14 @@ async fn update_settings(
     }
 
     let smtp_updated = request.smtp_enabled.is_some()
-        || request.smtp_host.is_some()
+        || !matches!(request.smtp_host, PatchField::Unset)
         || request.smtp_port.is_some()
         || request.smtp_tls_mode.is_some()
-        || request.smtp_username.is_some()
+        || !matches!(request.smtp_username, PatchField::Unset)
         || request.smtp_password.is_some()
         || request.smtp_password_clear.unwrap_or(false)
-        || request.smtp_from_email.is_some()
-        || request.smtp_from_name.is_some();
+        || !matches!(request.smtp_from_email, PatchField::Unset)
+        || !matches!(request.smtp_from_name, PatchField::Unset);
     let mut effective_settings = current_settings.clone();
     if smtp_updated {
         if !auth::user_is_owner(&state, &auth.user).await? {
@@ -788,7 +797,7 @@ async fn update_settings(
             update.smtp_enabled = Some(enabled);
             effective_settings.smtp_enabled = enabled;
         }
-        if let Some(host) = request.smtp_host {
+        if let PatchField::Set(host) = request.smtp_host {
             let host = normalized_optional_admin_string(host, "SMTP host")?;
             effective_settings.smtp_host = host.clone();
             update.smtp_host = Some(host);
@@ -811,7 +820,7 @@ async fn update_settings(
             update.smtp_tls_mode = Some(tls_mode.clone());
             effective_settings.smtp_tls_mode = tls_mode;
         }
-        if let Some(username) = request.smtp_username {
+        if let PatchField::Set(username) = request.smtp_username {
             let username = normalized_optional_admin_string(username, "SMTP username")?;
             effective_settings.smtp_username = username.clone();
             update.smtp_username = Some(username);
@@ -831,7 +840,7 @@ async fn update_settings(
                 effective_settings.smtp_password = Some(password.to_string());
             }
         }
-        if let Some(from_email) = request.smtp_from_email {
+        if let PatchField::Set(from_email) = request.smtp_from_email {
             let from_email = normalized_optional_admin_string(from_email, "SMTP from email")?;
             if let Some(from_email) = from_email.as_deref() {
                 validate_emailish(from_email, "SMTP from email")?;
@@ -839,7 +848,7 @@ async fn update_settings(
             effective_settings.smtp_from_email = from_email.clone();
             update.smtp_from_email = Some(from_email);
         }
-        if let Some(from_name) = request.smtp_from_name {
+        if let PatchField::Set(from_name) = request.smtp_from_name {
             let from_name = normalized_optional_admin_string(from_name, "SMTP from name")?;
             effective_settings.smtp_from_name = from_name.clone();
             update.smtp_from_name = Some(from_name);
@@ -1325,6 +1334,71 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    #[tokio::test]
+    async fn settings_patch_distinguishes_omitted_values_from_explicit_null() {
+        use clipline_cloud_db::{NewDeviceToken, NewUser};
+        use sha2::{Digest, Sha256};
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        let owner = state
+            .repositories
+            .users
+            .create(&NewUser::new("owner", "hash", "admin"))
+            .await
+            .unwrap();
+        state
+            .repositories
+            .settings
+            .set_owner_user_id(&owner.id)
+            .await
+            .unwrap();
+        let token = "settings-test-token";
+        state
+            .repositories
+            .device_tokens
+            .create(&NewDeviceToken::new(
+                &owner.id,
+                "test",
+                format!("{:x}", Sha256::digest(token)),
+            ))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let initial = serde_json::json!({ "smtp_host": "smtp.example.com", "smtp_username": "mailer", "smtp_from_email": "mailer@example.com", "smtp_from_name": "Clipline", "user_storage_quota_bytes": 1024 });
+        let cleared = serde_json::json!({ "smtp_host": null, "smtp_username": null, "smtp_from_email": null, "smtp_from_name": null, "user_storage_quota_bytes": null });
+        for payload in [initial.clone(), serde_json::json!({}), cleared.clone()] {
+            let request = serde_json::from_value(payload.clone()).unwrap();
+            let _ = update_settings(
+                State(state.clone()),
+                Extension(ClientIp("192.0.2.1".to_string())),
+                headers.clone(),
+                Json(request),
+            )
+            .await
+            .unwrap();
+            let stored = state.repositories.settings.get().await.unwrap();
+            if payload == cleared {
+                assert_eq!(stored.smtp_host, None);
+                assert_eq!(stored.smtp_username, None);
+                assert_eq!(stored.smtp_from_email, None);
+                assert_eq!(stored.smtp_from_name, None);
+                assert_eq!(stored.user_storage_quota_bytes, None);
+            } else {
+                assert_eq!(stored.smtp_host.as_deref(), Some("smtp.example.com"));
+                assert_eq!(stored.smtp_username.as_deref(), Some("mailer"));
+                assert_eq!(
+                    stored.smtp_from_email.as_deref(),
+                    Some("mailer@example.com")
+                );
+                assert_eq!(stored.smtp_from_name.as_deref(), Some("Clipline"));
+                assert_eq!(stored.user_storage_quota_bytes, Some(1024));
+            }
+        }
+    }
+
     #[test]
     fn game_category_validation_trims_display_name() {
         let display_name = validate_game_category_display_name(&UpsertGameCategoryRequest {
@@ -1520,6 +1594,7 @@ mod tests {
             bio: None,
             avatar_key: None,
             password_hash: "hash".to_string(),
+            password_change_required: false,
             role: "user".to_string(),
             is_disabled: false,
             storage_quota_bytes: None,

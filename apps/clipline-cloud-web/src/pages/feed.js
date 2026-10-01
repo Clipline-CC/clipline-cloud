@@ -172,7 +172,7 @@ export function feedPath({ sort = "uploaded_at_desc", game = "", q = "", page = 
   const normalizedSort = sort || "uploaded_at_desc";
   const normalizedGame = String(game || "").trim();
   const normalizedQuery = String(q || "").trim();
-  const normalizedPage = Math.max(1, Number(page || 1));
+  const normalizedPage = Math.max(1, Math.floor(Number(page || 1)) || 1);
   if (normalizedSort !== "uploaded_at_desc") {
     params.set("sort", normalizedSort);
   }
@@ -196,7 +196,7 @@ export function feedPath({ sort = "uploaded_at_desc", game = "", q = "", page = 
 
 // Pager navigation is URL-backed so browser history preserves the current page.
 function pager(data, query, setQ) {
-  const currentPage = Math.max(1, Number(query.page || 1));
+  const currentPage = Math.max(1, Math.floor(Number(query.page || 1)) || 1);
   const hasMore = Boolean(data?.has_more);
   if (currentPage <= 1 && !hasMore) return "";
   return html`<nav class="pager" aria-label="Public clip pages">

@@ -15,23 +15,32 @@ git push origin v1.3.6
 
 Pushing a `vMAJOR.MINOR.PATCH` tag starts the `Release` GitHub Actions workflow. The workflow builds
 the Docker image, pushes it to GHCR, and creates a GitHub release with generated notes plus the
-published image tags and manifest digest.
+published image tags and manifest digest. The tag must match the version in the server's Cargo.toml.
+Release actions are pinned to commit SHAs and the Docker build uses the locked dependency versions.
+
+Images are published under `ghcr.io/clipline-cc/clipline-cloud`. Existing installations using the old
+`dain98` image namespace must update `CLIPLINE_IMAGE` or their Compose image reference to receive
+new releases. The Compose defaults pin the server version; upgrade that tag explicitly when deploying
+a new release.
 
 Published image tags for `v1.3.6`:
 
 ```text
-ghcr.io/dain98/clipline-cloud:1.3.6
-ghcr.io/dain98/clipline-cloud:1.3
-ghcr.io/dain98/clipline-cloud:latest
-ghcr.io/dain98/clipline-cloud:sha-<short-git-sha>
+ghcr.io/clipline-cc/clipline-cloud:1.3.6
+ghcr.io/clipline-cc/clipline-cloud:1.3
+ghcr.io/clipline-cc/clipline-cloud:latest
+ghcr.io/clipline-cc/clipline-cloud:sha-<short-git-sha>
 ```
 
 ## Release Validation
 
+The release workflow runs the reusable CI workflow before publishing and rejects a tag that does not
+match the server package version. Actions and helper images are pinned to immutable references.
+
 Before tagging, run the Rust checks and dependency audit:
 
 ```sh
-cargo test --workspace
+cargo test --workspace --locked
 cargo tree -i rsa
 cargo audit --ignore RUSTSEC-2023-0071
 ```
@@ -45,7 +54,7 @@ runs the full multi-profile smoke suite (`default minio postgres`):
 
 ```sh
 BUILD_IMAGE=0 \
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.6 \
+CLIPLINE_IMAGE=ghcr.io/clipline-cc/clipline-cloud:1.3.6 \
 CLIPLINE_HTTP_PORT=18080 \
 MINIO_API_PORT=19000 \
 MINIO_CONSOLE_PORT=19001 \
@@ -58,7 +67,7 @@ For Caddy localhost TLS:
 
 ```sh
 BUILD_IMAGE=0 \
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.6 \
+CLIPLINE_IMAGE=ghcr.io/clipline-cc/clipline-cloud:1.3.6 \
 CLIPLINE_CADDY_HTTP_PORT=18081 \
 CLIPLINE_CADDY_HTTPS_PORT=18443 \
 CLIPLINE_CADDY_SUBNET=10.251.250.0/24 \
@@ -77,7 +86,7 @@ host.
 Pin production Compose deployments to the release tag:
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:1.3.6 \
+CLIPLINE_IMAGE=ghcr.io/clipline-cc/clipline-cloud:1.3.6 \
 docker compose -f deploy/compose/docker-compose.yml up -d
 ```
 
@@ -95,9 +104,14 @@ newer release unless that release's notes explicitly declare mixed-version compa
 Point `CLIPLINE_IMAGE` at the previous known-good tag and recreate the app container:
 
 ```sh
-CLIPLINE_IMAGE=ghcr.io/dain98/clipline-cloud:<previous-tag> \
+CLIPLINE_IMAGE=ghcr.io/clipline-cc/clipline-cloud:<previous-tag> \
 docker compose -f deploy/compose/docker-compose.yml up -d
 ```
 
 Database migrations are forward-only. Back up the database and media before upgrading, and restore
 from that backup if a release must be fully reverted.
+
+The dependency refresh removes the `event-listener` soundness advisory and both yanked `spin`
+versions. The current AWS S3 SDK still requires `lru` 0.16, so `RUSTSEC-2026-0253` remains visible in
+`cargo audit` until upstream moves to a patched series. There are no reachable CVE findings. Do not
+hide that advisory with an audit ignore.

@@ -200,7 +200,7 @@ pub(crate) async fn fetch_image(url: &str) -> Result<ImageAsset, ApiError> {
     if !valid_artwork_url(url) {
         return Err(ApiError::bad_request("invalid SteamGridDB artwork URL"));
     }
-    let response = http_client()?
+    let mut response = http_client()?
         .get(url)
         .send()
         .await
@@ -225,15 +225,20 @@ pub(crate) async fn fetch_image(url: &str) -> Result<ImageAsset, ApiError> {
         .filter(|value| value.starts_with("image/"))
         .ok_or_else(|| ApiError::bad_gateway("SteamGridDB returned non-image artwork"))?
         .to_string();
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| ApiError::bad_gateway("SteamGridDB artwork could not be loaded"))?;
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(ApiError::payload_too_large(
-            "SteamGridDB artwork is too large",
-        ));
+        .map_err(|_| ApiError::bad_gateway("SteamGridDB artwork could not be loaded"))?
+    {
+        if chunk.len() > MAX_IMAGE_BYTES.saturating_sub(bytes.len()) {
+            return Err(ApiError::payload_too_large(
+                "SteamGridDB artwork is too large",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
     }
+    let bytes = bytes::Bytes::from(bytes);
     Ok(ImageAsset {
         bytes,
         content_type,

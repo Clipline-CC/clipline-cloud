@@ -1,7 +1,7 @@
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{header, HeaderMap},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, FromRequest, Path, State},
+    http::{header, HeaderMap, Request, StatusCode},
     routing::{get, post, put},
     Json, Router,
 };
@@ -45,11 +45,37 @@ const MAX_TITLE_LEN: usize = 300;
 const MAX_DESCRIPTION_LEN: usize = 10_000;
 const MAX_CLIENT_CLIP_ID_LEN: usize = 255;
 
-fn schedule_automatic_game_category_enrichment(state: AppState, category: NewGameCategory) {
+fn schedule_automatic_game_category_enrichment(
+    state: AppState,
+    category: NewGameCategory,
+    user_id: &str,
+) {
     if !steamgriddb::configured(&state.config) {
         return;
     }
+    static ENRICHMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let Ok(permit) = ENRICHMENT_SLOTS.try_acquire() else {
+        return;
+    };
+    if crate::limits::check(
+        "enrichment-user",
+        user_id,
+        10,
+        std::time::Duration::from_secs(3600),
+    )
+    .is_err()
+        || crate::limits::check(
+            "enrichment-global",
+            "all",
+            100,
+            std::time::Duration::from_secs(3600),
+        )
+        .is_err()
+    {
+        return;
+    }
     tokio::spawn(async move {
+        let _permit = permit;
         enrich_new_game_category(&state, category).await;
     });
 }
@@ -309,7 +335,7 @@ async fn create_upload(
     };
     if let Some(category) = bundle.created_game_category {
         state.invalidate_game_category_map().await;
-        schedule_automatic_game_category_enrichment(state.clone(), category);
+        schedule_automatic_game_category_enrichment(state.clone(), category, &auth.user.id);
     }
     let session = state
         .repositories
@@ -345,7 +371,7 @@ async fn put_content(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<UploadProgressResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
@@ -360,6 +386,7 @@ async fn put_content(
     }
 
     let expected_size = expected_size(&session)?;
+    let body = read_upload_body(&state.config, body, expected_size).await?;
     if body.len() as u64 != expected_size {
         return Err(ApiError::bad_request(format!(
             "request body size {} does not match expected file size {expected_size}",
@@ -405,7 +432,7 @@ async fn put_part(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((id, part_number)): Path<(String, u16)>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<PartUploadResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
@@ -417,6 +444,13 @@ async fn put_part(
         ));
     };
     validate_part_number_for_session(&session, part_number)?;
+
+    let body = read_upload_body(
+        &state.config,
+        body,
+        expected_size_for_part(&session, part_number)?,
+    )
+    .await?;
 
     let checksum = sha256_hex(&body);
     if let Some(supplied_checksum) = optional_checksum_header(&headers)? {
@@ -445,6 +479,40 @@ async fn put_part(
 
     validate_part_size(&state.config, &session, part_number, body.len() as u64)?;
 
+    let claim = clipline_cloud_db::new_ulid();
+    if !state
+        .repositories
+        .upload_parts
+        .claim_write(&session.id, i64::from(part_number), &claim)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "this part is already being uploaded; retry shortly",
+        ));
+    }
+    // Recheck after obtaining the cross-process claim: the first writer may
+    // have committed between our initial lookup and this claim.
+    if let Some(existing) = state
+        .repositories
+        .upload_parts
+        .get(&session.id, i64::from(part_number))
+        .await?
+    {
+        state
+            .repositories
+            .upload_parts
+            .release_write(&session.id, i64::from(part_number), &claim)
+            .await?;
+        if existing.checksum_sha256.as_deref() == Some(checksum.as_str())
+            && existing.size_bytes == body.len() as i64
+        {
+            return Ok(Json(part_response(&session.id, &existing, true)));
+        }
+        return Err(ApiError::conflict(
+            "part number already exists with a different checksum",
+        ));
+    }
+
     let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
     let uploaded_part = state
         .storage
@@ -460,6 +528,11 @@ async fn put_part(
     new_part.checksum_sha256 = Some(checksum);
     new_part.etag = Some(uploaded_part.etag);
     let part = state.repositories.upload_parts.upsert(&new_part).await?;
+    state
+        .repositories
+        .upload_parts
+        .release_write(&session.id, i64::from(part_number), &claim)
+        .await?;
     let received_size = state
         .repositories
         .upload_parts
@@ -511,6 +584,7 @@ async fn create_direct_part_url(
             storage_upload_id,
             &key,
             part_number,
+            expected_size_for_part(&session, part_number)?,
             DIRECT_UPLOAD_PART_URL_TTL,
         )
         .await
@@ -637,14 +711,28 @@ async fn complete_upload(
     {
         Ok(metadata) => metadata,
         Err(error) => {
+            let permanent = matches!(&error, StorageError::InvalidPart(_))
+                || matches!(&error, StorageError::S3(message) if ["InvalidPart", "EntityTooSmall", "InvalidPartOrder", "BadDigest"].iter().any(|code| message.contains(code)));
+            if permanent {
+                mark_upload_failed(&state, &session, "multipart upload contains invalid parts")
+                    .await?;
+                return Err(ApiError::conflict(
+                    "multipart upload contains invalid parts; abort and restart the upload",
+                ));
+            }
             if !should_try_completion_reconciliation(&error) {
                 return Err(storage_error(error));
             }
             match state.storage.head_object(&key).await {
                 Ok(metadata) if metadata.size_bytes == expected_size => metadata,
-                Ok(_) => {
+                Ok(metadata) => {
                     let reason =
                         "stored object exists but size does not match expected upload size";
+                    state
+                        .repositories
+                        .clips
+                        .reserve_storage_bytes(&session.clip_id, metadata.size_bytes as i64)
+                        .await?;
                     mark_upload_failed(&state, &session, reason).await?;
                     return Err(ApiError::conflict(reason));
                 }
@@ -655,6 +743,11 @@ async fn complete_upload(
 
     if metadata.size_bytes != expected_size {
         let reason = "completed object size does not match expected upload size";
+        state
+            .repositories
+            .clips
+            .reserve_storage_bytes(&session.clip_id, metadata.size_bytes as i64)
+            .await?;
         mark_upload_failed(&state, &session, reason).await?;
         return Err(ApiError::conflict(reason));
     }
@@ -664,7 +757,6 @@ async fn complete_upload(
             .await
             .map_err(storage_error)?;
         if Some(checksum.as_str()) != session.checksum_sha256.as_deref() {
-            let _ = state.storage.delete_object(&key).await;
             let reason = "completed local object SHA-256 does not match expected upload checksum";
             mark_upload_failed(&state, &session, reason).await?;
             return Err(ApiError::conflict(reason));
@@ -760,6 +852,19 @@ async fn load_existing_idempotent_session(
             "idempotent upload is being created; retry this request",
         ));
     };
+    if existing_session.status == "failed" {
+        state
+            .repositories
+            .abort_upload(&existing_session.id, &existing_clip.id)
+            .await?;
+        if let Ok(key) = ObjectKey::parse(&existing_session.storage_key) {
+            if let Some(upload_id) = &existing_session.storage_upload_id {
+                let _ = state.storage.abort_multipart_upload(upload_id, &key).await;
+            }
+            let _ = state.storage.delete_object(&key).await;
+        }
+        return Ok(None);
+    }
     Ok(Some(existing_session))
 }
 
@@ -1509,7 +1614,37 @@ async fn mark_upload_failed(
             clip_id = %session.clip_id,
         );
     }
+    let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
+    if let Some(upload_id) = session.storage_upload_id.as_deref() {
+        if let Err(error) = state.storage.abort_multipart_upload(upload_id, &key).await {
+            warn!(event = "api.failed_upload_multipart_cleanup_failed", upload_id = %session.id, error = %error);
+        }
+    }
+    if let Err(error) = state.storage.delete_object(&key).await {
+        if !matches!(error, StorageError::NotFound(_)) {
+            warn!(event = "api.failed_upload_object_cleanup_failed", upload_id = %session.id, error = %error);
+        }
+    }
     Ok(())
+}
+
+async fn read_upload_body(
+    config: &Config,
+    body: Body,
+    expected_size: u64,
+) -> Result<Bytes, ApiError> {
+    let limit = usize::try_from(expected_size)
+        .unwrap_or(usize::MAX)
+        .min(crate::upload_request_body_limit(config));
+    let mut request = Request::new(body);
+    DefaultBodyLimit::max(limit).apply(&mut request);
+    Bytes::from_request(request, &()).await.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::payload_too_large("upload body exceeds the allowed size")
+        } else {
+            ApiError::bad_request("failed to read upload body")
+        }
+    })
 }
 
 fn recovery_action(status: &str) -> Option<&'static str> {
@@ -1713,6 +1848,204 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    async fn bearer_headers(state: &AppState, user_id: &str) -> HeaderMap {
+        let token = format!("upload-test-{}", clipline_cloud_db::new_ulid());
+        state
+            .repositories
+            .device_tokens
+            .create(&clipline_cloud_db::NewDeviceToken::new(
+                user_id,
+                "test",
+                sha256_hex(token.as_bytes()),
+            ))
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn upload_body_is_bounded_by_the_expected_size() {
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        assert_eq!(
+            read_upload_body(&state.config, Body::from("ok"), 2)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"ok")
+        );
+        assert_eq!(
+            read_upload_body(&state.config, Body::from("oversized"), 2)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn uploads_check_ownership_before_reading_bodies() {
+        use clipline_cloud_db::NewUser;
+        use tower::ServiceExt;
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        let owner = state
+            .repositories
+            .users
+            .create(&NewUser::new("owner", "hash", "user"))
+            .await
+            .unwrap();
+        let other = state
+            .repositories
+            .users
+            .create(&NewUser::new("other", "hash", "user"))
+            .await
+            .unwrap();
+        let keys = MediaObjectKeys::generate().unwrap();
+        let clip = state
+            .repositories
+            .clips
+            .create(&NewClip::new(&owner.id, "clip", "local"))
+            .await
+            .unwrap();
+        let session = state
+            .repositories
+            .upload_sessions
+            .create(&NewUploadSession::new(
+                &clip.id,
+                &owner.id,
+                2,
+                keys.source.as_str(),
+                now_utc() + ChronoDuration::hours(1),
+            ))
+            .await
+            .unwrap();
+        let headers = bearer_headers(&state, &other.id).await;
+        let app = routes(crate::upload_request_body_limit(&state.config)).with_state(state);
+        for suffix in ["content", "parts/1"] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/uploads/{}/{suffix}", session.id))
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(crate::tests::unreadable_body())
+                .unwrap();
+            *request.headers_mut() = headers.clone();
+            request
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_completed_objects_are_deleted_and_keep_their_quota() {
+        use clipline_cloud_db::NewUser;
+        let (_temp_dir, state) = crate::tests::test_state().await;
+        state.storage.probe().await.unwrap();
+        let user = state
+            .repositories
+            .users
+            .create(&NewUser::new("uploader", "hash", "user"))
+            .await
+            .unwrap();
+        let headers = bearer_headers(&state, &user.id).await;
+        for oversized in [false, true] {
+            let keys = MediaObjectKeys::generate().unwrap();
+            let mut new_clip = NewClip::new(&user.id, "clip", "local");
+            new_clip.file_size_bytes = Some(2);
+            new_clip.storage_key = Some(keys.source.as_str().to_string());
+            let clip = state.repositories.clips.create(&new_clip).await.unwrap();
+            let storage_id = state
+                .storage
+                .create_multipart_upload(&keys.source)
+                .await
+                .unwrap();
+            let uploaded = state
+                .storage
+                .upload_part(&storage_id, &keys.source, 1, Bytes::from_static(b"ok"))
+                .await
+                .unwrap();
+            let mut new_session = NewUploadSession::new(
+                &clip.id,
+                &user.id,
+                2,
+                keys.source.as_str(),
+                now_utc() + ChronoDuration::hours(1),
+            );
+            new_session.storage_upload_id = Some(storage_id.clone());
+            new_session.part_size_bytes = Some(2);
+            new_session.checksum_sha256 = Some("0".repeat(64));
+            let session = state
+                .repositories
+                .upload_sessions
+                .create(&new_session)
+                .await
+                .unwrap();
+            let mut part = NewUploadPart::new(&session.id, 1, 2);
+            part.etag = Some(uploaded.etag);
+            part.checksum_sha256 = Some(sha256_hex(b"ok"));
+            state.repositories.upload_parts.upsert(&part).await.unwrap();
+            if oversized {
+                // Simulate reconciliation after S3 completed an object with a false size acknowledgment.
+                state
+                    .storage
+                    .abort_multipart_upload(&storage_id, &keys.source)
+                    .await
+                    .unwrap();
+                state
+                    .storage
+                    .put_object(
+                        &keys.source,
+                        Bytes::from_static(b"oversized"),
+                        PutObjectMetadata::new("video/mp4"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let error = complete_upload(
+                State(state.clone()),
+                headers.clone(),
+                Path(session.id.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            assert!(!state.storage.object_exists(&keys.source).await.unwrap());
+            assert_eq!(
+                state
+                    .repositories
+                    .upload_sessions
+                    .get(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "failed"
+            );
+            let clip = state
+                .repositories
+                .clips
+                .get(&clip.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(clip.status, "failed");
+            assert_eq!(clip.file_size_bytes, Some(if oversized { 9 } else { 2 }));
+        }
+        assert_eq!(
+            state
+                .repositories
+                .clips
+                .active_storage_bytes_for_owner(&user.id)
+                .await
+                .unwrap(),
+            11
+        );
+    }
 
     fn session(part_size_bytes: i64, expected_size_bytes: i64) -> UploadSession {
         let now = now_utc();

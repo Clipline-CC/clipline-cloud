@@ -404,7 +404,7 @@ async fn update_visibility(
     };
 
     let public_share_id = match visibility.as_str() {
-        "private" => None,
+        "private" => clip.public_share_id.clone(),
         "public" | "unlisted" => clip
             .public_share_id
             .clone()
@@ -451,7 +451,7 @@ async fn bulk_update_visibility(
         .into_iter()
         .map(|clip| {
             let public_share_id = match visibility.as_str() {
-                "private" => None,
+                "private" => clip.public_share_id.clone(),
                 "public" | "unlisted" => clip
                     .public_share_id
                     .clone()
@@ -1003,7 +1003,10 @@ mod tests {
 
     #[tokio::test]
     async fn clip_public_url_follows_request_host() {
-        let app = test_app().await;
+        let mut app = test_app().await;
+        Arc::make_mut(&mut app.state.config)
+            .additional_public_urls
+            .push(url::Url::parse("https://watch.clipline.cc").unwrap());
         let owner = insert_user(&app.state, "owner").await;
         let mut clip = NewClip::new(&owner.id, "Public clip", "local");
         clip.status = "ready".to_string();

@@ -47,3 +47,11 @@ test("montageCountLabel appends '+' when has_more is true", () => {
 test("montageCountLabel singularizes 'clip' for a single loaded clip", () => {
   assert.equal(montageCountLabel({ clips: [1], has_more: false }), "1 clip on this instance");
 });
+
+test("login returns to a local destination and rejects external destinations", async () => {
+  const { safeLoginReturn } = await import("../src/pages/login.js");
+  assert.equal(safeLoginReturn("/clip/one?q=test#player"), "/clip/one?q=test#player");
+  for (const path of ["https://evil.test", "//evil.test", "/\\evil.test", "/login?return_to=/login", null]) {
+    assert.equal(safeLoginReturn(path), "/library");
+  }
+});

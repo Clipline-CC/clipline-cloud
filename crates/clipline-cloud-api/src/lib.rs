@@ -40,6 +40,8 @@ pub enum CloudApiError {
     Http(#[from] reqwest::Error),
     #[error("request body is inconsistent with declared upload metadata: {0}")]
     InvalidUpload(String),
+    #[error("path identifier must be nonempty and cannot be '.' or '..'")]
+    InvalidPathIdentifier,
 }
 
 pub type CloudApiResult<T> = Result<T, CloudApiError>;
@@ -126,11 +128,19 @@ impl CloudClient {
     }
 
     pub async fn get_upload(&self, upload_id: &str) -> CloudApiResult<UploadProgressResponse> {
-        self.get(&format!("/api/v1/uploads/{upload_id}")).await
+        self.get(&format!(
+            "/api/v1/uploads/{encoded_upload_id}",
+            encoded_upload_id = encode_path_segment(upload_id)?
+        ))
+        .await
     }
 
     pub async fn get_clip(&self, clip_id: &str) -> CloudApiResult<ClipDetailResponse> {
-        self.get(&format!("/api/v1/clips/{clip_id}")).await
+        self.get(&format!(
+            "/api/v1/clips/{encoded_clip_id}",
+            encoded_clip_id = encode_path_segment(clip_id)?
+        ))
+        .await
     }
 
     pub async fn list_clips(&self, request: &ListClipsRequest) -> CloudApiResult<ClipListResponse> {
@@ -147,7 +157,10 @@ impl CloudClient {
         visibility: impl Into<String>,
     ) -> CloudApiResult<ClipDetailResponse> {
         self.post_json(
-            &format!("/api/v1/clips/{clip_id}/visibility"),
+            &format!(
+                "/api/v1/clips/{encoded_clip_id}/visibility",
+                encoded_clip_id = encode_path_segment(clip_id)?
+            ),
             &UpdateVisibilityRequest {
                 visibility: visibility.into(),
             },
@@ -161,7 +174,10 @@ impl CloudClient {
         bytes: impl Into<Bytes>,
     ) -> CloudApiResult<UploadProgressResponse> {
         self.put_body(
-            &format!("/api/v1/uploads/{upload_id}/content"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/content",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             bytes.into(),
             None,
         )
@@ -177,7 +193,10 @@ impl CloudClient {
         let bytes = bytes.into();
         let checksum = sha256_hex(&bytes);
         self.put_body(
-            &format!("/api/v1/uploads/{upload_id}/parts/{part_number}"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/parts/{part_number}",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             bytes,
             Some(checksum),
         )
@@ -186,7 +205,10 @@ impl CloudClient {
 
     pub async fn complete_upload(&self, upload_id: &str) -> CloudApiResult<UploadProgressResponse> {
         self.post_json(
-            &format!("/api/v1/uploads/{upload_id}/complete"),
+            &format!(
+                "/api/v1/uploads/{encoded_upload_id}/complete",
+                encoded_upload_id = encode_path_segment(upload_id)?
+            ),
             &serde_json_value_empty(),
         )
         .await
@@ -446,9 +468,38 @@ fn serde_json_value_empty() -> serde_json::Value {
     serde_json::json!({})
 }
 
+fn encode_path_segment(value: &str) -> CloudApiResult<String> {
+    if matches!(value, "" | "." | "..") {
+        return Err(CloudApiError::InvalidPathIdentifier);
+    }
+    Ok(url::form_urlencoded::byte_serialize(value.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_identifiers_keep_reserved_characters_in_one_segment() {
+        let client = CloudClient::new(Url::parse("https://clips.example.com").unwrap());
+        let path = format!(
+            "/api/v1/clips/{}",
+            encode_path_segment("a/b #Über").unwrap()
+        );
+        let request = client
+            .request(reqwest::Method::GET, &path)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.url().path(), "/api/v1/clips/a%2Fb%20%23%C3%9Cber");
+        assert!(request.url().query().is_none());
+        assert!(request.url().fragment().is_none());
+        for value in ["", ".", ".."] {
+            assert!(encode_path_segment(value).is_err());
+        }
+    }
 
     #[test]
     fn credential_debug_is_redacted_without_changing_wire_format() {
@@ -470,6 +521,7 @@ mod tests {
         let user_wire = serde_json::json!({
             "id": "user-1", "username": "alice", "display_name": null, "email": null,
             "bio": null, "avatar_url": null, "role": "user", "is_disabled": false,
+                "password_change_required": false,
             "storage_bytes": 0, "storage_quota_bytes": null,
             "created_at": "2026-09-30T00:00:00Z", "updated_at": "2026-09-30T00:00:00Z",
             "last_login_at": null
@@ -478,6 +530,9 @@ mod tests {
             "user": user_wire, "auth_kind": "session", "csrf_token": secret
         });
         let me: MeResponse = serde_json::from_value(me_wire.clone()).expect("me response");
+        let changed_wire = serde_json::json!({"status": "ok", "csrf_token": secret});
+        let changed: types::ChangePasswordResponse =
+            serde_json::from_value(changed_wire.clone()).unwrap();
         let connected = ConnectedCloud {
             client: CloudClient::with_device_token(
                 Url::parse(&format!(
@@ -502,6 +557,7 @@ mod tests {
             format!("{request:?}"),
             format!("{token:?}"),
             format!("{me:?}"),
+            format!("{changed:?}"),
             format!("{:?}", connected.client),
             format!("{connected:#?}"),
         ] {
@@ -513,6 +569,7 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(token).expect("token JSON"), token_wire);
         assert_eq!(serde_json::to_value(me).expect("me JSON"), me_wire);
+        assert_eq!(serde_json::to_value(changed).unwrap(), changed_wire);
     }
 
     #[test]

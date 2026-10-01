@@ -33,6 +33,7 @@ export function formatRelativeTime(value) {
     return "Unknown";
   }
   const diffMs = Math.min(0, date.getTime() - Date.now());
+  if (Math.abs(diffMs) < 1000) return "just now";
   const units = [
     ["year", 365 * 24 * 60 * 60 * 1000],
     ["month", 30 * 24 * 60 * 60 * 1000],
@@ -44,7 +45,7 @@ export function formatRelativeTime(value) {
   ];
   const [unit, unitMs] =
     units.find(([, size]) => Math.abs(diffMs) >= size) || units[units.length - 1];
-  const amount = Math.round(diffMs / unitMs);
+  const amount = -Math.floor(Math.abs(diffMs) / unitMs);
   return new Intl.RelativeTimeFormat(undefined, { numeric: "always" }).format(amount, unit);
 }
 

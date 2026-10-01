@@ -4,6 +4,7 @@ mod clips;
 mod config;
 mod error;
 mod health;
+mod limits;
 mod logging;
 mod mail;
 mod media;
@@ -46,6 +47,7 @@ use url::Url;
 
 const MIB: u64 = 1024 * 1024;
 const GAME_CATEGORY_MAP_TTL: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'";
 
 #[derive(Clone)]
@@ -283,13 +285,20 @@ async fn run(config: Config) -> anyhow::Result<()> {
         ProcessRole::All => {
             let (job_shutdown_tx, job_runner_handle) =
                 start_job_runner(&config, repositories.clone(), storage.clone(), "server").await?;
-            let server_result =
-                run_http_server(config, database, repositories, storage, bind_addr).await;
+            let server_result = run_http_server(
+                config,
+                database,
+                repositories,
+                storage,
+                bind_addr,
+                Some(job_shutdown_tx.clone()),
+            )
+            .await;
             stop_job_runner(job_shutdown_tx, job_runner_handle).await;
             server_result?;
         }
         ProcessRole::Web => {
-            run_http_server(config, database, repositories, storage, bind_addr).await?;
+            run_http_server(config, database, repositories, storage, bind_addr, None).await?;
         }
         ProcessRole::Worker => {
             let (job_shutdown_tx, job_runner_handle) =
@@ -308,6 +317,7 @@ async fn run_http_server(
     repositories: Repositories,
     storage: SharedStorageBackend,
     bind_addr: SocketAddr,
+    job_shutdown: Option<watch::Sender<bool>>,
 ) -> anyhow::Result<()> {
     let auth_runtime = auth::AuthRuntime::new(config.session_secret.as_deref());
     let app = router(config, database, repositories, storage, auth_runtime);
@@ -324,7 +334,12 @@ async fn run_http_server(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        if let Some(sender) = job_shutdown {
+            let _ = sender.send(true);
+        }
+    })
     .await
     .context("server failed")
 }
@@ -335,6 +350,11 @@ async fn start_job_runner(
     storage: SharedStorageBackend,
     runner_prefix: &str,
 ) -> anyhow::Result<(watch::Sender<bool>, JoinHandle<()>)> {
+    clipline_cloud_core::media_processing::check_sandbox_support()
+        .context("media worker filesystem sandbox is unavailable")?;
+    clipline_cloud_core::media_processing::cleanup_abandoned_scratch()
+        .await
+        .context("failed to clean abandoned media scratch files")?;
     ensure_cleanup_session_sweep(&repositories)
         .await
         .context("failed to schedule cleanup session sweep")?;
@@ -349,10 +369,12 @@ async fn start_job_runner(
         JobRunnerConfig {
             runner_id: format!("{runner_prefix}-{}", clipline_cloud_db::new_ulid()),
             poll_interval: config.job_poll_interval,
+            concurrency: config.job_concurrency,
             lock_timeout: config.job_lock_timeout,
             retry_base_delay: config.job_retry_base_delay,
             retry_max_delay: config.job_retry_max_delay,
             video_optimization: config.video_optimization.clone(),
+            media_processing: config.media_processing.clone(),
         },
     );
     Ok((
@@ -443,6 +465,26 @@ fn redact_url_credentials(raw_url: &str) -> String {
     if url.password().is_some() {
         let _ = url.set_password(Some("***"));
     }
+    let pairs: Vec<_> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let secret = matches!(
+                key.to_ascii_lowercase().as_str(),
+                "password" | "pass" | "pwd" | "token" | "secret" | "sslpassword"
+            );
+            (
+                key.into_owned(),
+                if secret {
+                    "***".to_owned()
+                } else {
+                    value.into_owned()
+                },
+            )
+        })
+        .collect();
+    if !pairs.is_empty() {
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
     url.to_string()
 }
 
@@ -523,6 +565,8 @@ fn router(
         .layer(DefaultBodyLimit::max(
             config::DEFAULT_REQUEST_BODY_LIMIT_BYTES,
         ))
+        .layer(middleware::from_fn(public_read_budget))
+        .layer(middleware::from_fn(request_timeout))
         .layer(middleware::from_fn_with_state(
             config.clone(),
             secure_headers,
@@ -533,6 +577,49 @@ fn router(
         ))
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+async fn public_read_budget(request: Request<Body>, next: Next) -> Response {
+    if request.method() == axum::http::Method::GET
+        && request.uri().path().starts_with("/api/v1/public/")
+    {
+        let actor = request
+            .extensions()
+            .get::<ClientIp>()
+            .map(|ip| ip.0.as_str())
+            .unwrap_or("unknown");
+        let source = match actor.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(ip)) => {
+                std::net::Ipv6Addr::from(u128::from(ip) & (!0u128 << 64)).to_string()
+            }
+            _ => actor.to_string(),
+        };
+        let query = request.uri().query().unwrap_or("");
+        if url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "q" && !value.trim().is_empty())
+        {
+            if let Err(error) =
+                limits::check("public-search-source", &source, 30, Duration::from_secs(60))
+            {
+                return error.into_response();
+            }
+            if let Err(error) =
+                limits::check("public-search-global", "all", 120, Duration::from_secs(60))
+            {
+                return error.into_response();
+            }
+        }
+        if let Err(error) = limits::check("public-read", &source, 120, Duration::from_secs(60)) {
+            return error.into_response();
+        }
+    }
+    next.run(request).await
+}
+
+async fn request_timeout(request: Request<Body>, next: Next) -> Response {
+    tokio::time::timeout(REQUEST_TIMEOUT, next.run(request))
+        .await
+        .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
 }
 
 async fn spa_index(State(state): State<AppState>) -> Result<Response, StatusCode> {
@@ -680,12 +767,16 @@ fn forwarded_for_chain(headers: &HeaderMap) -> Option<Vec<std::net::IpAddr>> {
         .get(HeaderName::from_static("x-forwarded-for"))?
         .to_str()
         .ok()?;
-    let chain = value
-        .split(',')
-        .map(str::trim)
-        .map(str::parse::<std::net::IpAddr>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    // Only trust the valid suffix: malformed entries to its left cannot erase
+    // the client address, or make us cross an untrusted proxy boundary.
+    let mut chain = Vec::new();
+    for entry in value.split(',').rev() {
+        let Ok(ip) = entry.trim().parse::<std::net::IpAddr>() else {
+            break;
+        };
+        chain.push(ip);
+    }
+    chain.reverse();
     (!chain.is_empty()).then_some(chain)
 }
 
@@ -755,6 +846,77 @@ mod tests {
         app: Router,
         repositories: Repositories,
         _temp_dir: tempfile::TempDir,
+    }
+
+    struct UnreadableBody;
+
+    impl tokio::io::AsyncRead for UnreadableBody {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            panic!("rejected uploads must not read the request body");
+        }
+    }
+
+    pub(crate) fn unreadable_body() -> Body {
+        Body::from_stream(tokio_util::io::ReaderStream::new(UnreadableBody))
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_uploads_are_rejected_without_reading_bodies() {
+        let test = test_router().await;
+        for uri in [
+            "/api/v1/uploads/missing/content",
+            "/api/v1/uploads/missing/parts/1",
+        ] {
+            for authorization in [None, Some("Bearer invalid")] {
+                let mut request = Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "video/mp4");
+                if let Some(value) = authorization {
+                    request = request.header(header::AUTHORIZATION, value);
+                }
+                let response = test
+                    .app
+                    .clone()
+                    .oneshot(request_with_connect_info(
+                        request.body(unreadable_body()).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_with_stalled_bodies_time_out() {
+        struct StalledBody;
+        impl tokio::io::AsyncRead for StalledBody {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let test = test_router().await;
+        tokio::time::pause();
+        let body = Body::from_stream(tokio_util::io::ReaderStream::new(StalledBody));
+        let request = request_with_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap(),
+        );
+        let response = test.app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     fn headers_with_xff(value: &'static str) -> HeaderMap {
@@ -1013,6 +1175,23 @@ mod tests {
     }
 
     async fn test_router() -> TestRouter {
+        let (temp_dir, state) = test_state().await;
+        let repositories = state.repositories.clone();
+        let app = router(
+            state.config,
+            state.database,
+            repositories.clone(),
+            state.storage,
+            state.auth,
+        );
+        TestRouter {
+            app,
+            repositories,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    pub(crate) async fn test_state() -> (tempfile::TempDir, AppState) {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_url = format!("sqlite://{}", temp_dir.path().join("clipline.db").display());
         let config = Arc::new(Config::for_tests(
@@ -1026,13 +1205,18 @@ mod tests {
         let storage: SharedStorageBackend =
             Arc::new(LocalStorage::new(temp_dir.path().join("data")));
         let auth = auth::AuthRuntime::new(config.session_secret.as_deref());
-        let app = router(config, database, repositories.clone(), storage, auth);
-
-        TestRouter {
-            app,
-            repositories,
-            _temp_dir: temp_dir,
-        }
+        (
+            temp_dir,
+            AppState {
+                config,
+                database,
+                repositories,
+                storage,
+                auth,
+                game_category_map_cache: Arc::default(),
+                readiness: health::ReadinessCache::default(),
+            },
+        )
     }
 
     fn request_with_connect_info(mut request: Request<Body>) -> Request<Body> {

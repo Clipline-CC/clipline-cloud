@@ -378,7 +378,7 @@ export function Player({ src, poster, durationMs, markers }) {
   // Global keyboard shortcuts are active only while this player is mounted.
   useEffect(() => {
     function onKeyDown(event) {
-      if (event.defaultPrevented || isPlayerShortcutBlockedTarget(event.target)) return;
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || isPlayerShortcutBlockedTarget(event.target)) return;
       const intent = resolvePlayerKeyIntent(event.code, event.shiftKey);
       if (!intent) return;
       if (intent.kind === "exit-theater" && !theater) return;
