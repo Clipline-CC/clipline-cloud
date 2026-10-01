@@ -15,6 +15,7 @@ function publicRouteQuery(params) {
     game: params.get("game") || "",
     q: params.get("q") || "",
     page: Number.isFinite(page) ? Math.max(1, page) : 1,
+    ...(params.get("cursor") ? { cursor: params.get("cursor") } : {}),
   };
 }
 

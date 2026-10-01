@@ -40,8 +40,9 @@ use tokio::{
     net::TcpListener,
     sync::{watch, RwLock},
 };
-use tower_http::{catch_panic::CatchPanicLayer, services::ServeDir};
-use tracing::{info, warn};
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer, services::ServeDir};
+use tracing::{info, warn, Instrument};
 use url::Url;
 
 const MIB: u64 = 1024 * 1024;
@@ -531,8 +532,28 @@ fn router(
             config.clone(),
             attach_client_ip,
         ))
+        .layer(
+            CompressionLayer::new()
+                .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("video/"))),
+        )
         .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(trace_request))
         .with_state(state)
+}
+
+async fn trace_request(request: Request<Body>, next: Next) -> Response {
+    let started = Instant::now();
+    let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| "static".to_string());
+    let span = tracing::info_span!("http.request", method = %method, route = %route);
+    let response = next.run(request).instrument(span).await;
+    info!(event = "http.response", method = %method, route = %route,
+        status = response.status().as_u16(), latency_us = started.elapsed().as_micros() as u64);
+    response
 }
 
 async fn spa_index(State(state): State<AppState>) -> Result<Response, StatusCode> {

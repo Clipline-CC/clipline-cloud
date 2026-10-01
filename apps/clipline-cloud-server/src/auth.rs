@@ -1878,11 +1878,13 @@ pub(crate) async fn require_auth(
         if user.is_disabled {
             return Err(ApiError::unauthorized("user is disabled"));
         }
-        state
-            .repositories
-            .device_tokens
-            .touch(&device_token.id)
-            .await?;
+        if activity_touch_due(device_token.last_used_at) {
+            state
+                .repositories
+                .device_tokens
+                .touch(&device_token.id)
+                .await?;
+        }
         return Ok(AuthenticatedUser {
             user,
             kind: AuthKind::Bearer,
@@ -1910,12 +1912,18 @@ pub(crate) async fn require_auth(
     if user.is_disabled {
         return Err(ApiError::unauthorized("user is disabled"));
     }
-    state.repositories.sessions.touch(&session.id).await?;
+    if activity_touch_due(session.last_used_at) {
+        state.repositories.sessions.touch(&session.id).await?;
+    }
 
     Ok(AuthenticatedUser {
         user,
         kind: AuthKind::Cookie { token_hash },
     })
+}
+
+fn activity_touch_due(last_used_at: Option<DateTime<Utc>>) -> bool {
+    last_used_at.map_or(true, |last| last <= now_utc() - ChronoDuration::minutes(1))
 }
 
 pub(crate) async fn optional_auth(

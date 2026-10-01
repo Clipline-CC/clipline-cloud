@@ -25,6 +25,7 @@ use crate::media_processing::{
 };
 
 pub const VALIDATE_OBJECT_KIND: &str = "validate_object";
+pub const REFRESH_ARTIFACTS_KIND: &str = "refresh_artifacts";
 pub const PROBE_METADATA_KIND: &str = "probe_metadata";
 pub const OPTIMIZE_VIDEO_KIND: &str = "optimize_video";
 pub const THUMBNAIL_KIND: &str = "thumbnail";
@@ -271,6 +272,7 @@ impl JobRunner {
     async fn run_claimed_job(&self, job: Job) -> Result<(), JobRunnerError> {
         debug!(
             event = "jobs.claimed",
+            queue_age_ms = (now_utc() - job.next_run_at).num_milliseconds().max(0),
             job_id = %job.id,
             kind = %job.kind,
             attempts = job.attempts,
@@ -356,8 +358,10 @@ impl JobRunner {
     }
 
     async fn execute_claimed_job(&self, job: &Job) -> Result<(), JobRunnerError> {
-        match job.kind.as_str() {
+        let started = std::time::Instant::now();
+        let result = match job.kind.as_str() {
             VALIDATE_OBJECT_KIND => self.validate_object(job).await,
+            REFRESH_ARTIFACTS_KIND => self.refresh_artifacts(job).await,
             PROBE_METADATA_KIND => self.probe_metadata(job).await,
             OPTIMIZE_VIDEO_KIND => self.optimize_video(job).await,
             THUMBNAIL_KIND => self.generate_thumbnail(job).await,
@@ -367,7 +371,9 @@ impl JobRunner {
             other => Err(JobRunnerError::InvalidJob(format!(
                 "unknown job kind {other:?}"
             ))),
-        }
+        };
+        info!(event = "jobs.duration", kind = %job.kind, duration_ms = started.elapsed().as_millis() as u64, success = result.is_ok());
+        result
     }
 
     async fn handle_dead_job(
@@ -548,9 +554,12 @@ impl JobRunner {
     }
 
     async fn enqueue_media_refresh_jobs(&self, clip_id: &str) -> Result<(), JobRunnerError> {
-        enqueue_probe_metadata(&self.repositories, clip_id).await?;
-        enqueue_thumbnail(&self.repositories, clip_id).await?;
-        enqueue_poster(&self.repositories, clip_id).await?;
+        enqueue_clip_job(
+            &self.repositories,
+            REFRESH_ARTIFACTS_KIND,
+            clip_id.to_string(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -562,6 +571,42 @@ impl JobRunner {
                 error = %error,
             );
         }
+    }
+
+    async fn refresh_artifacts(&self, job: &Job) -> Result<(), JobRunnerError> {
+        let Some(clip) = self.load_ready_clip(job, REFRESH_ARTIFACTS_KIND).await? else {
+            return Ok(());
+        };
+        let source_key = clip_source_key(&clip)?;
+        let keys = media_keys_for_clip(&source_key)?;
+        let thumbnail = clip
+            .thumbnail_key
+            .as_deref()
+            .map(ObjectKey::parse)
+            .transpose()?
+            .unwrap_or(keys.thumbnail);
+        let poster = clip
+            .poster_key
+            .as_deref()
+            .map(ObjectKey::parse)
+            .transpose()?
+            .unwrap_or(keys.poster);
+        let metadata = self
+            .media_processor
+            .refresh_artifacts(
+                &self.storage,
+                &source_key,
+                &thumbnail,
+                &poster,
+                clip.checksum_sha256.as_deref(),
+            )
+            .await?;
+        self.update_probe_metadata(&clip, metadata).await?;
+        self.repositories
+            .clips
+            .set_media_artifact_keys(&clip.id, Some(poster.as_str()), Some(thumbnail.as_str()))
+            .await?;
+        Ok(())
     }
 
     async fn probe_metadata(&self, job: &Job) -> Result<(), JobRunnerError> {
@@ -934,31 +979,114 @@ impl JobRunner {
         }
 
         let now = now_utc();
-        self.cleanup_deleted_clips().await?;
-        let media_objects = self.storage.list_objects(MEDIA_OBJECT_PREFIX).await?;
-        let object_sizes = media_objects
-            .iter()
-            .map(|object| (object.key.as_str().to_string(), object.size_bytes))
-            .collect::<HashMap<_, _>>();
-        self.restore_clips_with_reappeared_source(&object_sizes)
-            .await?;
-        self.mark_ready_clips_with_missing_source(&object_sizes)
-            .await?;
-        self.delete_orphan_media_objects(now, &media_objects)
-            .await?;
-        self.abort_orphan_multipart_uploads(now).await?;
-
-        self.enqueue_next_cleanup_sweep_for_kind(CLEANUP_CLIP_KIND, now)
-            .await?;
+        let more_deleted = self.cleanup_deleted_clips().await?;
+        if self
+            .repositories
+            .jobs
+            .sweep_cursor("media_objects_done")
+            .await?
+            .is_none()
+        {
+            let cursor = self.repositories.jobs.sweep_cursor("media_objects").await?;
+            let page = self
+                .storage
+                .list_objects_page(MEDIA_OBJECT_PREFIX, cursor.as_deref(), 1000)
+                .await?;
+            self.delete_orphan_media_objects(now, &page.objects).await?;
+            self.repositories
+                .jobs
+                .set_sweep_cursor("media_objects", page.next_cursor.as_deref())
+                .await?;
+            if page.next_cursor.is_none() {
+                self.repositories
+                    .jobs
+                    .set_sweep_cursor("media_objects_done", Some("complete"))
+                    .await?;
+            }
+        }
+        let object_sizes = HashMap::new();
+        for (cursor_name, done_name) in [
+            ("failed_sources", "failed_sources_done"),
+            ("ready_sources", "ready_sources_done"),
+        ] {
+            if self
+                .repositories
+                .jobs
+                .sweep_cursor(done_name)
+                .await?
+                .is_none()
+            {
+                if cursor_name == "failed_sources" {
+                    self.restore_clips_with_reappeared_source(&object_sizes)
+                        .await?;
+                } else {
+                    self.mark_ready_clips_with_missing_source(&object_sizes)
+                        .await?;
+                }
+                if self
+                    .repositories
+                    .jobs
+                    .sweep_cursor(cursor_name)
+                    .await?
+                    .is_none()
+                {
+                    self.repositories
+                        .jobs
+                        .set_sweep_cursor(done_name, Some("complete"))
+                        .await?;
+                }
+            }
+        }
+        let more_history = self
+            .repositories
+            .jobs
+            .prune_succeeded_before(now - ChronoDuration::days(30), 1000)
+            .await?
+            >= 1000;
+        if self
+            .repositories
+            .jobs
+            .sweep_cursor("multipart_uploads_done")
+            .await?
+            .is_none()
+        {
+            self.abort_orphan_multipart_uploads(now).await?;
+        }
+        let mut more = more_deleted || more_history;
+        for name in [
+            "media_objects_done",
+            "failed_sources_done",
+            "ready_sources_done",
+            "multipart_uploads_done",
+        ] {
+            more |= self.repositories.jobs.sweep_cursor(name).await?.is_none();
+        }
+        if !more {
+            for name in [
+                "media_objects_done",
+                "failed_sources_done",
+                "ready_sources_done",
+                "multipart_uploads_done",
+            ] {
+                self.repositories.jobs.set_sweep_cursor(name, None).await?;
+            }
+        }
+        let delay = if more {
+            Duration::from_secs(1)
+        } else {
+            CLEANUP_CLIP_INTERVAL
+        };
+        enqueue_cleanup_clip_sweep(&self.repositories, now + chrono_duration(delay)).await?;
         Ok(())
     }
 
-    async fn cleanup_deleted_clips(&self) -> Result<(), JobRunnerError> {
+    async fn cleanup_deleted_clips(&self) -> Result<bool, JobRunnerError> {
         let deleted_clips = self
             .repositories
             .clips
             .list_deleted(CLEANUP_CLIP_BATCH_SIZE)
             .await?;
+        let more = deleted_clips.len() == CLEANUP_CLIP_BATCH_SIZE as usize;
         for clip in deleted_clips {
             self.delete_clip_objects(&clip).await?;
             self.repositories
@@ -967,7 +1095,7 @@ impl JobRunner {
                 .await?;
             self.repositories.clips.delete(&clip.id).await?;
         }
-        Ok(())
+        Ok(more)
     }
 
     async fn delete_clip_objects(&self, clip: &Clip) -> Result<(), JobRunnerError> {
@@ -1008,15 +1136,27 @@ impl JobRunner {
         &self,
         object_sizes: &HashMap<String, u64>,
     ) -> Result<(), JobRunnerError> {
+        let cursor = self
+            .repositories
+            .jobs
+            .sweep_cursor("failed_sources")
+            .await?
+            .unwrap_or_default();
         let failed_uploads = self
             .repositories
             .upload_sessions
-            .list_failed_with_reason(MISSING_SOURCE_FAILURE_REASON, CLEANUP_CLIP_BATCH_SIZE)
+            .list_failed_with_reason_after(
+                MISSING_SOURCE_FAILURE_REASON,
+                &cursor,
+                CLEANUP_CLIP_BATCH_SIZE,
+            )
             .await?;
+        let next_cursor = if failed_uploads.len() == CLEANUP_CLIP_BATCH_SIZE as usize {
+            failed_uploads.last().map(|session| session.id.clone())
+        } else {
+            None
+        };
         for session in failed_uploads {
-            let Some(inventory_size) = object_sizes.get(&session.storage_key).copied() else {
-                continue;
-            };
             let Some(clip) = self.repositories.clips.get(&session.clip_id).await? else {
                 continue;
             };
@@ -1031,13 +1171,16 @@ impl JobRunner {
             else {
                 continue;
             };
-            if inventory_size != expected_size {
+            if object_sizes
+                .get(&session.storage_key)
+                .is_some_and(|size| *size != expected_size)
+            {
                 warn!(
                     event = "jobs.cleanup_clip.restore_size_mismatch",
                     clip_id = %clip.id,
                     storage_key = %session.storage_key,
                     expected_size_bytes = expected_size,
-                    inventory_size_bytes = inventory_size,
+                    inventory_size_bytes = object_sizes.get(&session.storage_key).copied(),
                 );
                 continue;
             }
@@ -1072,6 +1215,10 @@ impl JobRunner {
                 );
             }
         }
+        self.repositories
+            .jobs
+            .set_sweep_cursor("failed_sources", next_cursor.as_deref())
+            .await?;
         Ok(())
     }
 
@@ -1079,18 +1226,35 @@ impl JobRunner {
         &self,
         object_sizes: &HashMap<String, u64>,
     ) -> Result<(), JobRunnerError> {
+        let cursor = self
+            .repositories
+            .jobs
+            .sweep_cursor("ready_sources")
+            .await?
+            .unwrap_or_default();
         let ready_clips = self
             .repositories
             .clips
-            .list_ready_with_storage_key(CLEANUP_CLIP_BATCH_SIZE)
+            .list_ready_sources_after(&cursor, CLEANUP_CLIP_BATCH_SIZE)
             .await?;
+        let next_cursor = if ready_clips.len() == CLEANUP_CLIP_BATCH_SIZE as usize {
+            ready_clips.last().map(|clip| clip.id.clone())
+        } else {
+            None
+        };
         for clip in ready_clips {
             let source_key = clip_source_key(&clip)?;
-            if source_is_confirmed_missing(&self.storage, &source_key, object_sizes).await? {
+            if source_is_confirmed_missing(&self.storage, &source_key, object_sizes).await?
+                && !self.storage.object_exists(&source_key).await?
+            {
                 self.mark_clip_failed_with_upload_reason(&clip.id, MISSING_SOURCE_FAILURE_REASON)
                     .await?;
             }
         }
+        self.repositories
+            .jobs
+            .set_sweep_cursor("ready_sources", next_cursor.as_deref())
+            .await?;
         Ok(())
     }
 
@@ -1124,35 +1288,48 @@ impl JobRunner {
         now: chrono::DateTime<chrono::Utc>,
         objects: &[ObjectSummary],
     ) -> Result<(), JobRunnerError> {
-        let active_references = self
-            .repositories
-            .clips
-            .list_active_storage_references()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut active_references = active_references;
-        if self.config.video_optimization.keep_original {
-            for key in active_references.clone() {
-                if let Ok(source_key) = ObjectKey::parse(&key) {
-                    if let Ok(original_key) = original_source_key(&source_key) {
-                        active_references.insert(original_key.as_str().to_string());
-                    }
-                }
-            }
-        }
+        let mut deletes = tokio::task::JoinSet::new();
         for object in objects {
-            if active_references.contains(object.key.as_str()) {
-                continue;
-            }
             if !is_older_than(object.last_modified, now, CLEANUP_ORPHAN_GRACE) {
                 continue;
             }
-            if let Err(error) = self.storage.delete_object(&object.key).await {
-                if !matches!(error, StorageError::NotFound(_)) {
-                    return Err(error.into());
-                }
+            let storage = self.storage.clone();
+            let repositories = self.repositories.clone();
+            let key = object.key.clone();
+            let keep_original = self.config.video_optimization.keep_original;
+            if deletes.len() >= 4 {
+                deletes
+                    .join_next()
+                    .await
+                    .expect("delete task")
+                    .map_err(|error| JobRunnerError::Validation(error.to_string()))??;
             }
+            deletes.spawn(async move {
+                // Check references immediately before deletion, including retained originals.
+                if repositories
+                    .clips
+                    .storage_key_is_referenced(key.as_str())
+                    .await?
+                {
+                    return Ok::<_, JobRunnerError>(());
+                }
+                if keep_original {
+                    if let Some(prefix) = key.as_str().strip_suffix("/original-source.mp4") {
+                        let source = format!("{prefix}/source.mp4");
+                        if repositories
+                            .clips
+                            .storage_key_is_referenced(&source)
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                delete_if_present(&storage, &key).await
+            });
+        }
+        while let Some(result) = deletes.join_next().await {
+            result.map_err(|error| JobRunnerError::Validation(error.to_string()))??;
         }
         Ok(())
     }
@@ -1161,26 +1338,39 @@ impl JobRunner {
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), JobRunnerError> {
-        let active_upload_ids = self
+        let cursor = self
             .repositories
-            .upload_sessions
-            .list_active_storage_upload_ids()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let uploads = self
-            .storage
-            .list_multipart_uploads(MEDIA_OBJECT_PREFIX)
+            .jobs
+            .sweep_cursor("multipart_uploads")
             .await?;
-        for upload in uploads {
-            if active_upload_ids.contains(&upload.upload_id) {
+        let page = self
+            .storage
+            .list_multipart_uploads_page(MEDIA_OBJECT_PREFIX, cursor.as_deref(), 1000)
+            .await?;
+        for upload in page.uploads {
+            if !is_older_than(upload.initiated_at, now, CLEANUP_ORPHAN_GRACE) {
                 continue;
             }
-            if !is_older_than(upload.initiated_at, now, CLEANUP_ORPHAN_GRACE) {
+            if self
+                .repositories
+                .upload_sessions
+                .storage_upload_is_active(&upload.upload_id)
+                .await?
+            {
                 continue;
             }
             self.storage
                 .abort_multipart_upload(&upload.upload_id, &upload.key)
+                .await?;
+        }
+        self.repositories
+            .jobs
+            .set_sweep_cursor("multipart_uploads", page.next_cursor.as_deref())
+            .await?;
+        if page.next_cursor.is_none() {
+            self.repositories
+                .jobs
+                .set_sweep_cursor("multipart_uploads_done", Some("complete"))
                 .await?;
         }
         Ok(())
@@ -1341,6 +1531,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_sweep_rotates_past_the_first_hundred_healthy_clips() {
+        let (temp_dir, repositories) = sqlite_repositories().await;
+        let storage: SharedStorageBackend =
+            Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
+        let user = repositories
+            .users
+            .create(&NewUser::new("rotation", "hash", "user"))
+            .await
+            .unwrap();
+        let healthy_key = MediaObjectKeys::generate().unwrap().source;
+        storage
+            .put_object(
+                &healthy_key,
+                bytes::Bytes::from_static(b"source"),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        let mut last_id = String::new();
+        for i in 0..101 {
+            let mut clip = NewClip::new(&user.id, "sweep", "local");
+            clip.id = format!("{i:026}");
+            clip.status = "ready".into();
+            clip.storage_key = Some(if i == 100 {
+                MediaObjectKeys::generate().unwrap().source.to_string()
+            } else {
+                healthy_key.to_string()
+            });
+            last_id = clip.id.clone();
+            repositories.clips.create(&clip).await.unwrap();
+        }
+        let runner = JobRunner::new(
+            repositories.clone(),
+            storage.clone(),
+            JobRunnerConfig::default(),
+        );
+        ensure_cleanup_clip_sweep(&repositories).await.unwrap();
+        assert!(runner.run_once().await.unwrap());
+        assert_eq!(
+            repositories
+                .clips
+                .get(&last_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+        let continuation = repositories
+            .jobs
+            .get_active_by_kind_and_target(CLEANUP_CLIP_KIND, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            continuation.next_run_at <= now_utc() + ChronoDuration::seconds(2),
+            "unfinished sweeps should continue promptly"
+        );
+        assert_eq!(
+            repositories
+                .jobs
+                .sweep_cursor("media_objects_done")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("complete")
+        );
+        // Reconstruct the runner to prove the cursor survives process restarts.
+        let runner = JobRunner::new(repositories.clone(), storage, JobRunnerConfig::default());
+        let continuation = repositories
+            .jobs
+            .claim_next(
+                &runner.config.runner_id,
+                continuation.next_run_at,
+                now_utc() - ChronoDuration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        runner.run_claimed_job(continuation).await.unwrap();
+        assert_eq!(
+            repositories
+                .clips
+                .get(&last_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+        assert!(repositories
+            .jobs
+            .sweep_cursor("ready_sources")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repositories
+            .jobs
+            .sweep_cursor("media_objects_done")
+            .await
+            .unwrap()
+            .is_none());
+        let next_cycle = repositories
+            .jobs
+            .get_active_by_kind_and_target(CLEANUP_CLIP_KIND, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(next_cycle.next_run_at >= now_utc() + ChronoDuration::minutes(29));
+    }
+
+    #[tokio::test]
     async fn validate_object_marks_processing_clip_ready() {
         let (temp_dir, repositories) = sqlite_repositories().await;
         let storage = Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
@@ -1407,14 +1709,7 @@ mod tests {
             .map(|job| job.kind)
             .collect::<Vec<_>>();
         queued_kinds.sort();
-        assert_eq!(
-            queued_kinds,
-            vec![
-                POSTER_KIND.to_string(),
-                PROBE_METADATA_KIND.to_string(),
-                THUMBNAIL_KIND.to_string()
-            ]
-        );
+        assert_eq!(queued_kinds, vec![REFRESH_ARTIFACTS_KIND.to_string()]);
     }
 
     #[tokio::test]
@@ -1521,14 +1816,7 @@ mod tests {
             .map(|job| job.kind)
             .collect::<Vec<_>>();
         queued_kinds.sort();
-        assert_eq!(
-            queued_kinds,
-            vec![
-                POSTER_KIND.to_string(),
-                PROBE_METADATA_KIND.to_string(),
-                THUMBNAIL_KIND.to_string()
-            ]
-        );
+        assert_eq!(queued_kinds, vec![REFRESH_ARTIFACTS_KIND.to_string()]);
     }
 
     #[tokio::test]
@@ -1581,14 +1869,7 @@ mod tests {
             .map(|job| job.kind)
             .collect::<Vec<_>>();
         queued_kinds.sort();
-        assert_eq!(
-            queued_kinds,
-            vec![
-                POSTER_KIND.to_string(),
-                PROBE_METADATA_KIND.to_string(),
-                THUMBNAIL_KIND.to_string()
-            ]
-        );
+        assert_eq!(queued_kinds, vec![REFRESH_ARTIFACTS_KIND.to_string()]);
     }
 
     #[tokio::test]

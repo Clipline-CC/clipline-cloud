@@ -4,6 +4,10 @@ This runbook covers the v1 Docker Compose profiles, operational limits, backup/r
 failure-mode checks. For step-by-step first-time setup of each profile, start with the
 [deployment guide](deployment-guide.md); this document is the deeper operations reference.
 
+For the 2026-10-01 index/search migrations, PostgreSQL extension prerequisite,
+upload admission limits, job retention, and new timing events, see the
+[optimization implementation notes](../optimization-review-implementation.md).
+
 ## Compose Profiles
 
 Run commands from `deploy/compose/`.

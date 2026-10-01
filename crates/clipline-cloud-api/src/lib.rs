@@ -1,5 +1,8 @@
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::Path;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::io::ReaderStream;
 
 use bytes::Bytes;
 pub use clipline_cloud_api_types::{
@@ -38,6 +41,10 @@ pub enum CloudApiError {
     Api { status: StatusCode, message: String },
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("file I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("upload worker failed: {0}")]
+    Worker(String),
     #[error("request body is inconsistent with declared upload metadata: {0}")]
     InvalidUpload(String),
 }
@@ -175,7 +182,10 @@ impl CloudClient {
         bytes: impl Into<Bytes>,
     ) -> CloudApiResult<PartUploadResponse> {
         let bytes = bytes.into();
-        let checksum = sha256_hex(&bytes);
+        let hash_bytes = bytes.clone();
+        let checksum = tokio::task::spawn_blocking(move || sha256_hex(&hash_bytes))
+            .await
+            .map_err(|error| CloudApiError::Worker(error.to_string()))?;
         self.put_body(
             &format!("/api/v1/uploads/{upload_id}/parts/{part_number}"),
             bytes,
@@ -229,11 +239,20 @@ impl CloudClient {
             "chunked" => {
                 let progress = self.get_upload(&upload.upload_id).await?;
                 on_progress(&progress);
-                for part_number in progress.missing_parts {
-                    let chunk = chunk_for_part(bytes, upload.part_size_bytes, part_number)?;
-                    self.put_part(&upload.upload_id, part_number, chunk).await?;
-                    let progress = self.get_upload(&upload.upload_id).await?;
-                    on_progress(&progress);
+                for batch in progress.missing_parts.chunks(4) {
+                    let mut workers = tokio::task::JoinSet::new();
+                    for &part_number in batch {
+                        let chunk = chunk_for_part(bytes, upload.part_size_bytes, part_number)?;
+                        let client = self.clone();
+                        let upload = upload.clone();
+                        workers.spawn(async move {
+                            client.put_upload_part(&upload, part_number, chunk).await
+                        });
+                    }
+                    while let Some(result) = workers.join_next().await {
+                        result.map_err(|error| CloudApiError::Worker(error.to_string()))??;
+                    }
+                    on_progress(&self.get_upload(&upload.upload_id).await?);
                 }
                 let progress = self.complete_upload(&upload.upload_id).await?;
                 on_progress(&progress);
@@ -243,6 +262,179 @@ impl CloudClient {
                 "server returned unsupported upload mode {other:?}"
             ))),
         }
+    }
+
+    /// Upload a file with bounded memory and at most four in-flight parts.
+    pub async fn upload_mp4_file(
+        &self,
+        request: &CreateUploadRequest,
+        path: impl AsRef<Path>,
+    ) -> CloudApiResult<UploadProgressResponse> {
+        self.upload_mp4_file_with_progress(request, path, |_| {})
+            .await
+    }
+
+    pub async fn upload_mp4_file_with_progress<F>(
+        &self,
+        request: &CreateUploadRequest,
+        path: impl AsRef<Path>,
+        mut on_progress: F,
+    ) -> CloudApiResult<UploadProgressResponse>
+    where
+        F: FnMut(&UploadProgressResponse),
+    {
+        let path = path.as_ref();
+        let mut file = tokio::fs::File::open(path).await?;
+        if file.metadata().await?.len() != request.file_size_bytes {
+            return Err(CloudApiError::InvalidUpload(
+                "file size does not match upload metadata".into(),
+            ));
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let checksum: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if checksum != request.checksum_sha256.to_ascii_lowercase() {
+            return Err(CloudApiError::InvalidUpload(
+                "checksum_sha256 does not match file".into(),
+            ));
+        }
+        let upload = self.create_upload(request).await?;
+        let progress = self.get_upload(&upload.upload_id).await?;
+        on_progress(&progress);
+        if progress.status == "completed" {
+            return Ok(progress);
+        }
+        if upload.mode == "single_put" {
+            file.seek(SeekFrom::Start(0)).await?;
+            let progress = self
+                .send_json(
+                    self.request(
+                        reqwest::Method::PUT,
+                        &format!("/api/v1/uploads/{}/content", upload.upload_id),
+                    )?
+                    .header(header::CONTENT_TYPE, "video/mp4")
+                    .header(header::CONTENT_LENGTH, request.file_size_bytes)
+                    .body(reqwest::Body::wrap_stream(ReaderStream::new(file))),
+                )
+                .await?;
+            on_progress(&progress);
+            return Ok(progress);
+        }
+        if upload.mode != "chunked"
+            || upload.part_size_bytes == 0
+            || upload.part_size_bytes > 64 * 1024 * 1024
+        {
+            return Err(CloudApiError::InvalidUpload(
+                "file uploads require a supported mode and parts of at most 64 MiB".into(),
+            ));
+        }
+        for batch in progress.missing_parts.chunks(4) {
+            let mut workers = tokio::task::JoinSet::new();
+            for &part_number in batch {
+                let path = path.to_path_buf();
+                let client = self.clone();
+                let upload = upload.clone();
+                let size = request.file_size_bytes;
+                workers.spawn(async move {
+                    if part_number == 0 {
+                        return Err(CloudApiError::InvalidUpload(
+                            "part numbers start at one".into(),
+                        ));
+                    }
+                    let offset = u64::from(part_number - 1)
+                        .checked_mul(upload.part_size_bytes)
+                        .filter(|offset| *offset < size)
+                        .ok_or_else(|| {
+                            CloudApiError::InvalidUpload("invalid part offset".into())
+                        })?;
+                    let count = (size - offset).min(upload.part_size_bytes) as usize;
+                    let mut file = tokio::fs::File::open(path).await?;
+                    file.seek(SeekFrom::Start(offset)).await?;
+                    let mut bytes = vec![0; count];
+                    file.read_exact(&mut bytes).await?;
+                    client
+                        .put_upload_part(&upload, part_number, Bytes::from(bytes))
+                        .await
+                });
+            }
+            while let Some(result) = workers.join_next().await {
+                result.map_err(|error| CloudApiError::Worker(error.to_string()))??;
+            }
+            on_progress(&self.get_upload(&upload.upload_id).await?);
+        }
+        let progress = self.complete_upload(&upload.upload_id).await?;
+        on_progress(&progress);
+        Ok(progress)
+    }
+
+    async fn put_upload_part(
+        &self,
+        upload: &CreateUploadResponse,
+        part_number: u16,
+        bytes: Bytes,
+    ) -> CloudApiResult<PartUploadResponse> {
+        if upload.direct_part_presign_url_template.is_none()
+            || upload.direct_part_ack_url_template.is_none()
+        {
+            return self.put_part(&upload.upload_id, part_number, bytes).await;
+        }
+        let size_bytes = bytes.len() as u64;
+        let hash_bytes = bytes.clone();
+        let checksum = tokio::task::spawn_blocking(move || sha256_hex(&hash_bytes))
+            .await
+            .map_err(|error| CloudApiError::Worker(error.to_string()))?;
+        let presigned: types::DirectPartUploadUrlResponse = self
+            .post_json(
+                &format!(
+                    "/api/v1/uploads/{}/parts/{part_number}/presign",
+                    upload.upload_id
+                ),
+                &serde_json_value_empty(),
+            )
+            .await?;
+        // This request has no Clipline credential: S3 receives only its signed URL and advertised headers.
+        let mut request = self.http.put(&presigned.url).body(bytes);
+        for header in presigned.headers {
+            request = request.header(header.name, header.value);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(CloudApiError::Api {
+                status,
+                message: "direct part upload failed".into(),
+            });
+        }
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| CloudApiError::InvalidUpload("S3 did not return a part ETag".into()))?
+            .trim_matches('"')
+            .to_string();
+        self.post_json(
+            &format!(
+                "/api/v1/uploads/{}/parts/{part_number}/ack",
+                upload.upload_id
+            ),
+            &types::DirectPartUploadAckRequest {
+                etag,
+                size_bytes,
+                checksum_sha256: checksum,
+            },
+        )
+        .await
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> CloudApiResult<T> {
@@ -445,6 +637,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 fn serde_json_value_empty() -> serde_json::Value {
     serde_json::json!({})
 }
+
+#[cfg(test)]
+mod upload_tests;
 
 #[cfg(test)]
 mod tests {
