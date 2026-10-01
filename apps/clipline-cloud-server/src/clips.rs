@@ -6,16 +6,20 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use clipline_cloud_api_types::{
-    ClipDetailResponse, ClipListResponse, ClipMarkerResponse, ClipSummaryResponse,
+    ClipDetailResponse, ClipListResponse, ClipMarkerResponse, ClipSummaryResponse, StatusResponse,
     UpdateVisibilityRequest,
 };
 use clipline_cloud_db::{BulkVisibilityUpdate, Clip, ClipListParams, ClipMarker, ClipSort};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::{
-    auth::{self, ApiError},
+    auth,
+    error::ApiError,
+    game_category_id, game_display_name, game_display_name_map, game_icon_url, game_video_art_url,
+    validation::{normalized_optional, validate_optional_char_count},
     AppState, ClientIp,
 };
 
@@ -25,6 +29,9 @@ const MAX_PAGE_SIZE: i64 = 100;
 const MAX_PAGE: i64 = 1_000_000;
 const MAX_BULK_CLIPS: usize = 100;
 const PUBLIC_SHARE_ID_LEN: usize = 22;
+const MAX_TITLE_LEN: usize = 300;
+const MAX_DESCRIPTION_LEN: usize = 10_000;
+const MAX_METADATA_FIELD_LEN: usize = 1_024;
 const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 pub fn routes() -> Router<AppState> {
@@ -46,6 +53,7 @@ pub fn routes() -> Router<AppState> {
 struct ListClipsQuery {
     sort: Option<String>,
     game: Option<String>,
+    game_category_id: Option<String>,
     source_type: Option<String>,
     visibility: Option<String>,
     status: Option<String>,
@@ -129,9 +137,17 @@ async fn list_clips(
         max_size_bytes,
         "min_size_bytes must be less than or equal to max_size_bytes",
     )?;
+    let game = normalized_optional(query.game);
+    let game_category_id = normalized_optional(query.game_category_id);
+    if game.is_some() && game_category_id.is_some() {
+        return Err(ApiError::bad_request(
+            "game and game_category_id cannot be combined",
+        ));
+    }
     let params = ClipListParams {
         owner_user_id: auth.user.id.clone(),
-        game: normalized_optional(query.game),
+        game,
+        game_category_id,
         source_type: normalized_optional(query.source_type),
         visibility: normalized_optional(query.visibility)
             .map(validate_visibility)
@@ -147,25 +163,30 @@ async fn list_clips(
         max_size_bytes,
         query: normalized_optional(query.q),
         sort: parse_sort(query.sort.as_deref())?,
-        limit: page_size,
+        limit: page_size + 1,
         offset: page.saturating_sub(1).saturating_mul(page_size),
     };
     if matches!((params.from.as_ref(), params.to.as_ref()), (Some(from), Some(to)) if from > to) {
         return Err(ApiError::bad_request("from must be before or equal to to"));
     }
 
-    let clips = state
-        .repositories
-        .clips
-        .list_for_owner(&params)
-        .await?
+    let mut clips = state.repositories.clips.list_for_owner(&params).await?;
+    let has_more = clips.len() as i64 > page_size;
+    clips.truncate(page_size as usize);
+    let stats = state.repositories.clips.stats_for_owner(&params).await?;
+    let display_names = game_display_name_map(&state).await?;
+    let public_base = state.request_public_url(&headers);
+    let clips = clips
         .into_iter()
-        .map(|clip| clip_summary_response(clip, &state))
+        .map(|clip| clip_summary_response(clip, &public_base, &display_names))
         .collect();
 
     Ok(Json(ClipListResponse {
         page,
         page_size,
+        has_more,
+        total: stats.total,
+        total_size_bytes: stats.total_size_bytes,
         clips,
     }))
 }
@@ -184,7 +205,7 @@ async fn get_clip(
     else {
         return Err(ApiError::not_found("clip not found"));
     };
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
 }
 
 async fn update_clip(
@@ -196,6 +217,12 @@ async fn update_clip(
 ) -> Result<Json<ClipDetailResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    validate_update_clip_request(&request)?;
+    if request.game_name.is_some() {
+        return Err(ApiError::bad_request(
+            "game_name cannot be changed after upload",
+        ));
+    }
     let Some(existing) = state
         .repositories
         .clips
@@ -226,7 +253,6 @@ async fn update_clip(
         }
         PatchValue::Missing => existing.description.clone(),
     };
-    let game_name = patch_optional_string(request.game_name, existing.game_name);
     let game_id = patch_optional_string(request.game_id, existing.game_id);
     let game_executable = patch_optional_string(request.game_executable, existing.game_executable);
     let source_type = patch_optional_string(request.source_type, existing.source_type);
@@ -245,7 +271,6 @@ async fn update_clip(
             &existing.id,
             &title,
             description.as_deref(),
-            game_name.as_deref(),
             game_id.as_deref(),
             game_executable.as_deref(),
             source_type.as_deref(),
@@ -270,7 +295,35 @@ async fn update_clip(
         .get_owned_non_deleted(&auth.user.id, &id)
         .await?
         .ok_or_else(|| ApiError::conflict("clip was deleted before the update completed"))?;
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
+}
+
+fn validate_update_clip_request(request: &UpdateClipRequest) -> Result<(), ApiError> {
+    validate_optional_char_count(request.title.as_deref(), "title", MAX_TITLE_LEN)?;
+    if let PatchValue::Present(Value::String(description)) = &request.description {
+        validate_optional_char_count(Some(description), "description", MAX_DESCRIPTION_LEN)?;
+    }
+    for (name, value) in [
+        (
+            "game_name",
+            request.game_name.as_ref().and_then(Option::as_deref),
+        ),
+        (
+            "game_id",
+            request.game_id.as_ref().and_then(Option::as_deref),
+        ),
+        (
+            "game_executable",
+            request.game_executable.as_ref().and_then(Option::as_deref),
+        ),
+        (
+            "source_type",
+            request.source_type.as_ref().and_then(Option::as_deref),
+        ),
+    ] {
+        validate_optional_char_count(value, name, MAX_METADATA_FIELD_LEN)?;
+    }
+    Ok(())
 }
 
 async fn delete_clip(
@@ -278,7 +331,7 @@ async fn delete_clip(
     Extension(client_ip): Extension<ClientIp>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<StatusResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let Some(clip) = state
@@ -301,7 +354,7 @@ async fn delete_clip(
         None,
     )
     .await?;
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(Json(StatusResponse::ok()))
 }
 
 async fn bulk_delete_clips(
@@ -380,7 +433,7 @@ async fn update_visibility(
         .get_owned_ready(&auth.user.id, &id)
         .await?
         .ok_or_else(|| ApiError::conflict("clip was deleted before the update completed"))?;
-    Ok(Json(detail_response(&state, clip).await?))
+    Ok(Json(detail_response(&state, &headers, clip).await?))
 }
 
 async fn bulk_update_visibility(
@@ -428,7 +481,11 @@ async fn bulk_update_visibility(
     }))
 }
 
-async fn detail_response(state: &AppState, clip: Clip) -> Result<ClipDetailResponse, ApiError> {
+async fn detail_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    clip: Clip,
+) -> Result<ClipDetailResponse, ApiError> {
     let markers = state
         .repositories
         .clip_markers
@@ -437,16 +494,34 @@ async fn detail_response(state: &AppState, clip: Clip) -> Result<ClipDetailRespo
         .into_iter()
         .map(clip_marker_response)
         .collect();
-    Ok(clip_detail_response(clip, markers, state))
+    let display_names = game_display_name_map(state).await?;
+    Ok(clip_detail_response(
+        clip,
+        markers,
+        &state.request_public_url(headers),
+        &display_names,
+    ))
 }
 
-fn clip_summary_response(clip: Clip, state: &AppState) -> ClipSummaryResponse {
+fn clip_summary_response(
+    clip: Clip,
+    public_base: &url::Url,
+    display_names: &HashMap<String, crate::ResolvedGameCategory>,
+) -> ClipSummaryResponse {
+    let game_display_name = game_display_name(clip.game_name.as_deref(), display_names);
+    let game_category_id = game_category_id(clip.game_name.as_deref(), display_names);
+    let game_icon_url = game_icon_url(clip.game_name.as_deref(), display_names);
+    let game_video_art_url = game_video_art_url(clip.game_name.as_deref(), display_names);
     ClipSummaryResponse {
         id: clip.id,
         client_clip_id: clip.client_clip_id,
         title: clip.title,
         description: clip.description,
         game_name: clip.game_name,
+        game_category_id,
+        game_display_name,
+        game_icon_url,
+        game_video_art_url,
         game_id: clip.game_id,
         source_type: clip.source_type,
         recorded_at: clip.recorded_at,
@@ -461,7 +536,7 @@ fn clip_summary_response(clip: Clip, state: &AppState) -> ClipSummaryResponse {
         public_url: clip
             .public_share_id
             .as_deref()
-            .and_then(|share_id| public_url(state, share_id)),
+            .and_then(|share_id| public_url(public_base, share_id)),
         view_count: clip.view_count,
         created_at: clip.created_at,
         updated_at: clip.updated_at,
@@ -471,18 +546,27 @@ fn clip_summary_response(clip: Clip, state: &AppState) -> ClipSummaryResponse {
 fn clip_detail_response(
     clip: Clip,
     markers: Vec<ClipMarkerResponse>,
-    state: &AppState,
+    public_base: &url::Url,
+    display_names: &HashMap<String, crate::ResolvedGameCategory>,
 ) -> ClipDetailResponse {
     let public_url = clip
         .public_share_id
         .as_deref()
-        .and_then(|share_id| public_url(state, share_id));
+        .and_then(|share_id| public_url(public_base, share_id));
+    let game_display_name = game_display_name(clip.game_name.as_deref(), display_names);
+    let game_category_id = game_category_id(clip.game_name.as_deref(), display_names);
+    let game_icon_url = game_icon_url(clip.game_name.as_deref(), display_names);
+    let game_video_art_url = game_video_art_url(clip.game_name.as_deref(), display_names);
     ClipDetailResponse {
         id: clip.id,
         client_clip_id: clip.client_clip_id,
         title: clip.title,
         description: clip.description,
         game_name: clip.game_name,
+        game_category_id,
+        game_display_name,
+        game_icon_url,
+        game_video_art_url,
         game_id: clip.game_id,
         game_executable: clip.game_executable,
         source_type: clip.source_type,
@@ -615,12 +699,6 @@ fn validate_list_status(value: String) -> Result<String, ApiError> {
     }
 }
 
-fn normalized_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 fn patch_optional_string(patch: Option<Option<String>>, current: Option<String>) -> Option<String> {
     match patch {
         Some(Some(value)) => normalized_optional(Some(value)),
@@ -648,13 +726,11 @@ fn random_base62_char() -> char {
     }
 }
 
-fn public_url(state: &AppState, share_id: &str) -> Option<String> {
-    state
-        .config
-        .public_url
-        .join(&format!("c/{share_id}"))
-        .ok()
-        .map(|url| url.to_string())
+fn public_url(public_base: &url::Url, share_id: &str) -> Option<String> {
+    Some(crate::config::join_public_path(
+        public_base,
+        &format!("c/{share_id}"),
+    ))
 }
 
 #[cfg(test)]
@@ -809,6 +885,7 @@ mod tests {
                 Query(ListClipsQuery {
                     sort: Some("definitely-not-a-sort".to_string()),
                     game: None,
+                    game_category_id: None,
                     source_type: None,
                     visibility: None,
                     status: None,
@@ -838,6 +915,7 @@ mod tests {
         ready.status = "ready".to_string();
         ready.client_clip_id = Some("local-ready".to_string());
         ready.source_type = Some("replay".to_string());
+        ready.file_size_bytes = Some(200);
         app.state
             .repositories
             .clips
@@ -849,6 +927,7 @@ mod tests {
         processing.status = "processing".to_string();
         processing.client_clip_id = Some("local-processing".to_string());
         processing.source_type = Some("replay".to_string());
+        processing.file_size_bytes = Some(100);
         app.state
             .repositories
             .clips
@@ -899,6 +978,9 @@ mod tests {
 
         assert_eq!(response.page, 1);
         assert_eq!(response.page_size, 100);
+        assert!(!response.has_more);
+        assert_eq!(response.total, 2);
+        assert_eq!(response.total_size_bytes, 300);
         assert_eq!(
             response
                 .clips
@@ -917,6 +999,53 @@ mod tests {
             Some("local-ready")
         );
         assert_eq!(response.clips[1].source_type.as_deref(), Some("replay"));
+    }
+
+    #[tokio::test]
+    async fn clip_public_url_follows_request_host() {
+        let app = test_app().await;
+        let owner = insert_user(&app.state, "owner").await;
+        let mut clip = NewClip::new(&owner.id, "Public clip", "local");
+        clip.status = "ready".to_string();
+        clip.visibility = "public".to_string();
+        clip.public_share_id = Some("c_testhostshareid123456".to_string());
+        let clip = app
+            .state
+            .repositories
+            .clips
+            .create(&clip)
+            .await
+            .expect("clip");
+
+        let headers = auth_headers(&app.state, &owner.id).await;
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .expect("authorization header")
+            .clone();
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/clips/{}", clip.id))
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::HOST, "watch.clipline.cc")
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = routes()
+            .with_state(app.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let detail: ClipDetailResponse = serde_json::from_slice(&body).expect("clip detail");
+        assert_eq!(
+            detail.public_url.as_deref(),
+            Some("https://watch.clipline.cc/c/c_testhostshareid123456")
+        );
     }
 
     async fn test_app() -> TestApp {
@@ -939,6 +1068,8 @@ mod tests {
             repositories,
             storage,
             auth,
+            game_category_map_cache: Arc::default(),
+            readiness: crate::health::ReadinessCache::default(),
         };
         TestApp {
             state,

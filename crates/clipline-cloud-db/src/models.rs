@@ -79,6 +79,7 @@ pub struct AppSettings {
     pub smtp_password: Option<String>,
     pub smtp_from_email: Option<String>,
     pub smtp_from_name: Option<String>,
+    pub user_storage_quota_bytes: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -285,10 +286,104 @@ impl NewClip {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct GameCategory {
+    pub id: String,
+    pub display_name: String,
+    pub steamgriddb_game_id: Option<i64>,
+    pub artwork_kind: Option<String>,
+    pub artwork_id: Option<i64>,
+    pub artwork_url: Option<String>,
+    pub artwork_thumb_url: Option<String>,
+    pub video_artwork_id: Option<i64>,
+    pub video_artwork_url: Option<String>,
+    pub video_artwork_thumb_url: Option<String>,
+    pub icon_artwork_id: Option<i64>,
+    pub icon_artwork_url: Option<String>,
+    pub icon_artwork_thumb_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewGameCategory {
+    pub id: String,
+    pub display_name: String,
+    pub steamgriddb_game_id: Option<i64>,
+    pub artwork_kind: Option<String>,
+    pub artwork_id: Option<i64>,
+    pub artwork_url: Option<String>,
+    pub artwork_thumb_url: Option<String>,
+    pub video_artwork_id: Option<i64>,
+    pub video_artwork_url: Option<String>,
+    pub video_artwork_thumb_url: Option<String>,
+    pub icon_artwork_id: Option<i64>,
+    pub icon_artwork_url: Option<String>,
+    pub icon_artwork_thumb_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl NewGameCategory {
+    pub fn new(display_name: impl Into<String>) -> Self {
+        let now = now_utc();
+        let display_name = display_name.into().chars().take(200).collect();
+        Self {
+            id: new_ulid(),
+            display_name,
+            steamgriddb_game_id: None,
+            artwork_kind: None,
+            artwork_id: None,
+            artwork_url: None,
+            artwork_thumb_url: None,
+            video_artwork_id: None,
+            video_artwork_url: None,
+            video_artwork_thumb_url: None,
+            icon_artwork_id: None,
+            icon_artwork_url: None,
+            icon_artwork_thumb_url: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct GameCategoryName {
+    pub id: String,
+    pub category_id: String,
+    pub reported_name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewGameCategoryName {
+    pub id: String,
+    pub category_id: String,
+    pub reported_name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl NewGameCategoryName {
+    pub fn new(category_id: impl Into<String>, reported_name: impl Into<String>) -> Self {
+        let now = now_utc();
+        Self {
+            id: new_ulid(),
+            category_id: category_id.into(),
+            reported_name: reported_name.into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
 pub struct ClipComment {
     pub id: String,
     pub clip_id: String,
+    pub parent_comment_id: Option<String>,
     pub user_id: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
@@ -300,6 +395,7 @@ pub struct ClipComment {
 pub struct NewClipComment {
     pub id: String,
     pub clip_id: String,
+    pub parent_comment_id: Option<String>,
     pub user_id: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
@@ -317,6 +413,7 @@ impl NewClipComment {
         Self {
             id: new_ulid(),
             clip_id: clip_id.into(),
+            parent_comment_id: None,
             user_id: user_id.into(),
             body: body.into(),
             created_at: now,
@@ -585,10 +682,12 @@ impl NewResetPasswordToken {
 pub struct InvitationToken {
     pub id: String,
     pub token_hash: String,
+    pub claim_token_hash: Option<String>,
     pub role: String,
     pub created_by_user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
     pub used_at: Option<DateTime<Utc>>,
 }
 
@@ -596,10 +695,12 @@ pub struct InvitationToken {
 pub struct NewInvitationToken {
     pub id: String,
     pub token_hash: String,
+    pub claim_token_hash: Option<String>,
     pub role: String,
     pub created_by_user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
     pub used_at: Option<DateTime<Utc>>,
 }
 
@@ -612,10 +713,12 @@ impl NewInvitationToken {
         Self {
             id: new_ulid(),
             token_hash: token_hash.into(),
+            claim_token_hash: None,
             role: role.into(),
             created_by_user_id: None,
             created_at: now_utc(),
             expires_at,
+            claimed_at: None,
             used_at: None,
         }
     }

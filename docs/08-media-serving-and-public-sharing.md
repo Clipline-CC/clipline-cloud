@@ -45,6 +45,10 @@ GET /api/v1/clips/{id}/poster
 GET /api/v1/public/clips/{share_id}
 GET /api/v1/public/clips/{share_id}/media
 GET /api/v1/public/clips/{share_id}/thumbnail
+
+# Public game discovery
+GET /api/v1/public/games
+GET /api/v1/public/game-categories/{category_id}/artwork
 ```
 
 > Thumbnails/posters are generated in Phase 2 (doc 12); in Phase 1 these endpoints return placeholders.
@@ -59,6 +63,9 @@ Each clip has a `visibility` and, when shared, a `public_share_id`.
   metadata, no edit/delete controls.**
 - Public clips appear in the anonymous public library; unlisted clips remain link-only and never
   appear in discovery views.
+- Public game discovery aggregates by canonical category. Its opaque category ID can be supplied
+  as `game_category_id` to the public clip list, including every raw reported name attached through
+  an administrator merge.
 - Reverting to private makes the public page return **404 (not 403)** for anonymous users — 403 would
   confirm the clip exists.
 - Public links are **stable until revoked**; expiring links are a future feature.
@@ -79,7 +86,8 @@ presigned URL already handed out **stays valid until its TTL expires.** Keep tha
 through the backend proxy instead of presigned URLs.
 
 For browser `<video>` playback against a cross-origin S3 host, the bucket needs **CORS** allowing
-`GET`/`HEAD` and the `Range` request header from the public origin, and the presigned response
+`GET`/`HEAD` and the `Range` request header from every origin browsers will use to open the app
+(`CLIPLINE_PUBLIC_URL` and any other public hostnames), and the presigned response
 should carry `Content-Type: video/mp4`, `Accept-Ranges: bytes`, and cache headers. Same-origin
 backend-proxied media avoids the CORS surface entirely.
 
@@ -95,7 +103,7 @@ Minimal S3 bucket CORS for presigned cross-origin playback:
 ```json
 [
   {
-    "AllowedOrigins": ["https://clips.example.com"],
+    "AllowedOrigins": ["https://clips.example.com", "https://watch.example.com"],
     "AllowedMethods": ["GET", "HEAD"],
     "AllowedHeaders": ["Range"],
     "ExposeHeaders": ["Accept-Ranges", "Content-Range", "Content-Length", "Content-Type", "ETag"],
@@ -135,3 +143,5 @@ Minimal S3 bucket CORS for presigned cross-origin playback:
   S3 presigned public media redirects, and configurable public media mode/TTL. Verified local
   playback and MinIO-backed S3 playback with HTTP smokes, including public revocation returning
   anonymous `404`.
+- 2026-07-15 — Public game tiles, clip payloads, artwork, and filters now use canonical category
+  IDs while retaining raw reported names as immutable clip metadata.

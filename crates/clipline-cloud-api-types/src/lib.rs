@@ -3,6 +3,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: &'static str,
 }
@@ -12,6 +17,33 @@ pub struct ReadinessResponse {
     pub status: &'static str,
     pub database: &'static str,
     pub storage: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub status: &'static str,
+}
+
+impl StatusResponse {
+    pub const fn ok() -> Self {
+        Self { status: "ok" }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangePasswordResponse {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub csrf_token: Option<String>,
+}
+
+impl ChangePasswordResponse {
+    pub const fn ok(csrf_token: Option<String>) -> Self {
+        Self {
+            status: "ok",
+            csrf_token,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +302,8 @@ pub struct ListClipsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_category_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,
@@ -299,6 +333,12 @@ pub struct ListClipsRequest {
 pub struct ClipListResponse {
     pub page: i64,
     pub page_size: i64,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub total_size_bytes: i64,
     pub clips: Vec<ClipSummaryResponse>,
 }
 
@@ -310,6 +350,14 @@ pub struct ClipSummaryResponse {
     pub title: String,
     pub description: Option<String>,
     pub game_name: Option<String>,
+    #[serde(default)]
+    pub game_category_id: Option<String>,
+    #[serde(default)]
+    pub game_display_name: Option<String>,
+    #[serde(default)]
+    pub game_icon_url: Option<String>,
+    #[serde(default)]
+    pub game_video_art_url: Option<String>,
     pub game_id: Option<String>,
     #[serde(default)]
     pub source_type: Option<String>,
@@ -336,6 +384,14 @@ pub struct ClipDetailResponse {
     pub title: String,
     pub description: Option<String>,
     pub game_name: Option<String>,
+    #[serde(default)]
+    pub game_category_id: Option<String>,
+    #[serde(default)]
+    pub game_display_name: Option<String>,
+    #[serde(default)]
+    pub game_icon_url: Option<String>,
+    #[serde(default)]
+    pub game_video_art_url: Option<String>,
     pub game_id: Option<String>,
     pub game_executable: Option<String>,
     pub source_type: Option<String>,

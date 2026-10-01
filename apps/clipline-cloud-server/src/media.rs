@@ -13,9 +13,12 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use clipline_cloud_db::{Clip, ClipComment, ClipSort, NewClipComment, PublicClipListParams, User};
+use clipline_cloud_db::{
+    Clip, ClipComment, ClipSort, GameCategory, NewClipComment, PublicClipListParams, User,
+};
 use clipline_cloud_storage::{
-    ByteRange, ContentRange, ObjectKey, ObjectMetadata, StorageError, StoredObjectStream,
+    ByteRange, ContentRange, ObjectKey, ObjectMetadata, PutObjectMetadata, StorageError,
+    StoredObjectStream,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
@@ -23,9 +26,9 @@ use tracing::warn;
 use url::Url;
 
 use crate::{
-    auth::{self, ApiError},
-    config::PublicMediaMode,
-    AppState, ClientIp,
+    auth, config::PublicMediaMode, error::ApiError, game_display_name, game_display_name_map,
+    game_icon_url, game_video_art_url, steamgriddb, validation::normalized_optional, AppState,
+    ClientIp,
 };
 
 const COPY_NOTICE: &str =
@@ -55,6 +58,14 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/clips/{id}/poster", get(get_owned_poster))
         .route("/api/v1/public/clips", get(list_public_clips))
         .route("/api/v1/public/games", get(list_public_games))
+        .route(
+            "/api/v1/public/game-categories/{id}/artwork",
+            get(get_public_game_category_grid_artwork),
+        )
+        .route(
+            "/api/v1/public/game-categories/{id}/artwork/{slot}",
+            get(get_public_game_category_artwork),
+        )
         .route("/api/v1/public/users/{username}", get(get_public_user))
         .route(
             "/api/v1/public/users/{username}/avatar",
@@ -85,12 +96,17 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/public/clips/{share_id}/thumbnail",
             get(get_public_thumbnail),
         )
+        .route(
+            "/api/v1/public/clips/{share_id}/poster",
+            get(get_public_poster),
+        )
 }
 
 #[derive(Debug, Deserialize)]
 struct PublicClipListQuery {
     sort: Option<String>,
     game: Option<String>,
+    game_category_id: Option<String>,
     q: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
@@ -122,7 +138,9 @@ struct PublicGameListResponse {
 
 #[derive(Debug, Serialize)]
 struct PublicGameResponse {
-    game: String,
+    category_id: String,
+    display_name: String,
+    thumbnail_url: Option<String>,
     clip_count: i64,
 }
 
@@ -135,6 +153,10 @@ struct PublicClipSummaryResponse {
     author_username: Option<String>,
     author_avatar_url: Option<String>,
     game_name: Option<String>,
+    game_category_id: Option<String>,
+    game_display_name: Option<String>,
+    game_icon_url: Option<String>,
+    game_video_art_url: Option<String>,
     game_id: Option<String>,
     recorded_at: Option<DateTime<Utc>>,
     uploaded_at: Option<DateTime<Utc>>,
@@ -155,6 +177,10 @@ struct PublicClipResponse {
     viewer_can_edit: bool,
     viewer_clip_id: Option<String>,
     game_name: Option<String>,
+    game_category_id: Option<String>,
+    game_display_name: Option<String>,
+    game_icon_url: Option<String>,
+    game_video_art_url: Option<String>,
     game_id: Option<String>,
     recorded_at: Option<DateTime<Utc>>,
     uploaded_at: Option<DateTime<Utc>>,
@@ -162,6 +188,7 @@ struct PublicClipResponse {
     view_count: i64,
     media_url: String,
     thumbnail_url: String,
+    poster_url: String,
     share_url: String,
     copy_notice: &'static str,
 }
@@ -184,6 +211,7 @@ struct PublicCommentListResponse {
 #[derive(Debug, Serialize)]
 struct PublicCommentResponse {
     id: String,
+    parent_comment_id: Option<String>,
     body: String,
     author_name: String,
     author_username: Option<String>,
@@ -197,6 +225,7 @@ struct PublicCommentResponse {
 #[derive(Debug, Deserialize)]
 struct CreatePublicCommentRequest {
     body: String,
+    parent_comment_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,20 +248,22 @@ enum CacheScope {
 
 async fn get_public_share_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(share_id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let public_base = state.request_public_url(&headers);
     let Some(clip) = state
         .repositories
         .clips
         .get_by_public_share_id(&share_id)
         .await?
     else {
-        return Ok(public_share_unavailable_response(&state, &share_id));
+        return Ok(public_share_unavailable_response(&public_base, &share_id));
     };
 
-    let author_name = public_clip_author_name(&state, &clip).await?;
+    let author_name = public_clip_author_name(&state, &clip, &public_base).await?;
     Ok(public_share_page_response(
-        &state,
+        &public_base,
         &share_id,
         &clip,
         &author_name,
@@ -241,6 +272,7 @@ async fn get_public_share_page(
 
 async fn list_public_clips(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<PublicClipListQuery>,
 ) -> Result<Json<PublicClipListResponse>, ApiError> {
     let page = query.page.unwrap_or(DEFAULT_PUBLIC_PAGE).max(1);
@@ -249,9 +281,17 @@ async fn list_public_clips(
         .unwrap_or(DEFAULT_PUBLIC_PAGE_SIZE)
         .clamp(1, MAX_PUBLIC_PAGE_SIZE);
     let offset = public_page_offset(page, page_size)?;
+    let game = normalized_optional(query.game);
+    let game_category_id = normalized_optional(query.game_category_id);
+    if game.is_some() && game_category_id.is_some() {
+        return Err(ApiError::bad_request(
+            "game and game_category_id cannot be combined",
+        ));
+    }
     let params = PublicClipListParams {
         owner_user_id: None,
-        game: normalized_optional(query.game),
+        game,
+        game_category_id,
         query: normalized_optional(query.q),
         sort: parse_public_sort(query.sort.as_deref())?,
         limit: page_size + 1,
@@ -259,11 +299,19 @@ async fn list_public_clips(
     };
     let clips = state.repositories.clips.list_public(&params).await?;
     let has_more = clips.len() as i64 > page_size;
+    let public_base = state.request_public_url(&headers);
+    let authors = public_authors_for_clips(&state, &clips, &public_base).await?;
+    let display_names = game_display_name_map(&state).await?;
     let mut public_clips = Vec::with_capacity(clips.len());
     for clip in clips.into_iter().take(page_size as usize) {
         if clip.public_share_id.is_some() {
-            let author = public_clip_author(&state, &clip).await?;
-            if let Some(response) = public_clip_summary_response(&state, clip, author) {
+            let author = authors
+                .get(&clip.owner_user_id)
+                .cloned()
+                .unwrap_or_else(|| public_author_from_user(&public_base, None));
+            if let Some(response) =
+                public_clip_summary_response(&public_base, clip, author, &display_names)
+            {
                 public_clips.push(response);
             }
         }
@@ -279,6 +327,7 @@ async fn list_public_clips(
 
 async fn list_public_recommendations(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<PublicRecommendationQuery>,
 ) -> Result<Json<PublicRecommendationResponse>, ApiError> {
     let limit = query
@@ -293,6 +342,7 @@ async fn list_public_recommendations(
     let params = PublicClipListParams {
         owner_user_id: None,
         game: None,
+        game_category_id: None,
         query: None,
         sort: ClipSort::UploadedAtDesc,
         limit: RECOMMENDATION_CANDIDATE_LIMIT.max(limit),
@@ -300,11 +350,19 @@ async fn list_public_recommendations(
     };
     let candidates = state.repositories.clips.list_public(&params).await?;
     let clips = recommend_public_clips(candidates, source.as_ref(), limit as usize);
+    let public_base = state.request_public_url(&headers);
+    let authors = public_authors_for_clips(&state, &clips, &public_base).await?;
+    let display_names = game_display_name_map(&state).await?;
 
     let mut public_clips = Vec::with_capacity(clips.len());
     for clip in clips {
-        let author = public_clip_author(&state, &clip).await?;
-        if let Some(response) = public_clip_summary_response(&state, clip, author) {
+        let author = authors
+            .get(&clip.owner_user_id)
+            .cloned()
+            .unwrap_or_else(|| public_author_from_user(&public_base, None));
+        if let Some(response) =
+            public_clip_summary_response(&public_base, clip, author, &display_names)
+        {
             public_clips.push(response);
         }
     }
@@ -317,22 +375,213 @@ async fn list_public_recommendations(
 async fn list_public_games(
     State(state): State<AppState>,
 ) -> Result<Json<PublicGameListResponse>, ApiError> {
+    let categories = state
+        .repositories
+        .game_categories
+        .list()
+        .await?
+        .into_iter()
+        .map(|category| (category.id.clone(), category))
+        .collect::<HashMap<_, _>>();
     let games = state
         .repositories
         .clips
         .list_public_games()
         .await?
         .into_iter()
-        .map(|game| PublicGameResponse {
-            game: game.game,
-            clip_count: game.clip_count,
+        .map(|game| {
+            let category = categories.get(&game.category_id);
+            PublicGameResponse {
+                display_name: game.display_name,
+                thumbnail_url: category.and_then(|category| {
+                    category
+                        .artwork_thumb_url
+                        .as_ref()
+                        .zip(category.artwork_id)
+                        .map(|(_, artwork_id)| {
+                            format!(
+                                "/api/v1/public/game-categories/{}/artwork/grid?v={artwork_id}",
+                                category.id
+                            )
+                        })
+                }),
+                category_id: game.category_id,
+                clip_count: game.clip_count,
+            }
         })
         .collect();
     Ok(Json(PublicGameListResponse { games }))
 }
 
+async fn get_public_game_category_grid_artwork(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    serve_public_game_category_artwork(&state, &id, "grid").await
+}
+
+async fn get_public_game_category_artwork(
+    State(state): State<AppState>,
+    Path((id, slot)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    serve_public_game_category_artwork(&state, &id, &slot).await
+}
+
+async fn serve_public_game_category_artwork(
+    state: &AppState,
+    id: &str,
+    slot: &str,
+) -> Result<Response, ApiError> {
+    let category = state
+        .repositories
+        .game_categories
+        .get(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("game category artwork not found"))?;
+    let (artwork_id, url) = match slot {
+        "grid" => category.artwork_id.zip(category.artwork_url.as_deref()),
+        "video" => category
+            .video_artwork_id
+            .zip(category.video_artwork_url.as_deref()),
+        "icon" => category
+            .icon_artwork_id
+            .zip(category.icon_artwork_url.as_deref()),
+        _ => return Err(ApiError::not_found("game category artwork not found")),
+    }
+    .ok_or_else(|| ApiError::not_found("game category artwork not found"))?;
+    let image = load_cached_game_category_artwork(state, id, slot, artwork_id, url).await?;
+    let content_type = HeaderValue::from_str(&image.content_type)
+        .map_err(|_| ApiError::bad_gateway("SteamGridDB returned an invalid content type"))?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(image.bytes))
+        .map_err(|_| ApiError::internal("game category artwork response could not be created"))
+}
+
+pub(crate) async fn cache_game_category_artwork(state: &AppState, category: &GameCategory) {
+    let (grid, video, icon) = tokio::join!(
+        cache_game_category_artwork_slot(
+            state,
+            &category.id,
+            "grid",
+            category.artwork_id,
+            category.artwork_url.as_deref(),
+        ),
+        cache_game_category_artwork_slot(
+            state,
+            &category.id,
+            "video",
+            category.video_artwork_id,
+            category.video_artwork_url.as_deref(),
+        ),
+        cache_game_category_artwork_slot(
+            state,
+            &category.id,
+            "icon",
+            category.icon_artwork_id,
+            category.icon_artwork_url.as_deref(),
+        ),
+    );
+    for (slot, result) in [("grid", grid), ("video", video), ("icon", icon)] {
+        if let Err(error) = result {
+            warn!(
+                event = "game_category.artwork_cache_failed",
+                category_id = %category.id,
+                slot,
+                status = %error.status(),
+                error = error.message()
+            );
+        }
+    }
+}
+
+pub(crate) async fn warm_game_category_artwork_cache(state: &AppState) {
+    let categories = match state.repositories.game_categories.list().await {
+        Ok(categories) => categories,
+        Err(error) => {
+            warn!(event = "game_category.artwork_cache_warm_failed", error = %error);
+            return;
+        }
+    };
+    for category in categories {
+        cache_game_category_artwork(state, &category).await;
+    }
+}
+
+async fn cache_game_category_artwork_slot(
+    state: &AppState,
+    category_id: &str,
+    slot: &str,
+    artwork_id: Option<i64>,
+    url: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some((artwork_id, url)) = artwork_id.zip(url) else {
+        return Ok(());
+    };
+    load_cached_game_category_artwork(state, category_id, slot, artwork_id, url)
+        .await
+        .map(|_| ())
+}
+
+async fn load_cached_game_category_artwork(
+    state: &AppState,
+    category_id: &str,
+    slot: &str,
+    artwork_id: i64,
+    url: &str,
+) -> Result<steamgriddb::ImageAsset, ApiError> {
+    let key = game_category_artwork_key(category_id, slot, artwork_id)?;
+    match state.storage.get_object(&key, None).await {
+        Ok(object) => {
+            return Ok(steamgriddb::ImageAsset {
+                bytes: object.bytes,
+                content_type: object.metadata.content_type,
+            });
+        }
+        Err(StorageError::NotFound(_)) => {}
+        Err(error) => warn!(
+            event = "game_category.artwork_cache_read_failed",
+            category_id,
+            slot,
+            error = %error
+        ),
+    }
+
+    let image = steamgriddb::fetch_image(url).await?;
+    if let Err(error) = state
+        .storage
+        .put_object(
+            &key,
+            image.bytes.clone(),
+            PutObjectMetadata::new(&image.content_type),
+        )
+        .await
+    {
+        warn!(
+            event = "game_category.artwork_cache_write_failed",
+            category_id,
+            slot,
+            error = %error
+        );
+    }
+    Ok(image)
+}
+
+fn game_category_artwork_key(
+    category_id: &str,
+    slot: &str,
+    artwork_id: i64,
+) -> Result<ObjectKey, ApiError> {
+    ObjectKey::parse(format!(
+        "objects/game-categories/{category_id}/{slot}/{artwork_id}"
+    ))
+    .map_err(|_| ApiError::internal("game category artwork cache key is invalid"))
+}
+
 async fn get_public_user(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(username): Path<String>,
 ) -> Result<Json<PublicUserProfileResponse>, ApiError> {
     let Some(user) = state.repositories.users.get_by_username(&username).await? else {
@@ -344,6 +593,7 @@ async fn get_public_user(
     let params = PublicClipListParams {
         owner_user_id: Some(user.id.clone()),
         game: None,
+        game_category_id: None,
         query: None,
         sort: ClipSort::UploadedAtDesc,
         limit: PUBLIC_PROFILE_CLIP_LIMIT,
@@ -355,10 +605,14 @@ async fn get_public_user(
         .clips
         .count_public_for_owner(&user.id)
         .await?;
-    let author = public_author_from_user(&state, Some(&user));
+    let public_base = state.request_public_url(&headers);
+    let author = public_author_from_user(&public_base, Some(&user));
+    let display_names = game_display_name_map(&state).await?;
     let public_clips = clips
         .into_iter()
-        .filter_map(|clip| public_clip_summary_response(&state, clip, author.clone()))
+        .filter_map(|clip| {
+            public_clip_summary_response(&public_base, clip, author.clone(), &display_names)
+        })
         .collect::<Vec<_>>();
 
     Ok(Json(PublicUserProfileResponse {
@@ -435,6 +689,7 @@ async fn get_owned_thumbnail(
         &headers,
         &clip,
         clip.thumbnail_key.as_deref(),
+        None,
         CacheScope::Owner,
     )
     .await
@@ -447,11 +702,15 @@ async fn get_owned_poster(
 ) -> Result<Response, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     let clip = ensure_owned_ready_clip(&state, &auth.user.id, &id).await?;
+    // poster_key is assigned at upload creation but the poster object is only
+    // written by a post-ready job, so fall back per object (not per key) to the
+    // thumbnail when the poster is still pending, failed, or predates posters.
     serve_clip_image_or_placeholder(
         &state,
         &headers,
         &clip,
         clip.poster_key.as_deref(),
+        clip.thumbnail_key.as_deref(),
         CacheScope::Owner,
     )
     .await
@@ -468,7 +727,13 @@ async fn get_public_clip(
         .as_ref()
         .is_some_and(|auth| auth.user.id == clip.owner_user_id);
     let viewer_clip_id = viewer_can_edit.then(|| clip.id.clone());
-    let author = public_clip_author(&state, &clip).await?;
+    let public_base = state.request_public_url(&headers);
+    let author = public_clip_author(&state, &clip, &public_base).await?;
+    let display_names = game_display_name_map(&state).await?;
+    let game_display_name = game_display_name(clip.game_name.as_deref(), &display_names);
+    let game_category_id = crate::game_category_id(clip.game_name.as_deref(), &display_names);
+    let game_icon_url = game_icon_url(clip.game_name.as_deref(), &display_names);
+    let game_video_art_url = game_video_art_url(clip.game_name.as_deref(), &display_names);
     Ok(Json(PublicClipResponse {
         share_id: share_id.clone(),
         title: clip.title,
@@ -479,14 +744,28 @@ async fn get_public_clip(
         viewer_can_edit,
         viewer_clip_id,
         game_name: clip.game_name,
+        game_category_id,
+        game_display_name,
+        game_icon_url,
+        game_video_art_url,
         game_id: clip.game_id,
         recorded_at: clip.recorded_at,
         uploaded_at: clip.uploaded_at,
         duration_ms: clip.duration_ms,
         view_count: clip.view_count,
-        media_url: absolute_url(&state, &format!("api/v1/public/clips/{share_id}/media")),
-        thumbnail_url: absolute_url(&state, &format!("api/v1/public/clips/{share_id}/thumbnail")),
-        share_url: absolute_url(&state, &format!("c/{share_id}")),
+        media_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/media"),
+        ),
+        thumbnail_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/thumbnail"),
+        ),
+        poster_url: absolute_url(
+            &public_base,
+            &format!("api/v1/public/clips/{share_id}/poster"),
+        ),
+        share_url: absolute_url(&public_base, &format!("c/{share_id}")),
         copy_notice: COPY_NOTICE,
     }))
 }
@@ -503,9 +782,29 @@ async fn list_public_comments(
         .clip_comments
         .list_for_clip(&clip.id, PUBLIC_COMMENT_LIMIT)
         .await?;
+    let users = public_users_by_id(
+        &state,
+        comments
+            .iter()
+            .map(|comment| comment.user_id.clone())
+            .collect(),
+    )
+    .await?;
+    let viewer_is_owner = match auth.as_ref() {
+        Some(viewer) => auth::user_is_owner(&state, &viewer.user).await?,
+        None => false,
+    };
+    let public_base = state.request_public_url(&headers);
     let mut responses = Vec::with_capacity(comments.len());
     for comment in comments {
-        responses.push(public_comment_response(&state, &clip, comment, auth.as_ref()).await?);
+        responses.push(public_comment_response_with_context(
+            &public_base,
+            &clip,
+            comment,
+            auth.as_ref(),
+            viewer_is_owner,
+            &users,
+        ));
     }
     Ok(Json(PublicCommentListResponse {
         comments: responses,
@@ -523,10 +822,31 @@ async fn create_public_comment(
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let clip = load_public_clip(&state, &share_id).await?;
     let body = normalize_comment_body(request.body)?;
+    let parent_comment_id = normalize_parent_comment_id(request.parent_comment_id);
+    if let Some(parent_comment_id) = parent_comment_id.as_deref() {
+        let Some(parent) = state
+            .repositories
+            .clip_comments
+            .get(parent_comment_id)
+            .await?
+        else {
+            return Err(ApiError::not_found("parent comment not found"));
+        };
+        if parent.deleted_at.is_some() || parent.clip_id != clip.id {
+            return Err(ApiError::not_found("parent comment not found"));
+        }
+        if parent.parent_comment_id.is_some() {
+            return Err(ApiError::bad_request(
+                "replies can only target top-level comments",
+            ));
+        }
+    }
+    let mut new_comment = NewClipComment::new(&clip.id, &auth.user.id, body);
+    new_comment.parent_comment_id = parent_comment_id.clone();
     let comment = state
         .repositories
         .clip_comments
-        .create(&NewClipComment::new(&clip.id, &auth.user.id, body))
+        .create(&new_comment)
         .await?;
     auth::audit_with_ip(
         &state.repositories,
@@ -535,11 +855,18 @@ async fn create_public_comment(
         "clip.comment.created",
         Some("clip"),
         Some(&clip.id),
-        None,
+        Some(serde_json::json!({ "parent_comment_id": parent_comment_id })),
     )
     .await?;
     Ok(Json(
-        public_comment_response(&state, &clip, comment, Some(&auth)).await?,
+        public_comment_response(
+            &state,
+            &clip,
+            comment,
+            Some(&auth),
+            &state.request_public_url(&headers),
+        )
+        .await?,
     ))
 }
 
@@ -558,7 +885,7 @@ async fn delete_public_comment(
     if comment.deleted_at.is_some() || comment.clip_id != clip.id {
         return Err(ApiError::not_found("comment not found"));
     }
-    if !viewer_can_delete_comment(&state, &auth.user, &clip).await? {
+    if !viewer_can_delete_comment(&state, &auth.user, &clip, Some(&comment)).await? {
         return Err(ApiError::forbidden("comment delete is not allowed"));
     }
 
@@ -625,14 +952,22 @@ fn public_view_allowed(client_ip: &str, clip_id: &str) -> bool {
 }
 
 fn public_clip_summary_response(
-    state: &AppState,
+    public_base: &Url,
     clip: Clip,
     author: PublicAuthor,
+    display_names: &HashMap<String, crate::ResolvedGameCategory>,
 ) -> Option<PublicClipSummaryResponse> {
     let share_id = clip.public_share_id?;
+    let game_display_name = game_display_name(clip.game_name.as_deref(), display_names);
+    let game_category_id = crate::game_category_id(clip.game_name.as_deref(), display_names);
+    let game_icon_url = game_icon_url(clip.game_name.as_deref(), display_names);
+    let game_video_art_url = game_video_art_url(clip.game_name.as_deref(), display_names);
     Some(PublicClipSummaryResponse {
-        thumbnail_url: absolute_url(state, &format!("api/v1/public/clips/{share_id}/thumbnail")),
-        share_url: absolute_url(state, &format!("c/{share_id}")),
+        thumbnail_url: absolute_url(
+            public_base,
+            &format!("api/v1/public/clips/{share_id}/thumbnail"),
+        ),
+        share_url: absolute_url(public_base, &format!("c/{share_id}")),
         share_id,
         title: clip.title,
         description: clip.description,
@@ -640,6 +975,10 @@ fn public_clip_summary_response(
         author_username: author.username,
         author_avatar_url: author.avatar_url,
         game_name: clip.game_name,
+        game_category_id,
+        game_display_name,
+        game_icon_url,
+        game_video_art_url,
         game_id: clip.game_id,
         recorded_at: clip.recorded_at,
         uploaded_at: clip.uploaded_at,
@@ -685,6 +1024,26 @@ async fn get_public_thumbnail(
         &state,
         &headers,
         &clip,
+        clip.thumbnail_key.as_deref(),
+        None,
+        CacheScope::Public,
+    )
+    .await
+}
+
+async fn get_public_poster(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let clip = load_public_clip(&state, &share_id).await?;
+    // Same object-level thumbnail fallback as get_owned_poster: og:image and
+    // the watch player point here unconditionally.
+    serve_clip_image_or_placeholder(
+        &state,
+        &headers,
+        &clip,
+        clip.poster_key.as_deref(),
         clip.thumbnail_key.as_deref(),
         CacheScope::Public,
     )
@@ -754,22 +1113,42 @@ async fn serve_clip_image_or_placeholder(
     state: &AppState,
     headers: &HeaderMap,
     clip: &Clip,
-    storage_key: Option<&str>,
+    primary_key: Option<&str>,
+    fallback_key: Option<&str>,
     scope: CacheScope,
 ) -> Result<Response, ApiError> {
-    let Some(storage_key) = storage_key else {
-        return Ok(placeholder_response(headers));
-    };
+    if let Some(storage_key) = primary_key {
+        if let Some(response) = try_serve_clip_image(state, headers, clip, storage_key, scope).await
+        {
+            return Ok(response);
+        }
+    }
+    if let Some(storage_key) = fallback_key {
+        if let Some(response) = try_serve_clip_image(state, headers, clip, storage_key, scope).await
+        {
+            return Ok(response);
+        }
+    }
+    Ok(placeholder_response(headers))
+}
+
+async fn try_serve_clip_image(
+    state: &AppState,
+    headers: &HeaderMap,
+    clip: &Clip,
+    storage_key: &str,
+    scope: CacheScope,
+) -> Option<Response> {
     let key = match ObjectKey::parse(storage_key) {
         Ok(key) => key,
         Err(error) => {
             warn!(event = "media.invalid_artifact_key", clip_id = %clip.id, error = %error);
-            return Ok(placeholder_response(headers));
+            return None;
         }
     };
     let metadata = match state.storage.head_object(&key).await {
         Ok(metadata) => metadata,
-        Err(StorageError::NotFound(_)) => return Ok(placeholder_response(headers)),
+        Err(StorageError::NotFound(_)) => return None,
         Err(error) => {
             warn!(
                 event = "media.artifact_head_failed",
@@ -777,16 +1156,16 @@ async fn serve_clip_image_or_placeholder(
                 key = %key,
                 error = %error
             );
-            return Ok(placeholder_response(headers));
+            return None;
         }
     };
     if etag_matches(headers, metadata.etag.as_deref()) {
-        return Ok(not_modified_response(&metadata, scope));
+        return Some(not_modified_response(&metadata, scope));
     }
 
     match state.storage.get_object_stream(&key, None).await {
-        Ok(object) => Ok(media_response(object, scope)),
-        Err(StorageError::NotFound(_)) => Ok(placeholder_response(headers)),
+        Ok(object) => Some(media_response(object, scope)),
+        Err(StorageError::NotFound(_)) => None,
         Err(error) => {
             warn!(
                 event = "media.artifact_get_failed",
@@ -794,7 +1173,7 @@ async fn serve_clip_image_or_placeholder(
                 key = %key,
                 error = %error
             );
-            Ok(placeholder_response(headers))
+            None
         }
     }
 }
@@ -1026,46 +1405,71 @@ fn insert_header_str(headers: &mut HeaderMap, name: HeaderName, value: impl AsRe
 }
 
 fn public_share_page_response(
-    state: &AppState,
+    public_base: &Url,
     share_id: &str,
     clip: &Clip,
     author_name: &str,
 ) -> Response {
     let title = public_share_title(clip);
     let description = public_share_description(clip, Some(author_name));
-    let share_url = absolute_url(state, &format!("c/{share_id}"));
-    let media_url = absolute_url(state, &format!("api/v1/public/clips/{share_id}/media"));
-    let thumbnail_url = absolute_url(state, &format!("api/v1/public/clips/{share_id}/thumbnail"));
-    let width = clip.width.unwrap_or(1280).max(1);
-    let height = clip.height.unwrap_or(720).max(1);
+    let share_url = absolute_url(public_base, &format!("c/{share_id}"));
+    let media_url = absolute_url(
+        public_base,
+        &format!("api/v1/public/clips/{share_id}/media"),
+    );
+    let poster_url = absolute_url(
+        public_base,
+        &format!("api/v1/public/clips/{share_id}/poster"),
+    );
+    let (image_width, image_height) = public_embed_image_dimensions(clip);
     let html = public_share_html(PublicShareHtml {
         title: &title,
         description: &description,
         share_url: &share_url,
         media_url: &media_url,
-        thumbnail_url: &thumbnail_url,
-        width,
-        height,
+        image_url: &poster_url,
+        image_width,
+        image_height,
+        video_width: clip.width.unwrap_or(1280).max(1),
+        video_height: clip.height.unwrap_or(720).max(1),
         status_message: "Loading public clip...",
     });
     html_response(StatusCode::OK, html)
 }
 
-fn public_share_unavailable_response(state: &AppState, share_id: &str) -> Response {
+fn public_share_unavailable_response(public_base: &Url, share_id: &str) -> Response {
     let title = "Clip unavailable";
     let description = "This Clipline public link is no longer active.";
-    let share_url = absolute_url(state, &format!("c/{share_id}"));
+    let share_url = absolute_url(public_base, &format!("c/{share_id}"));
     let html = public_share_html(PublicShareHtml {
         title,
         description,
         share_url: &share_url,
         media_url: "",
-        thumbnail_url: "",
-        width: 1280,
-        height: 720,
+        image_url: "",
+        image_width: 1280,
+        image_height: 720,
+        video_width: 1280,
+        video_height: 720,
         status_message: "Clip unavailable",
     });
     html_response(StatusCode::NOT_FOUND, html)
+}
+
+fn public_embed_image_dimensions(clip: &Clip) -> (i64, i64) {
+    // Poster artifacts are always rendered at this width (`scale=1280:-2` in
+    // media_processing::generate_poster), including upscaled small sources,
+    // so advertise that size rather than the source dimensions.
+    const POSTER_WIDTH: i64 = 1280;
+    // Same sane bound the metadata probe enforces; stored dimensions can come
+    // straight from the upload request, so clamp before multiplying.
+    const MAX_DIMENSION: i64 = 16_384;
+    let width = clip.width.unwrap_or(POSTER_WIDTH).clamp(1, MAX_DIMENSION);
+    let height = clip.height.unwrap_or(720).clamp(1, MAX_DIMENSION);
+    let scaled_height = (height * POSTER_WIDTH + width / 2) / width;
+    // `-2` keeps the proportional height even.
+    let even_height = ((scaled_height + 1) / 2) * 2;
+    (POSTER_WIDTH, even_height.max(2))
 }
 
 struct PublicShareHtml<'a> {
@@ -1073,9 +1477,13 @@ struct PublicShareHtml<'a> {
     description: &'a str,
     share_url: &'a str,
     media_url: &'a str,
-    thumbnail_url: &'a str,
-    width: i64,
-    height: i64,
+    image_url: &'a str,
+    // og:image sizing matches the generated poster (capped at 1280px);
+    // og:video keeps the clip's real pixel dimensions.
+    image_width: i64,
+    image_height: i64,
+    video_width: i64,
+    video_height: i64,
     status_message: &'a str,
 }
 
@@ -1084,17 +1492,26 @@ fn public_share_html(data: PublicShareHtml<'_>) -> String {
     let description = escape_html(data.description);
     let share_url = escape_html(data.share_url);
     let media_url = escape_html(data.media_url);
-    let thumbnail_url = escape_html(data.thumbnail_url);
+    let image_url = escape_html(data.image_url);
     let status_message = escape_html(data.status_message);
-    let image_meta = if data.thumbnail_url.is_empty() {
+    let image_alt = escape_html(&format!("Preview image for {}", data.title));
+    let image_meta = if data.image_url.is_empty() {
         String::new()
     } else {
         format!(
             r#"
-    <meta property="og:image" content="{thumbnail_url}">
-    <meta property="og:image:secure_url" content="{thumbnail_url}">
+    <meta property="og:image" content="{image_url}">
+    <meta property="og:image:secure_url" content="{image_url}">
     <meta property="og:image:type" content="image/jpeg">
-    <meta name="twitter:image" content="{thumbnail_url}">"#
+    <meta property="og:image:width" content="{image_width}">
+    <meta property="og:image:height" content="{image_height}">
+    <meta property="og:image:alt" content="{image_alt}">
+    <meta name="twitter:image" content="{image_url}">
+    <meta name="twitter:image:width" content="{image_width}">
+    <meta name="twitter:image:height" content="{image_height}">
+    <meta name="twitter:image:alt" content="{image_alt}">"#,
+            image_width = data.image_width,
+            image_height = data.image_height,
         )
     };
     let video_meta = if data.media_url.is_empty() {
@@ -1107,8 +1524,8 @@ fn public_share_html(data: PublicShareHtml<'_>) -> String {
     <meta property="og:video:type" content="video/mp4">
     <meta property="og:video:width" content="{width}">
     <meta property="og:video:height" content="{height}">"#,
-            width = data.width,
-            height = data.height
+            width = data.video_width,
+            height = data.video_height
         )
     };
 
@@ -1132,13 +1549,14 @@ fn public_share_html(data: PublicShareHtml<'_>) -> String {
     <meta name="twitter:description" content="{description}">{image_meta}{video_meta}
     <link rel="canonical" href="{share_url}">
     <link rel="icon" type="image/svg+xml" href="/clipline-icon.svg">
-    <link rel="stylesheet" href="/styles.css">
-    <script type="module" src="/app.js"></script>
+    <link rel="stylesheet" href="/tokens.css">
+    <link rel="stylesheet" href="/ui.css">
+    <script type="module" src="/main.js"></script>
   </head>
   <body>
     <div id="app" class="app-root">
       <main class="boot-screen">
-        <div class="brand-mark" aria-hidden="true">CL</div>
+        <img class="boot-icon" src="/clipline-icon.svg" alt="" width="48" height="48">
         <p>{status_message}</p>
       </main>
     </div>
@@ -1173,13 +1591,56 @@ fn public_share_title(clip: &Clip) -> String {
     }
 }
 
-async fn public_clip_author_name(state: &AppState, clip: &Clip) -> Result<String, ApiError> {
-    Ok(public_clip_author(state, clip).await?.name)
+async fn public_clip_author_name(
+    state: &AppState,
+    clip: &Clip,
+    public_base: &Url,
+) -> Result<String, ApiError> {
+    Ok(public_clip_author(state, clip, public_base).await?.name)
 }
 
-async fn public_clip_author(state: &AppState, clip: &Clip) -> Result<PublicAuthor, ApiError> {
+async fn public_clip_author(
+    state: &AppState,
+    clip: &Clip,
+    public_base: &Url,
+) -> Result<PublicAuthor, ApiError> {
     let user = state.repositories.users.get(&clip.owner_user_id).await?;
-    Ok(public_author_from_user(state, user.as_ref()))
+    Ok(public_author_from_user(public_base, user.as_ref()))
+}
+
+async fn public_authors_for_clips(
+    state: &AppState,
+    clips: &[Clip],
+    public_base: &Url,
+) -> Result<HashMap<String, PublicAuthor>, ApiError> {
+    let users = public_users_by_id(
+        state,
+        clips
+            .iter()
+            .map(|clip| clip.owner_user_id.clone())
+            .collect(),
+    )
+    .await?;
+    Ok(users
+        .into_iter()
+        .map(|(id, user)| (id, public_author_from_user(public_base, Some(&user))))
+        .collect())
+}
+
+async fn public_users_by_id(
+    state: &AppState,
+    mut user_ids: Vec<String>,
+) -> Result<HashMap<String, User>, ApiError> {
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    Ok(state
+        .repositories
+        .users
+        .get_many(&user_ids)
+        .await?
+        .into_iter()
+        .map(|user| (user.id.clone(), user))
+        .collect())
 }
 
 async fn public_comment_response(
@@ -1187,16 +1648,47 @@ async fn public_comment_response(
     clip: &Clip,
     comment: ClipComment,
     viewer: Option<&auth::AuthenticatedUser>,
+    public_base: &Url,
 ) -> Result<PublicCommentResponse, ApiError> {
     let user = state.repositories.users.get(&comment.user_id).await?;
-    let author = public_author_from_user(state, user.as_ref());
-    let is_uploader = comment.user_id == clip.owner_user_id;
-    let viewer_can_delete = match viewer {
-        Some(viewer) => viewer_can_delete_comment(state, &viewer.user, clip).await?,
+    let viewer_is_owner = match viewer {
+        Some(viewer) => auth::user_is_owner(state, &viewer.user).await?,
         None => false,
     };
-    Ok(PublicCommentResponse {
+    let users = user
+        .map(|user| HashMap::from([(user.id.clone(), user)]))
+        .unwrap_or_default();
+    Ok(public_comment_response_with_context(
+        public_base,
+        clip,
+        comment,
+        viewer,
+        viewer_is_owner,
+        &users,
+    ))
+}
+
+fn public_comment_response_with_context(
+    public_base: &Url,
+    clip: &Clip,
+    comment: ClipComment,
+    viewer: Option<&auth::AuthenticatedUser>,
+    viewer_is_owner: bool,
+    users: &HashMap<String, User>,
+) -> PublicCommentResponse {
+    let author = public_author_from_user(public_base, users.get(&comment.user_id));
+    let is_uploader = comment.user_id == clip.owner_user_id;
+    let viewer_can_delete = viewer.is_some_and(|viewer| {
+        viewer_can_delete_comment_with_owner_flag(
+            &viewer.user,
+            clip,
+            Some(comment.user_id.as_str()),
+            viewer_is_owner,
+        )
+    });
+    PublicCommentResponse {
         id: comment.id,
+        parent_comment_id: comment.parent_comment_id,
         body: comment.body,
         author_name: author.name,
         author_username: author.username,
@@ -1205,18 +1697,20 @@ async fn public_comment_response(
         viewer_can_delete,
         created_at: comment.created_at,
         updated_at: comment.updated_at,
-    })
+    }
 }
 
 async fn viewer_can_delete_comment(
     state: &AppState,
     viewer: &User,
     clip: &Clip,
+    comment: Option<&ClipComment>,
 ) -> Result<bool, ApiError> {
     let viewer_is_owner = auth::user_is_owner(state, viewer).await?;
     Ok(viewer_can_delete_comment_with_owner_flag(
         viewer,
         clip,
+        comment.map(|comment| comment.user_id.as_str()),
         viewer_is_owner,
     ))
 }
@@ -1224,14 +1718,16 @@ async fn viewer_can_delete_comment(
 fn viewer_can_delete_comment_with_owner_flag(
     viewer: &User,
     clip: &Clip,
+    comment_user_id: Option<&str>,
     viewer_is_owner: bool,
 ) -> bool {
-    viewer.id == clip.owner_user_id
+    comment_user_id == Some(viewer.id.as_str())
+        || viewer.id == clip.owner_user_id
         || viewer_is_owner
         || matches!(viewer.role.as_str(), "admin" | "owner")
 }
 
-fn public_author_from_user(state: &AppState, user: Option<&User>) -> PublicAuthor {
+fn public_author_from_user(public_base: &Url, user: Option<&User>) -> PublicAuthor {
     let Some(user) = user else {
         return PublicAuthor {
             name: "Unknown creator".to_string(),
@@ -1244,7 +1740,7 @@ fn public_author_from_user(state: &AppState, user: Option<&User>) -> PublicAutho
         username: Some(user.username.clone()),
         avatar_url: user.avatar_key.as_ref().map(|_| {
             absolute_url(
-                state,
+                public_base,
                 &format!(
                     "api/v1/public/users/{}/avatar",
                     path_segment(&user.username)
@@ -1275,6 +1771,12 @@ fn normalize_comment_body(body: String) -> Result<String, ApiError> {
         )));
     }
     Ok(body)
+}
+
+fn normalize_parent_comment_id(parent_comment_id: Option<String>) -> Option<String> {
+    parent_comment_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn path_segment(value: &str) -> String {
@@ -1346,12 +1848,6 @@ fn escape_html(value: &str) -> String {
         }
     }
     escaped
-}
-
-fn normalized_optional(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn recommend_public_clips(
@@ -1490,13 +1986,8 @@ fn public_page_offset(page: i64, page_size: i64) -> Result<i64, ApiError> {
         .ok_or_else(|| ApiError::bad_request("page is too large"))
 }
 
-fn absolute_url(state: &AppState, path: &str) -> String {
-    state
-        .config
-        .public_url
-        .join(path.trim_start_matches('/'))
-        .map(|url| url.to_string())
-        .unwrap_or_else(|_| format!("/{}", path.trim_start_matches('/')))
+fn absolute_url(public_base: &Url, path: &str) -> String {
+    crate::config::join_public_path(public_base, path)
 }
 
 fn storage_error(error: StorageError) -> ApiError {
@@ -1516,6 +2007,16 @@ fn storage_error(error: StorageError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn category_artwork_cache_keys_are_versioned_by_artwork_id() {
+        assert_eq!(
+            game_category_artwork_key("01K0ABCDEF1234567890GHJKMN", "grid", 42)
+                .expect("artwork cache key")
+                .as_str(),
+            "objects/game-categories/01K0ABCDEF1234567890GHJKMN/grid/42"
+        );
+    }
 
     #[test]
     fn parses_common_byte_ranges() {
@@ -1576,18 +2077,55 @@ mod tests {
             description: "A&B's clip",
             share_url: "https://clips.example.com/c/share",
             media_url: "https://clips.example.com/api/v1/public/clips/share/media",
-            thumbnail_url: "https://clips.example.com/api/v1/public/clips/share/thumbnail",
-            width: 1920,
-            height: 1080,
+            image_url: "https://clips.example.com/api/v1/public/clips/share/poster",
+            image_width: 1280,
+            image_height: 720,
+            video_width: 1920,
+            video_height: 1080,
             status_message: "Loading <clip>",
         });
 
         assert!(html.contains("Clip &lt;one&gt; &quot;win&quot;"));
         assert!(html.contains("A&amp;B&#39;s clip"));
         assert!(html.contains(r#"<meta property="og:video:type" content="video/mp4">"#));
+        assert!(html.contains(
+            r#"<meta property="og:image" content="https://clips.example.com/api/v1/public/clips/share/poster">"#
+        ));
+        assert!(html.contains(r#"<meta property="og:image:width" content="1280">"#));
+        assert!(html.contains(r#"<meta property="og:image:height" content="720">"#));
         assert!(html.contains(r#"<meta property="og:video:width" content="1920">"#));
+        assert!(html.contains(r#"<meta property="og:video:height" content="1080">"#));
         assert!(html.contains(r#"<meta property="og:image:type" content="image/jpeg">"#));
         assert!(!html.contains("Loading <clip>"));
+    }
+
+    #[test]
+    fn public_embed_image_dimensions_match_generated_poster_width() {
+        let mut clip = test_clip_with_metadata(Some("League"), Some(26_000));
+        clip.width = Some(1920);
+        clip.height = Some(1080);
+        assert_eq!(public_embed_image_dimensions(&clip), (1280, 720));
+
+        // Small sources are upscaled by the poster job (`scale=1280:-2`), so
+        // the advertised size matches the artifact, not the source.
+        clip.width = Some(800);
+        clip.height = Some(600);
+        assert_eq!(public_embed_image_dimensions(&clip), (1280, 960));
+
+        // Vertical video keeps aspect with an even height.
+        clip.width = Some(720);
+        clip.height = Some(1280);
+        assert_eq!(public_embed_image_dimensions(&clip), (1280, 2276));
+
+        // Client-supplied dimensions outside probe bounds must not overflow;
+        // height clamps to 16_384 before scaling.
+        clip.width = Some(1281);
+        clip.height = Some(i64::MAX);
+        assert_eq!(public_embed_image_dimensions(&clip), (1280, 16_372));
+
+        clip.width = Some(0);
+        clip.height = Some(-42);
+        assert_eq!(public_embed_image_dimensions(&clip), (1280, 1280));
     }
 
     #[test]
@@ -1632,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn comment_delete_permission_allows_admins_owner_and_clip_uploader() {
+    fn comment_delete_permission_allows_author_admins_owner_and_clip_uploader() {
         let clip = test_clip_with_metadata(Some("Factorio"), Some(30_000));
         let uploader = test_user("owner", "user");
         let admin = test_user("admin", "admin");
@@ -1641,26 +2179,45 @@ mod tests {
         let regular_user = test_user("viewer", "user");
 
         assert!(viewer_can_delete_comment_with_owner_flag(
-            &uploader, &clip, false
+            &uploader, &clip, None, false
         ));
         assert!(viewer_can_delete_comment_with_owner_flag(
-            &admin, &clip, false
+            &admin, &clip, None, false
         ));
         assert!(viewer_can_delete_comment_with_owner_flag(
             &owner_role,
             &clip,
+            None,
             false
         ));
         assert!(viewer_can_delete_comment_with_owner_flag(
             &configured_owner,
             &clip,
+            None,
             true
+        ));
+        assert!(viewer_can_delete_comment_with_owner_flag(
+            &regular_user,
+            &clip,
+            Some(regular_user.id.as_str()),
+            false
         ));
         assert!(!viewer_can_delete_comment_with_owner_flag(
             &regular_user,
             &clip,
+            None,
             false
         ));
+    }
+
+    #[test]
+    fn comment_parent_id_normalization_treats_blank_as_absent() {
+        assert_eq!(
+            normalize_parent_comment_id(Some(" parent ".to_string())),
+            Some("parent".to_string())
+        );
+        assert_eq!(normalize_parent_comment_id(Some("   ".to_string())), None);
+        assert_eq!(normalize_parent_comment_id(None), None);
     }
 
     #[test]

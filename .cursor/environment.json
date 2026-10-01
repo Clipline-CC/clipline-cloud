@@ -1,0 +1,16 @@
+{
+  "name": "Clipline Cloud",
+  "install": "./.cursor/install.sh",
+  "terminals": [
+    {
+      "name": "clipline-server",
+      "command": "./.cursor/dev-server.sh"
+    }
+  ],
+  "ports": [
+    {
+      "name": "clipline web server",
+      "port": 8080
+    }
+  ]
+}

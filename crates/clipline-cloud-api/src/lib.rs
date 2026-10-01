@@ -5,11 +5,11 @@ use bytes::Bytes;
 pub use clipline_cloud_api_types::{
     ClipDetailResponse, ClipListResponse, ClipMarkerResponse, ClipSummaryResponse,
     CreateDeviceTokenRequest, CreateDeviceTokenResponse, CreateUploadRequest, CreateUploadResponse,
-    DiscoveryResponse, HealthResponse, ListClipsRequest, MeResponse, PartUploadResponse,
-    ReadinessResponse, UpdateVisibilityRequest, UploadProgressResponse, UserResponse,
+    DiscoveryResponse, ErrorResponse, HealthResponse, ListClipsRequest, MeResponse,
+    PartUploadResponse, ReadinessResponse, UpdateVisibilityRequest, UploadProgressResponse,
+    UserResponse,
 };
 use reqwest::{header, StatusCode};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::{Host, Url};
@@ -446,11 +446,6 @@ fn serde_json_value_empty() -> serde_json::Value {
     serde_json::json!({})
 }
 
-#[derive(Debug, Deserialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,7 +663,8 @@ mod tests {
         let client = CloudClient::new(Url::parse("https://clips.example.com").expect("url"));
         let request = ListClipsRequest {
             sort: Some("uploaded_at_desc".to_string()),
-            game: Some("league".to_string()),
+            game: None,
+            game_category_id: Some("01K123CATEGORY".to_string()),
             source_type: Some("replay".to_string()),
             visibility: Some("private".to_string()),
             status: Some("ready".to_string()),
@@ -700,7 +696,7 @@ mod tests {
             query_pairs,
             vec![
                 ("sort".to_string(), "uploaded_at_desc".to_string()),
-                ("game".to_string(), "league".to_string()),
+                ("game_category_id".to_string(), "01K123CATEGORY".to_string(),),
                 ("source_type".to_string(), "replay".to_string()),
                 ("visibility".to_string(), "private".to_string()),
                 ("status".to_string(), "ready".to_string()),

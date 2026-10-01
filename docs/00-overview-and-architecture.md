@@ -42,11 +42,10 @@ device token, and uploads → clips appear in the owner's library → owner sort
 private/public, and shares public clips via non-guessable URLs. Storage works identically on local
 disk or S3.
 
-**Explicitly out of scope for v1:** public discovery feed; likes/comments/follows/subscriptions/
-recommendations; a central Clipline account system; federation; server-side video
-optimization/transcoding; mobile apps; real-time chat; end-to-end encrypted media; multi-tenant
-commercial hosting; OAuth/OIDC login (Discord/Google/Steam). Revisitable later; v1 focuses on
-reliable upload, private library management, and shareable links.
+**Still out of scope:** a central Clipline account system; federation; mobile apps; real-time chat;
+end-to-end encrypted media; multi-tenant commercial hosting; and OAuth/OIDC login. The current
+product does include a public discovery feed, comments, recommendations, and optional server-side
+video optimization; the privacy and operator-control principles below still apply to them.
 
 ## 3. Design Principles
 
@@ -92,6 +91,11 @@ Each is a deliberate v1 commitment. Later milestones must honor these.
 8. **`private` means application-level access control, not cryptography.** The operator runs the
    infrastructure and can technically read files and rows. E2E encryption is out of scope.
 9. **No social features, no self-registration, manual upload only, public links stable-until-revoked.**
+10. **Reported game names are immutable source metadata, organized through managed categories.**
+    Every nonblank name reported by a clip maps case-insensitively to one canonical game category.
+    Administrators may edit category presentation, merge categories, and separate a reported name
+    again without rewriting any clip. Optional SteamGridDB matches and artwork belong to the
+    category, not to the raw reported name.
 
 ## 5. Architecture
 
@@ -131,8 +135,8 @@ for password hashing, opaque tokens. The backend image bundles `ffmpeg`/`ffprobe
 thumbnail/poster generation and metadata backfill — so it is **not** a tiny static binary; this is a
 deliberate, stated dependency.
 
-**Frontend:** any of React / SvelteKit / Solid / plain Vite; Tailwind or similar; HTML5 `<video>`
-for playback. No proprietary cloud dependency.
+**Frontend:** Preact, HTM templates, and esbuild, with HTML5 `<video>` playback. The compiled static
+assets are committed and served by the backend. No proprietary cloud dependency.
 
 **Storage:** local filesystem adapter + S3-compatible adapter behind one trait. Optional MinIO
 Compose profile for local S3 testing.
@@ -169,13 +173,15 @@ otherwise. (Reinforced in the admin model: no casual "view everyone's private cl
 The complete env surface. Authoritative loading/validation rules live in doc 01.
 
 ```
-CLIPLINE_PUBLIC_URL                 # required for share links; warns if not HTTPS
+CLIPLINE_PUBLIC_URL                 # required fallback origin; warns if not HTTPS
+CLIPLINE_ADDITIONAL_PUBLIC_URLS     # optional extra CSRF origins when Origin ≠ request Host
 CLIPLINE_BIND_ADDR
 CLIPLINE_DATABASE_URL[_FILE]        # sqlite:///data/clipline.db (default) | postgres://...
 
 CLIPLINE_BOOTSTRAP_ADMIN_USERNAME
 CLIPLINE_BOOTSTRAP_ADMIN_PASSWORD
 CLIPLINE_BOOTSTRAP_ADMIN_PASSWORD_FILE
+CLIPLINE_STEAMGRIDDB_API_KEY[_FILE] # optional; admin game search and category artwork
 
 CLIPLINE_STORAGE_BACKEND            # local | s3
 CLIPLINE_DATA_DIR                   # required for local
@@ -212,7 +218,10 @@ CLIPLINE_LOG_LEVEL
 
 Config is validated at startup; the app fails loudly on invalid storage/DB settings. `local`
 requires `CLIPLINE_DATA_DIR`; `s3` requires endpoint, bucket, access key, secret key;
-`CLIPLINE_PUBLIC_URL` is required for share links.
+`CLIPLINE_PUBLIC_URL` is required as the fallback origin when a request has no usable `Host`. Generated
+share, invite, reset, discovery, and public media URLs follow the request `Host`. Optional
+`CLIPLINE_ADDITIONAL_PUBLIC_URLS` lists extra origins allowed for browser CSRF checks when `Origin`
+does not match that Host.
 
 ## 29. Repository Layout
 

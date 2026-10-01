@@ -8,25 +8,29 @@ use axum::{
 use chrono::Duration as ChronoDuration;
 use clipline_cloud_api_types::{
     CreateUploadRequest, CreateUploadResponse, DirectPartUploadAckRequest,
-    DirectPartUploadUrlResponse, DirectUploadHeader, PartUploadResponse, UploadProgressResponse,
+    DirectPartUploadUrlResponse, DirectUploadHeader, PartUploadResponse, StatusResponse,
+    UploadProgressResponse,
 };
-use clipline_cloud_core::jobs::enqueue_validate_object;
+use clipline_cloud_core::jobs::VALIDATE_OBJECT_KIND;
 use clipline_cloud_db::{
-    now_utc, Clip, NewClip, NewUploadPart, NewUploadSession, UploadPart, UploadSession,
+    now_utc, AbortUploadOutcome, Clip, FinalizeUploadOutcome, NewClip, NewClipMarker,
+    NewGameCategory, NewJob, NewUploadPart, NewUploadSession, UploadPart, UploadSession,
 };
 use clipline_cloud_storage::{
     CompletedUploadPart, MediaObjectKeys, ObjectKey, PutObjectMetadata, SharedStorageBackend,
     StorageError,
 };
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
-    auth::{self, ApiError, AuthenticatedUser},
+    auth::{self, AuthenticatedUser},
     clips::generate_public_share_id,
     config::{Config, StorageConfig},
+    error::ApiError,
+    media, steamgriddb,
+    validation::{normalized_optional_ref, validate_optional_char_count},
     AppState,
 };
 
@@ -36,13 +40,138 @@ const MAX_MULTIPART_PARTS: u64 = 10_000;
 const PART_SHA256_HEADER: &str = "x-clipline-part-sha256";
 const STORAGE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 const DIRECT_UPLOAD_PART_URL_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub(crate) const UPLOAD_JSON_BODY_LIMIT: usize = 256 * 1024;
+const MAX_TITLE_LEN: usize = 300;
+const MAX_DESCRIPTION_LEN: usize = 10_000;
+const MAX_CLIENT_CLIP_ID_LEN: usize = 255;
+
+fn schedule_automatic_game_category_enrichment(state: AppState, category: NewGameCategory) {
+    if !steamgriddb::configured(&state.config) {
+        return;
+    }
+    tokio::spawn(async move {
+        enrich_new_game_category(&state, category).await;
+    });
+}
+
+async fn enrich_new_game_category(state: &AppState, category: NewGameCategory) {
+    let search_results =
+        match steamgriddb::search_games(&state.config, &category.display_name).await {
+            Ok(results) => results,
+            Err(error) => {
+                warn!(
+                    event = "game_category.auto_enrichment_search_failed",
+                    category_id = %category.id,
+                    status = %error.status(),
+                    error = error.message()
+                );
+                return;
+            }
+        };
+    let Some(game) = steamgriddb::best_game_match(&category.display_name, search_results) else {
+        info!(
+            event = "game_category.auto_enrichment_no_match",
+            category_id = %category.id
+        );
+        return;
+    };
+
+    let (grid_result, video_result, icon_result) = tokio::join!(
+        steamgriddb::list_artwork(&state.config, game.id, steamgriddb::ArtworkKind::Grid),
+        steamgriddb::list_artwork(&state.config, game.id, steamgriddb::ArtworkKind::Hero),
+        steamgriddb::list_artwork(&state.config, game.id, steamgriddb::ArtworkKind::Icon),
+    );
+    let grid = automatic_artwork_result(&category.id, "grid", grid_result);
+    let video = automatic_artwork_result(&category.id, "video", video_result);
+    let icon = automatic_artwork_result(&category.id, "icon", icon_result);
+
+    let mut update = NewGameCategory::new(&category.display_name);
+    update.steamgriddb_game_id = Some(game.id);
+    if let Some(asset) = grid {
+        update.artwork_kind = Some("grid".to_string());
+        update.artwork_id = Some(asset.id);
+        update.artwork_url = Some(asset.url);
+        update.artwork_thumb_url = Some(asset.thumb);
+    }
+    if let Some(asset) = video {
+        update.video_artwork_id = Some(asset.id);
+        update.video_artwork_url = Some(asset.url);
+        update.video_artwork_thumb_url = Some(asset.thumb);
+    }
+    if let Some(asset) = icon {
+        update.icon_artwork_id = Some(asset.id);
+        update.icon_artwork_url = Some(asset.url);
+        update.icon_artwork_thumb_url = Some(asset.thumb);
+    }
+
+    match state
+        .repositories
+        .game_categories
+        .apply_automatic_metadata_if_unchanged(&category.id, category.updated_at, &update)
+        .await
+    {
+        Ok(Some(updated)) => {
+            state.invalidate_game_category_map().await;
+            media::cache_game_category_artwork(state, &updated).await;
+            info!(
+                event = "game_category.auto_enrichment_completed",
+                category_id = %category.id,
+                steamgriddb_game_id = game.id,
+                grid_artwork_id = update.artwork_id,
+                video_artwork_id = update.video_artwork_id,
+                icon_artwork_id = update.icon_artwork_id
+            );
+        }
+        Ok(None) => info!(
+            event = "game_category.auto_enrichment_skipped_changed_category",
+            category_id = %category.id
+        ),
+        Err(error) => warn!(
+            event = "game_category.auto_enrichment_update_failed",
+            category_id = %category.id,
+            error = %error
+        ),
+    }
+}
+
+fn automatic_artwork_result(
+    category_id: &str,
+    slot: &str,
+    result: Result<Vec<steamgriddb::ArtworkResult>, ApiError>,
+) -> Option<steamgriddb::ArtworkResult> {
+    match result {
+        Ok(results) => steamgriddb::highest_scoring_artwork(results),
+        Err(error) => {
+            warn!(
+                event = "game_category.auto_enrichment_artwork_failed",
+                category_id,
+                slot,
+                status = %error.status(),
+                error = error.message()
+            );
+            None
+        }
+    }
+}
+const MAX_METADATA_FIELD_LEN: usize = 1_024;
+const MAX_CODEC_LEN: usize = 120;
+const MAX_MARKERS: usize = 1_000;
+const MAX_MARKER_KIND_LEN: usize = 64;
+const MAX_MARKER_LABEL_LEN: usize = 256;
+const MAX_MARKER_METADATA_BYTES: usize = 16 * 1024;
 
 pub fn routes(max_request_body_bytes: usize) -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/uploads", post(create_upload))
-        .route("/api/v1/uploads/{id}", get(get_upload).delete(abort_upload))
+    let media_body_routes = Router::new()
         .route("/api/v1/uploads/{id}/content", put(put_content))
         .route("/api/v1/uploads/{id}/parts/{part_number}", put(put_part))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes));
+
+    Router::new()
+        .route(
+            "/api/v1/uploads",
+            post(create_upload).layer(DefaultBodyLimit::max(UPLOAD_JSON_BODY_LIMIT)),
+        )
+        .route("/api/v1/uploads/{id}", get(get_upload).delete(abort_upload))
         .route(
             "/api/v1/uploads/{id}/parts/{part_number}/presign",
             post(create_direct_part_url),
@@ -52,7 +181,7 @@ pub fn routes(max_request_body_bytes: usize) -> Router<AppState> {
             post(ack_direct_part_upload),
         )
         .route("/api/v1/uploads/{id}/complete", post(complete_upload))
-        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .merge(media_body_routes)
 }
 
 async fn create_upload(
@@ -64,7 +193,7 @@ async fn create_upload(
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     validate_create_request(&state.config, &request)?;
 
-    let client_clip_id = normalized_optional(&request.client_clip_id);
+    let client_clip_id = normalized_optional_ref(request.client_clip_id.as_deref());
     if let Some(client_clip_id) = client_clip_id.as_deref() {
         if let Some(existing_session) =
             load_existing_idempotent_session(&state, &auth.user.id, client_clip_id).await?
@@ -116,11 +245,11 @@ async fn create_upload(
         state.config.storage_backend_name(),
     );
     new_clip.client_clip_id = client_clip_id.clone();
-    new_clip.description = normalized_optional(&request.description);
-    new_clip.game_name = normalized_optional(&request.game_name);
-    new_clip.game_id = normalized_optional(&request.game_id);
-    new_clip.game_executable = normalized_optional(&request.game_executable);
-    new_clip.source_type = normalized_optional(&request.source_type);
+    new_clip.description = normalized_optional_ref(request.description.as_deref());
+    new_clip.game_name = normalized_optional_ref(request.game_name.as_deref());
+    new_clip.game_id = normalized_optional_ref(request.game_id.as_deref());
+    new_clip.game_executable = normalized_optional_ref(request.game_executable.as_deref());
+    new_clip.source_type = normalized_optional_ref(request.source_type.as_deref());
     new_clip.recorded_at = request.recorded_at;
     new_clip.duration_ms = request.duration_ms;
     new_clip.file_size_bytes = Some(request.file_size_bytes as i64);
@@ -128,8 +257,8 @@ async fn create_upload(
     new_clip.height = request.height;
     new_clip.fps = request.fps;
     new_clip.container = Some("mp4".to_string());
-    new_clip.video_codec = normalized_optional(&request.video_codec);
-    new_clip.audio_codec = normalized_optional(&request.audio_codec);
+    new_clip.video_codec = normalized_optional_ref(request.video_codec.as_deref());
+    new_clip.audio_codec = normalized_optional_ref(request.audio_codec.as_deref());
     new_clip.checksum_sha256 = Some(request.checksum_sha256.to_ascii_lowercase());
     new_clip.visibility = request.visibility.unwrap_or_else(|| "private".to_string());
     if matches!(new_clip.visibility.as_str(), "public" | "unlisted") {
@@ -139,8 +268,26 @@ async fn create_upload(
     new_clip.poster_key = Some(keys.poster.as_str().to_string());
     new_clip.thumbnail_key = Some(keys.thumbnail.as_str().to_string());
 
-    let clip = match state.repositories.clips.create(&new_clip).await {
-        Ok(clip) => clip,
+    let markers = build_clip_markers(&new_clip.id, request.markers.as_deref());
+    let expires_at = now_utc() + upload_session_ttl(&state.config);
+    let mut new_session = NewUploadSession::new(
+        &new_clip.id,
+        &auth.user.id,
+        request.file_size_bytes as i64,
+        keys.source.as_str(),
+        expires_at,
+    );
+    new_session.part_size_bytes = Some(part_size_bytes as i64);
+    new_session.storage_upload_id = storage_upload_id;
+    new_session.checksum_sha256 = Some(request.checksum_sha256.to_ascii_lowercase());
+    let storage_upload_id = new_session.storage_upload_id.clone();
+
+    let bundle = match state
+        .repositories
+        .create_upload_bundle(&new_clip, &new_session, &markers)
+        .await
+    {
+        Ok(bundle) => bundle,
         Err(error) => {
             cleanup_created_storage_upload(&state, storage_upload_id.as_deref(), &keys.source)
                 .await;
@@ -160,23 +307,16 @@ async fn create_upload(
             return Err(error.into());
         }
     };
-    let expires_at = now_utc() + upload_session_ttl(&state.config);
-    let mut new_session = NewUploadSession::new(
-        &clip.id,
-        &auth.user.id,
-        request.file_size_bytes as i64,
-        keys.source.as_str(),
-        expires_at,
-    );
-    new_session.part_size_bytes = Some(part_size_bytes as i64);
-    new_session.storage_upload_id = storage_upload_id;
-    new_session.checksum_sha256 = Some(request.checksum_sha256.to_ascii_lowercase());
-    let storage_upload_id = new_session.storage_upload_id.clone();
+    if let Some(category) = bundle.created_game_category {
+        state.invalidate_game_category_map().await;
+        schedule_automatic_game_category_enrichment(state.clone(), category);
+    }
     let session = state
         .repositories
         .upload_sessions
-        .create(&new_session)
-        .await?;
+        .get(&new_session.id)
+        .await?
+        .ok_or_else(|| ApiError::internal("created upload session is missing"))?;
 
     enforce_upload_limits_after_create(
         &state,
@@ -465,7 +605,14 @@ async fn complete_upload(
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let (session, _clip) = load_owned_upload(&state, &auth, &id).await?;
     if session.status == "completed" {
-        return Ok(Json(progress_response(&state, &session).await?));
+        let _ = finalize_upload_db(&state, &session).await?;
+        let reconciled = state
+            .repositories
+            .upload_sessions
+            .get(&session.id)
+            .await?
+            .ok_or_else(|| ApiError::conflict("upload session no longer exists"))?;
+        return Ok(Json(progress_response(&state, &reconciled).await?));
     }
     ensure_mutable_upload(&session)?;
     let Some(storage_upload_id) = session.storage_upload_id.as_deref() else {
@@ -538,12 +685,19 @@ async fn abort_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<StatusResponse>, ApiError> {
     let auth = auth::require_auth(&state, &headers).await?;
     auth::require_csrf_for_cookie(&state, &headers, &auth)?;
     let (session, clip) = load_owned_upload(&state, &auth, &id).await?;
-    if session.status == "completed" {
-        return Err(ApiError::conflict("completed uploads cannot be aborted"));
+    match state
+        .repositories
+        .abort_upload(&session.id, &clip.id)
+        .await?
+    {
+        AbortUploadOutcome::Aborted | AbortUploadOutcome::AlreadyAborted => {}
+        AbortUploadOutcome::NotMutable => {
+            return Err(upload_session_no_longer_mutable(&state, &session.id).await?)
+        }
     }
 
     let key = ObjectKey::parse(&session.storage_key).map_err(storage_error)?;
@@ -563,18 +717,7 @@ async fn abort_upload(
         }
     }
 
-    state
-        .repositories
-        .upload_parts
-        .delete_for_session(&session.id)
-        .await?;
-    state
-        .repositories
-        .upload_sessions
-        .abort(&session.id)
-        .await?;
-    state.repositories.clips.soft_delete(&clip.id).await?;
-    Ok(Json(json!({ "status": "ok" })))
+    Ok(Json(StatusResponse::ok()))
 }
 
 async fn load_owned_upload(
@@ -647,6 +790,31 @@ fn validate_create_request(config: &Config, request: &CreateUploadRequest) -> Re
     if request.title.trim().is_empty() {
         return Err(ApiError::bad_request("title is required"));
     }
+    validate_optional_char_count(Some(request.title.as_str()), "title", MAX_TITLE_LEN)?;
+    validate_optional_char_count(
+        request.client_clip_id.as_deref(),
+        "client_clip_id",
+        MAX_CLIENT_CLIP_ID_LEN,
+    )?;
+    validate_optional_char_count(
+        request.description.as_deref(),
+        "description",
+        MAX_DESCRIPTION_LEN,
+    )?;
+    for (name, value) in [
+        ("game_name", request.game_name.as_deref()),
+        ("game_id", request.game_id.as_deref()),
+        ("game_executable", request.game_executable.as_deref()),
+        ("source_type", request.source_type.as_deref()),
+    ] {
+        validate_optional_char_count(value, name, MAX_METADATA_FIELD_LEN)?;
+    }
+    for (name, value) in [
+        ("video_codec", request.video_codec.as_deref()),
+        ("audio_codec", request.audio_codec.as_deref()),
+    ] {
+        validate_optional_char_count(value, name, MAX_CODEC_LEN)?;
+    }
     if request.file_size_bytes == 0 {
         return Err(ApiError::bad_request(
             "file_size_bytes must be greater than zero",
@@ -654,6 +822,11 @@ fn validate_create_request(config: &Config, request: &CreateUploadRequest) -> Re
     }
     if request.file_size_bytes > config.max_upload_size_bytes {
         return Err(ApiError::bad_request("file exceeds maximum upload size"));
+    }
+    if request.file_size_bytes > i64::MAX as u64 {
+        return Err(ApiError::bad_request(
+            "file_size_bytes exceeds the supported database range",
+        ));
     }
     validate_checksum(&request.checksum_sha256)?;
     if !request.container.trim().eq_ignore_ascii_case("mp4") {
@@ -678,7 +851,77 @@ fn validate_create_request(config: &Config, request: &CreateUploadRequest) -> Re
             "duration, dimensions, and fps must be positive when provided",
         ));
     }
+    validate_markers(request.markers.as_deref(), request.duration_ms)?;
     Ok(())
+}
+
+fn validate_markers(
+    markers: Option<&[clipline_cloud_api_types::CreateMarkerRequest]>,
+    duration_ms: Option<i64>,
+) -> Result<(), ApiError> {
+    let Some(markers) = markers else {
+        return Ok(());
+    };
+    if markers.len() > MAX_MARKERS {
+        return Err(ApiError::bad_request(format!(
+            "markers must contain {MAX_MARKERS} entries or fewer"
+        )));
+    }
+    for marker in markers {
+        if marker.kind.trim().is_empty() {
+            return Err(ApiError::bad_request("marker kind is required"));
+        }
+        validate_optional_char_count(
+            Some(marker.kind.as_str()),
+            "marker kind",
+            MAX_MARKER_KIND_LEN,
+        )?;
+        validate_optional_char_count(
+            marker.label.as_deref(),
+            "marker label",
+            MAX_MARKER_LABEL_LEN,
+        )?;
+        if marker.timestamp_ms < 0
+            || duration_ms.is_some_and(|duration_ms| marker.timestamp_ms > duration_ms)
+        {
+            return Err(ApiError::bad_request(
+                "marker timestamp_ms must fall within the clip duration",
+            ));
+        }
+        if let Some(metadata) = marker.metadata.as_ref() {
+            let size = serde_json::to_vec(metadata)
+                .map_err(|_| ApiError::bad_request("marker metadata is invalid"))?
+                .len();
+            if size > MAX_MARKER_METADATA_BYTES {
+                return Err(ApiError::bad_request(format!(
+                    "marker metadata must be {MAX_MARKER_METADATA_BYTES} bytes or fewer"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_clip_markers(
+    clip_id: &str,
+    markers: Option<&[clipline_cloud_api_types::CreateMarkerRequest]>,
+) -> Vec<NewClipMarker> {
+    markers
+        .unwrap_or_default()
+        .iter()
+        .map(|marker| {
+            let mut new_marker =
+                NewClipMarker::new(clip_id, marker.kind.trim(), marker.timestamp_ms);
+            new_marker.label = marker
+                .label
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            new_marker.metadata_json = marker.metadata.clone().map(sqlx::types::Json);
+            new_marker
+        })
+        .collect()
 }
 
 async fn enforce_user_storage_quota(
@@ -686,13 +929,9 @@ async fn enforce_user_storage_quota(
     user: &clipline_cloud_db::User,
     requested_size_bytes: u64,
 ) -> Result<(), ApiError> {
-    let quota_bytes = match user.storage_quota_bytes {
-        Some(value) => Some(
-            u64::try_from(value)
-                .map_err(|_| ApiError::internal("stored user storage quota is negative"))?,
-        ),
-        None => state.config.user_storage_quota_bytes,
-    };
+    let settings = state.repositories.settings.get().await?;
+    let quota_bytes =
+        crate::admin::effective_per_user_storage_quota_bytes(user, &settings, &state.config);
     let Some(quota_bytes) = quota_bytes else {
         return Ok(());
     };
@@ -751,17 +990,14 @@ async fn rollback_created_upload_session(
     key: &ObjectKey,
 ) {
     cleanup_created_storage_upload(state, storage_upload_id, key).await;
-    if let Err(error) = state.repositories.upload_sessions.delete(&session.id).await {
+    if let Err(error) = state
+        .repositories
+        .delete_upload_bundle(&session.id, &session.clip_id)
+        .await
+    {
         warn!(
-            event = "api.upload_rejected_session_cleanup_failed",
+            event = "api.upload_rejected_bundle_cleanup_failed",
             session_id = %session.id,
-            error = %error,
-        );
-        return;
-    }
-    if let Err(error) = state.repositories.clips.delete(&session.clip_id).await {
-        warn!(
-            event = "api.upload_rejected_clip_cleanup_failed",
             clip_id = %session.clip_id,
             error = %error,
         );
@@ -1202,52 +1438,24 @@ async fn finalize_upload_db(
     state: &AppState,
     session: &UploadSession,
 ) -> Result<FinalizeUploadResult, ApiError> {
-    if !state
+    let mut job = NewJob::new(VALIDATE_OBJECT_KIND, now_utc());
+    job.target_type = Some("clip".to_string());
+    job.target_id = Some(session.clip_id.clone());
+    match state
         .repositories
-        .upload_sessions
-        .update_received_size(&session.id, session.expected_size_bytes)
+        .finalize_upload(
+            &session.id,
+            &session.clip_id,
+            session.expected_size_bytes,
+            &job,
+        )
         .await?
     {
-        return completed_or_stale_upload_result(state, &session.id).await;
-    }
-    if !state
-        .repositories
-        .upload_sessions
-        .complete(&session.id)
-        .await?
-    {
-        return completed_or_stale_upload_result(state, &session.id).await;
-    }
-    let transitioned = state
-        .repositories
-        .clips
-        .mark_uploaded_processing(&session.clip_id)
-        .await?;
-    if !transitioned {
-        return Err(ApiError::conflict(
-            "clip could not transition into processing",
-        ));
-    }
-
-    enqueue_validate_object(&state.repositories, &session.clip_id)
-        .await
-        .map_err(|error| {
-            warn!(event = "api.job_enqueue_error", error = %error);
-            ApiError::internal("failed to enqueue validation job")
-        })?;
-    Ok(FinalizeUploadResult::Finalized)
-}
-
-async fn completed_or_stale_upload_result(
-    state: &AppState,
-    session_id: &str,
-) -> Result<FinalizeUploadResult, ApiError> {
-    match state.repositories.upload_sessions.get(session_id).await? {
-        Some(session) if session.status == "completed" => {
-            Ok(FinalizeUploadResult::AlreadyCompleted)
+        FinalizeUploadOutcome::Finalized => Ok(FinalizeUploadResult::Finalized),
+        FinalizeUploadOutcome::AlreadyCompleted => Ok(FinalizeUploadResult::AlreadyCompleted),
+        FinalizeUploadOutcome::NotMutable => {
+            Err(ApiError::conflict("upload session is no longer mutable"))
         }
-        Some(_) => Err(ApiError::conflict("upload session is no longer mutable")),
-        None => Err(ApiError::conflict("upload session no longer exists")),
     }
 }
 
@@ -1422,14 +1630,6 @@ fn is_s3_storage(config: &Config) -> bool {
 fn upload_session_ttl(config: &Config) -> ChronoDuration {
     ChronoDuration::from_std(config.upload_session_ttl)
         .unwrap_or_else(|_| ChronoDuration::hours(24))
-}
-
-fn normalized_optional(value: &Option<String>) -> Option<String> {
-    value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn should_try_completion_reconciliation(error: &StorageError) -> bool {
@@ -1609,6 +1809,43 @@ mod tests {
     }
 
     #[test]
+    fn upload_markers_are_validated_and_converted_for_persistence() {
+        let markers = vec![clipline_cloud_api_types::CreateMarkerRequest {
+            kind: " kill ".to_string(),
+            label: Some(" First blood ".to_string()),
+            timestamp_ms: 750,
+            metadata: Some(serde_json::json!({ "weapon": "rail" })),
+        }];
+
+        validate_markers(Some(&markers), Some(1_000)).expect("valid markers");
+        let converted = build_clip_markers("clip", Some(&markers));
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].clip_id, "clip");
+        assert_eq!(converted[0].kind, "kill");
+        assert_eq!(converted[0].label.as_deref(), Some("First blood"));
+        assert_eq!(
+            converted[0].metadata_json.as_ref().map(|value| &value.0),
+            markers[0].metadata.as_ref()
+        );
+    }
+
+    #[test]
+    fn upload_markers_must_fit_within_clip_duration() {
+        let markers = vec![clipline_cloud_api_types::CreateMarkerRequest {
+            kind: "kill".to_string(),
+            label: None,
+            timestamp_ms: 1_001,
+            metadata: None,
+        }];
+
+        assert_eq!(
+            error_status(validate_markers(Some(&markers), Some(1_000))),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn create_response_advertises_direct_s3_templates_only_when_enabled() {
         let upload = session(4, 10);
         let local_config = Config::for_tests("sqlite:///tmp/clipline-upload-test.db", "/tmp");
@@ -1785,5 +2022,15 @@ mod tests {
         let error = storage_error(StorageError::S3("ServiceUnavailable: 503".to_string()));
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn automatic_artwork_failure_leaves_that_slot_empty() {
+        assert!(automatic_artwork_result(
+            "category",
+            "icon",
+            Err(ApiError::bad_gateway("upstream unavailable")),
+        )
+        .is_none());
     }
 }

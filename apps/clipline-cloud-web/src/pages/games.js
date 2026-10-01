@@ -1,0 +1,41 @@
+import { html } from "../lib/html.js";
+import { useApiResource } from "../lib/use-api-resource.js";
+import { EmptyState } from "../components/EmptyState.js";
+
+// Tile grid of every game with public clips. Data: GET /api/v1/public/games
+// → { games: [{ category_id, display_name, clip_count, thumbnail_url }] }.
+// Categories without selected artwork fall back to a gradient initial.
+export function GamesPage() {
+  const { data, error } = useApiResource("/api/v1/public/games");
+  const games = data?.games ?? null;
+
+  if (error) {
+    return html`<main class="page">
+      <${EmptyState} name="alert" title="Couldn't load games" body=${error.message} />
+    </main>`;
+  }
+
+  return html`<main class="page">
+    <p class="kicker">Browse by game</p>
+    ${games == null
+      ? html`<div class="game-grid">
+          ${Array.from({ length: 6 }, (_, i) => html`<div class="game-tile is-loading" key=${i}>
+            <div class="skeleton-thumb"></div>
+          </div>`)}
+        </div>`
+      : games.length === 0
+      ? html`<${EmptyState} name="film" title="No games yet"
+          body="Once clips are shared as public, their games will show up here." />`
+      : html`<div class="game-grid">
+          ${games.map((g) => html`<a class="game-tile" href=${`/game/${encodeURIComponent(g.category_id)}`}>
+            ${g.thumbnail_url
+              ? html`<img src=${g.thumbnail_url} alt="" loading="lazy" />`
+              : html`<div class="game-tile-fallback">${(g.display_name || "?")[0].toUpperCase()}</div>`}
+            <div class="game-tile-body">
+              <b>${g.display_name}</b>
+              <small>${g.clip_count} clip${g.clip_count === 1 ? "" : "s"}</small>
+            </div>
+          </a>`)}
+        </div>`}
+  </main>`;
+}

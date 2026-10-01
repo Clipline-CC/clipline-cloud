@@ -1,19 +1,22 @@
 use axum::{
-    extract::{Extension, Query, State},
-    http::HeaderMap,
-    routing::get,
+    body::Body,
+    extract::{Extension, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
+    routing::{get, patch},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use clipline_cloud_db::{
-    AppSettings, AuditLogEntry, DatabaseKind, Job, UpdateAppSettings, UploadSession,
+    AppSettings, AuditLogEntry, DatabaseKind, GameCategory, GameCategoryName, Job,
+    MergeGameCategoryOutcome, NewAuditLogEntry, NewGameCategory, SeparateGameCategoryNameOutcome,
+    UpdateAppSettings, UploadSession,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::{self, ApiError},
-    config::StorageConfig,
-    mail, AppState, ClientIp,
+    auth, config::StorageConfig, error::ApiError, mail, media, steamgriddb,
+    validation::normalized_optional, AppState, ClientIp,
 };
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -28,9 +31,40 @@ pub fn routes() -> Router<AppState> {
             get(settings).patch(update_settings),
         )
         .route("/api/v1/admin/overview", get(overview))
+        .route(
+            "/api/v1/admin/game-categories",
+            get(game_categories),
+        )
+        .route(
+            "/api/v1/admin/game-categories/steamgriddb/search",
+            get(search_steamgriddb_games),
+        )
+        .route(
+            "/api/v1/admin/game-categories/steamgriddb/games/{game_id}/artwork",
+            get(steamgriddb_artwork),
+        )
+        .route(
+            "/api/v1/admin/game-categories/steamgriddb/games/{game_id}/artwork/{kind}/{artwork_id}/preview",
+            get(steamgriddb_artwork_preview),
+        )
+        .route(
+            "/api/v1/admin/game-categories/{id}",
+            patch(update_game_category),
+        )
+        .route(
+            "/api/v1/admin/game-categories/{id}/merge",
+            axum::routing::post(merge_game_category),
+        )
+        .route(
+            "/api/v1/admin/game-categories/{id}/reported-names/{name_id}/separate",
+            axum::routing::post(separate_game_category_name),
+        )
         .route("/api/v1/admin/uploads/failed", get(failed_uploads))
         .route("/api/v1/admin/jobs/dead", get(dead_jobs))
-        .route("/api/v1/admin/jobs/recent-errors", get(recent_job_errors))
+        .route(
+            "/api/v1/admin/jobs/recent-errors",
+            get(recent_job_errors).delete(clear_job_errors),
+        )
         .route("/api/v1/admin/audit/recent", get(recent_audit_log))
 }
 
@@ -53,6 +87,8 @@ struct AdminSettingsResponse {
     smtp_password_configured: bool,
     smtp_from_email: Option<String>,
     smtp_from_name: Option<String>,
+    user_storage_quota_bytes: Option<u64>,
+    user_storage_quota_env_fallback_bytes: Option<u64>,
     updated_at: DateTime<Utc>,
 }
 
@@ -70,11 +106,80 @@ struct UpdateAdminSettingsRequest {
     smtp_password_clear: Option<bool>,
     smtp_from_email: Option<Option<String>>,
     smtp_from_name: Option<Option<String>>,
+    user_storage_quota_bytes: Option<Option<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminGameCategoryListResponse {
+    steamgriddb_configured: bool,
+    categories: Vec<AdminGameCategoryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminGameCategoryResponse {
+    id: String,
+    display_name: String,
+    steamgriddb_game_id: Option<i64>,
+    grid_artwork_id: Option<i64>,
+    grid_artwork_url: Option<String>,
+    video_artwork_id: Option<i64>,
+    video_artwork_url: Option<String>,
+    icon_artwork_id: Option<i64>,
+    icon_artwork_url: Option<String>,
+    clip_count: i64,
+    reported_names: Vec<AdminGameCategoryNameResponse>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminGameCategoryNameResponse {
+    id: String,
+    reported_name: String,
+    clip_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertGameCategoryRequest {
+    display_name: String,
+    steamgriddb_game_id: Option<i64>,
+    grid_artwork_id: Option<i64>,
+    video_artwork_id: Option<i64>,
+    icon_artwork_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeGameCategoryRequest {
+    destination_category_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SteamGridDbSearchQuery {
+    q: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SteamGridDbArtworkQuery {
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SteamGridDbArtworkPreviewQuery {
+    url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SteamGridDbArtworkResponse {
+    id: i64,
+    kind: String,
+    score: i64,
+    style: String,
+    preview_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +204,7 @@ struct AdminOverviewResponse {
     server_version: &'static str,
     api_version: &'static str,
     public_url: String,
+    additional_public_urls: Vec<String>,
     storage_backend: &'static str,
     storage_summary: String,
     database_backend: &'static str,
@@ -163,9 +269,448 @@ async fn settings(
     headers: HeaderMap,
 ) -> Result<Json<AdminSettingsResponse>, ApiError> {
     let _auth = auth::require_admin(&state, &headers).await?;
-    Ok(Json(AdminSettingsResponse::from(
-        state.repositories.settings.get().await?,
+    let settings = state.repositories.settings.get().await?;
+    Ok(Json(AdminSettingsResponse::from_settings(
+        settings,
+        &state.config,
     )))
+}
+
+async fn game_categories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminGameCategoryListResponse>, ApiError> {
+    let _auth = auth::require_admin(&state, &headers).await?;
+    Ok(Json(AdminGameCategoryListResponse {
+        steamgriddb_configured: steamgriddb::configured(&state.config),
+        categories: load_admin_game_categories(&state).await?,
+    }))
+}
+
+async fn load_admin_game_categories(
+    state: &AppState,
+) -> Result<Vec<AdminGameCategoryResponse>, ApiError> {
+    let categories = state.repositories.game_categories.list().await?;
+    let names = state.repositories.game_categories.list_all_names().await?;
+    let clip_counts = state
+        .repositories
+        .clips
+        .list_game_names()
+        .await?
+        .into_iter()
+        .map(|game| (game.game_name.to_lowercase(), game.clip_count))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut names_by_category = std::collections::HashMap::<String, Vec<GameCategoryName>>::new();
+    for name in names {
+        names_by_category
+            .entry(name.category_id.clone())
+            .or_default()
+            .push(name);
+    }
+    Ok(categories
+        .into_iter()
+        .map(|category| {
+            let names = names_by_category.remove(&category.id).unwrap_or_default();
+            AdminGameCategoryResponse::from_category(category, names, &clip_counts)
+        })
+        .collect())
+}
+
+async fn load_admin_game_category(
+    state: &AppState,
+    category_id: &str,
+) -> Result<AdminGameCategoryResponse, ApiError> {
+    let category = state
+        .repositories
+        .game_categories
+        .get(category_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("game category not found"))?;
+    let names = state
+        .repositories
+        .game_categories
+        .list_names(category_id)
+        .await?;
+    let clip_counts = state
+        .repositories
+        .game_categories
+        .list_name_clip_counts(category_id)
+        .await?
+        .into_iter()
+        .map(|(name, count)| (name.to_lowercase(), count))
+        .collect();
+    Ok(AdminGameCategoryResponse::from_category(
+        category,
+        names,
+        &clip_counts,
+    ))
+}
+
+async fn search_steamgriddb_games(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SteamGridDbSearchQuery>,
+) -> Result<Json<Vec<steamgriddb::GameSearchResult>>, ApiError> {
+    let _auth = auth::require_admin(&state, &headers).await?;
+    Ok(Json(
+        steamgriddb::search_games(&state.config, &query.q).await?,
+    ))
+}
+
+async fn steamgriddb_artwork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(game_id): Path<i64>,
+    Query(query): Query<SteamGridDbArtworkQuery>,
+) -> Result<Json<Vec<SteamGridDbArtworkResponse>>, ApiError> {
+    let _auth = auth::require_admin(&state, &headers).await?;
+    let kind = query.kind.parse()?;
+    Ok(Json(
+        steamgriddb::list_artwork(&state.config, game_id, kind)
+            .await?
+            .into_iter()
+            .map(|artwork| SteamGridDbArtworkResponse {
+                preview_url: steamgriddb_artwork_preview_url(game_id, &artwork),
+                id: artwork.id,
+                kind: artwork.kind,
+                score: artwork.score,
+                style: artwork.style,
+            })
+            .collect(),
+    ))
+}
+
+fn steamgriddb_artwork_preview_url(game_id: i64, artwork: &steamgriddb::ArtworkResult) -> String {
+    format!(
+        "/api/v1/admin/game-categories/steamgriddb/games/{game_id}/artwork/{}/{}/preview?{}",
+        artwork.kind,
+        artwork.id,
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("url", &artwork.thumb)
+            .finish()
+    )
+}
+
+async fn steamgriddb_artwork_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((game_id, kind, artwork_id)): Path<(i64, String, i64)>,
+    Query(query): Query<SteamGridDbArtworkPreviewQuery>,
+) -> Result<Response, ApiError> {
+    let _auth = auth::require_admin(&state, &headers).await?;
+    let _: steamgriddb::ArtworkKind = kind.parse()?;
+    if game_id <= 0 || artwork_id <= 0 {
+        return Err(ApiError::bad_request(
+            "SteamGridDB game and artwork ids must be positive",
+        ));
+    }
+    steamgriddb_image_response(
+        steamgriddb::fetch_image(&query.url).await?,
+        "private, max-age=3600",
+    )
+}
+
+async fn update_game_category(
+    State(state): State<AppState>,
+    Extension(client_ip): Extension<ClientIp>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpsertGameCategoryRequest>,
+) -> Result<Json<AdminGameCategoryResponse>, ApiError> {
+    let auth = auth::require_admin(&state, &headers).await?;
+    auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    let existing = state
+        .repositories
+        .game_categories
+        .get(&id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("game category not found"))?;
+    let update = new_game_category(&state, request, Some(&existing)).await?;
+    let mut audit = NewAuditLogEntry::new("game_category.updated");
+    audit.actor_user_id = Some(auth.user.id.clone());
+    audit.target_type = Some("game_category".to_string());
+    audit.target_id = Some(id.clone());
+    audit.ip_address = Some(client_ip.as_str().to_string());
+    audit.metadata_json = Some(sqlx::types::Json(serde_json::json!({
+        "display_name": update.display_name.clone(),
+        "steamgriddb_game_id": update.steamgriddb_game_id,
+        "grid_artwork_id": update.artwork_id,
+        "video_artwork_id": update.video_artwork_id,
+        "icon_artwork_id": update.icon_artwork_id,
+    })));
+    if !state
+        .repositories
+        .update_game_category_with_audit(&id, &update, &audit)
+        .await?
+    {
+        return Err(ApiError::not_found("game category not found"));
+    }
+    state.invalidate_game_category_map().await;
+    if let Some(category) = state.repositories.game_categories.get(&id).await? {
+        media::cache_game_category_artwork(&state, &category).await;
+    }
+    Ok(Json(load_admin_game_category(&state, &id).await?))
+}
+
+async fn merge_game_category(
+    State(state): State<AppState>,
+    Extension(client_ip): Extension<ClientIp>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<MergeGameCategoryRequest>,
+) -> Result<Json<AdminGameCategoryResponse>, ApiError> {
+    let auth = auth::require_admin(&state, &headers).await?;
+    auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    let destination_id = request.destination_category_id.trim();
+    if destination_id.is_empty() {
+        return Err(ApiError::bad_request("destination category is required"));
+    }
+    if id == destination_id {
+        return Err(ApiError::bad_request(
+            "a category cannot be merged into itself",
+        ));
+    }
+    let source = state
+        .repositories
+        .game_categories
+        .get(&id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("source game category not found"))?;
+    let destination = state
+        .repositories
+        .game_categories
+        .get(destination_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("destination game category not found"))?;
+    let moved_names = state
+        .repositories
+        .game_categories
+        .list_names(&id)
+        .await?
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "id": name.id,
+                "reported_name": name.reported_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut audit = NewAuditLogEntry::new("game_category.merged");
+    audit.actor_user_id = Some(auth.user.id.clone());
+    audit.target_type = Some("game_category".to_string());
+    audit.target_id = Some(destination_id.to_string());
+    audit.ip_address = Some(client_ip.as_str().to_string());
+    audit.metadata_json = Some(sqlx::types::Json(serde_json::json!({
+        "source_category_id": id.clone(),
+        "destination_category_id": destination_id,
+        "source_display_name": source.display_name,
+        "destination_display_name": destination.display_name,
+        "moved_reported_names": moved_names,
+    })));
+    match state
+        .repositories
+        .merge_game_categories(&id, destination_id, Some(&audit))
+        .await?
+    {
+        MergeGameCategoryOutcome::Merged => {}
+        MergeGameCategoryOutcome::SourceNotFound => {
+            return Err(ApiError::not_found("source game category not found"));
+        }
+        MergeGameCategoryOutcome::DestinationNotFound => {
+            return Err(ApiError::not_found("destination game category not found"));
+        }
+    }
+    state.invalidate_game_category_map().await;
+    Ok(Json(
+        load_admin_game_category(&state, destination_id).await?,
+    ))
+}
+
+async fn separate_game_category_name(
+    State(state): State<AppState>,
+    Extension(client_ip): Extension<ClientIp>,
+    headers: HeaderMap,
+    Path((id, name_id)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<AdminGameCategoryResponse>), ApiError> {
+    let auth = auth::require_admin(&state, &headers).await?;
+    auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    let mut audit = NewAuditLogEntry::new("game_category_name.separated");
+    audit.actor_user_id = Some(auth.user.id.clone());
+    audit.target_type = Some("game_category".to_string());
+    audit.target_id = Some(id.clone());
+    audit.ip_address = Some(client_ip.as_str().to_string());
+    audit.metadata_json = Some(sqlx::types::Json(serde_json::json!({
+        "source_category_id": id.clone(),
+        "reported_name_id": name_id.clone(),
+    })));
+    let new_category_id = match state
+        .repositories
+        .separate_game_category_name(&id, &name_id, Some(&audit))
+        .await?
+    {
+        SeparateGameCategoryNameOutcome::Created(category_id) => category_id,
+        SeparateGameCategoryNameOutcome::CategoryNotFound => {
+            return Err(ApiError::not_found("game category not found"));
+        }
+        SeparateGameCategoryNameOutcome::NameNotFound
+        | SeparateGameCategoryNameOutcome::NameNotInCategory => {
+            return Err(ApiError::not_found("reported game name not found"));
+        }
+        SeparateGameCategoryNameOutcome::AlreadySeparate => {
+            return Err(ApiError::conflict(
+                "reported game name is already in its own category",
+            ));
+        }
+    };
+    state.invalidate_game_category_map().await;
+    Ok((
+        StatusCode::CREATED,
+        Json(load_admin_game_category(&state, &new_category_id).await?),
+    ))
+}
+
+async fn new_game_category(
+    state: &AppState,
+    request: UpsertGameCategoryRequest,
+    existing: Option<&GameCategory>,
+) -> Result<NewGameCategory, ApiError> {
+    let display_name = validate_game_category_display_name(&request)?;
+    if request.steamgriddb_game_id.is_some_and(|id| id <= 0) {
+        return Err(ApiError::bad_request(
+            "SteamGridDB game id must be positive",
+        ));
+    }
+    let mut new = NewGameCategory::new(&display_name);
+    new.steamgriddb_game_id = request.steamgriddb_game_id;
+    let grid = resolve_artwork_slot(
+        state,
+        request.steamgriddb_game_id,
+        steamgriddb::ArtworkKind::Grid,
+        request.grid_artwork_id,
+        existing.and_then(|category| category.steamgriddb_game_id),
+        existing.and_then(|category| category.artwork_id),
+        existing.and_then(|category| category.artwork_url.as_deref()),
+        existing.and_then(|category| category.artwork_thumb_url.as_deref()),
+    )
+    .await?;
+    if let Some(grid) = grid {
+        new.artwork_kind = Some("grid".to_string());
+        new.artwork_id = Some(grid.id);
+        new.artwork_url = Some(grid.url);
+        new.artwork_thumb_url = Some(grid.thumb);
+    }
+
+    let video = resolve_artwork_slot(
+        state,
+        request.steamgriddb_game_id,
+        steamgriddb::ArtworkKind::Hero,
+        request.video_artwork_id,
+        existing.and_then(|category| category.steamgriddb_game_id),
+        existing.and_then(|category| category.video_artwork_id),
+        existing.and_then(|category| category.video_artwork_url.as_deref()),
+        existing.and_then(|category| category.video_artwork_thumb_url.as_deref()),
+    )
+    .await?;
+    if let Some(video) = video {
+        new.video_artwork_id = Some(video.id);
+        new.video_artwork_url = Some(video.url);
+        new.video_artwork_thumb_url = Some(video.thumb);
+    }
+
+    let icon = resolve_artwork_slot(
+        state,
+        request.steamgriddb_game_id,
+        steamgriddb::ArtworkKind::Icon,
+        request.icon_artwork_id,
+        existing.and_then(|category| category.steamgriddb_game_id),
+        existing.and_then(|category| category.icon_artwork_id),
+        existing.and_then(|category| category.icon_artwork_url.as_deref()),
+        existing.and_then(|category| category.icon_artwork_thumb_url.as_deref()),
+    )
+    .await?;
+    if let Some(icon) = icon {
+        new.icon_artwork_id = Some(icon.id);
+        new.icon_artwork_url = Some(icon.url);
+        new.icon_artwork_thumb_url = Some(icon.thumb);
+    }
+    Ok(new)
+}
+
+struct ResolvedArtworkSlot {
+    id: i64,
+    url: String,
+    thumb: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_artwork_slot(
+    state: &AppState,
+    game_id: Option<i64>,
+    kind: steamgriddb::ArtworkKind,
+    requested_id: Option<i64>,
+    existing_game_id: Option<i64>,
+    existing_id: Option<i64>,
+    existing_url: Option<&str>,
+    existing_thumb: Option<&str>,
+) -> Result<Option<ResolvedArtworkSlot>, ApiError> {
+    let Some(requested_id) = requested_id else {
+        return Ok(None);
+    };
+    let game_id = game_id.ok_or_else(|| {
+        ApiError::bad_request("select a SteamGridDB game before selecting artwork")
+    })?;
+    if existing_game_id == Some(game_id) && existing_id == Some(requested_id) {
+        if let (Some(url), Some(thumb)) = (existing_url, existing_thumb) {
+            return Ok(Some(ResolvedArtworkSlot {
+                id: requested_id,
+                url: url.to_string(),
+                thumb: thumb.to_string(),
+            }));
+        }
+    }
+    let asset = steamgriddb::list_artwork(&state.config, game_id, kind)
+        .await?
+        .into_iter()
+        .find(|asset| asset.id == requested_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "selected SteamGridDB {} artwork not found",
+                kind.as_str()
+            ))
+        })?;
+    Ok(Some(ResolvedArtworkSlot {
+        id: asset.id,
+        url: asset.url,
+        thumb: asset.thumb,
+    }))
+}
+
+fn validate_game_category_display_name(
+    request: &UpsertGameCategoryRequest,
+) -> Result<String, ApiError> {
+    let display_name = request.display_name.trim();
+    if display_name.is_empty() {
+        return Err(ApiError::bad_request("display name is required"));
+    }
+    if display_name.chars().count() > 200 {
+        return Err(ApiError::bad_request(
+            "display name must be at most 200 characters",
+        ));
+    }
+    Ok(display_name.to_string())
+}
+
+fn steamgriddb_image_response(
+    image: steamgriddb::ImageAsset,
+    cache_control: &'static str,
+) -> Result<Response, ApiError> {
+    let content_type = HeaderValue::from_str(&image.content_type)
+        .map_err(|_| ApiError::bad_gateway("SteamGridDB returned an invalid content type"))?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(Body::from(image.bytes))
+        .map_err(|_| ApiError::internal("SteamGridDB artwork response could not be created"))
 }
 
 async fn update_settings(
@@ -192,6 +737,21 @@ async fn update_settings(
             ));
         }
         update.vod_threshold_minutes = Some(threshold);
+    }
+
+    if let Some(quota) = request.user_storage_quota_bytes {
+        let stored = match quota {
+            None => None,
+            Some(bytes) => {
+                let bytes = i64::try_from(bytes)
+                    .map_err(|_| ApiError::bad_request("storage quota is too large"))?;
+                if bytes < 0 {
+                    return Err(ApiError::bad_request("storage quota must be non-negative"));
+                }
+                Some(bytes)
+            }
+        };
+        update.user_storage_quota_bytes = Some(stored);
     }
 
     if let Some(about_text) = request.about_text {
@@ -304,11 +864,15 @@ async fn update_settings(
             "about_text_updated": update.about_text.is_some(),
             "smtp_updated": smtp_updated,
             "smtp_enabled": update.smtp_enabled,
+            "user_storage_quota_bytes": update.user_storage_quota_bytes,
         })),
     )
     .await?;
 
-    Ok(Json(AdminSettingsResponse::from(updated)))
+    Ok(Json(AdminSettingsResponse::from_settings(
+        updated,
+        &state.config,
+    )))
 }
 
 async fn overview(
@@ -321,6 +885,7 @@ async fn overview(
     let total_storage_bytes = state.repositories.clips.total_storage_bytes().await?;
     let total_storage_bytes = u64::try_from(total_storage_bytes)
         .map_err(|_| ApiError::internal("stored total storage usage is negative"))?;
+    let settings = state.repositories.settings.get().await?;
     let global_storage_warning = state
         .config
         .global_storage_warning_threshold_bytes
@@ -330,6 +895,12 @@ async fn overview(
         server_version: env!("CARGO_PKG_VERSION"),
         api_version: "v1",
         public_url: state.config.public_url.to_string(),
+        additional_public_urls: state
+            .config
+            .additional_public_urls
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         storage_backend: state.config.storage_backend_name(),
         storage_summary: storage_summary(&state.config.storage),
         database_backend: database_kind_name(state.database.kind()),
@@ -339,7 +910,7 @@ async fn overview(
         upload_session_ttl_seconds: state.config.upload_session_ttl.as_secs(),
         direct_s3_uploads: state.config.direct_s3_uploads,
         max_active_upload_sessions_per_user: state.config.max_active_upload_sessions_per_user,
-        user_storage_quota_bytes: state.config.user_storage_quota_bytes,
+        user_storage_quota_bytes: effective_user_storage_quota_bytes(&settings, &state.config),
         global_storage_warning_threshold_bytes: state.config.global_storage_warning_threshold_bytes,
         global_storage_warning,
         public_media_mode: state.config.public_media_mode.as_str(),
@@ -407,6 +978,29 @@ async fn recent_job_errors(
     Ok(Json(jobs))
 }
 
+#[derive(Debug, Serialize)]
+struct ClearJobErrorsResponse {
+    terminal_jobs_deleted: u64,
+    errors_cleared: u64,
+}
+
+async fn clear_job_errors(
+    State(state): State<AppState>,
+    Extension(client_ip): Extension<ClientIp>,
+    headers: HeaderMap,
+) -> Result<Json<ClearJobErrorsResponse>, ApiError> {
+    let auth = auth::require_admin(&state, &headers).await?;
+    auth::require_csrf_for_cookie(&state, &headers, &auth)?;
+    let (terminal_jobs_deleted, errors_cleared) = state
+        .repositories
+        .clear_job_errors_with_audit(Some(&auth.user.id), Some(client_ip.as_str()))
+        .await?;
+    Ok(Json(ClearJobErrorsResponse {
+        terminal_jobs_deleted,
+        errors_cleared,
+    }))
+}
+
 async fn recent_audit_log(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -458,19 +1052,15 @@ fn normalized_optional_admin_string(
     value: Option<String>,
     label: &str,
 ) -> Result<Option<String>, ApiError> {
-    let Some(value) = value else {
+    let Some(value) = normalized_optional(value) else {
         return Ok(None);
     };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
     if value.len() > MAX_SMTP_FIELD_LEN {
         return Err(ApiError::bad_request(format!(
             "{label} must be at most {MAX_SMTP_FIELD_LEN} bytes"
         )));
     }
-    Ok(Some(value.to_string()))
+    Ok(Some(value))
 }
 
 fn validate_emailish(value: &str, label: &str) -> Result<(), ApiError> {
@@ -483,12 +1073,74 @@ fn validate_emailish(value: &str, label: &str) -> Result<(), ApiError> {
     }
 }
 
-impl From<AppSettings> for AdminSettingsResponse {
-    fn from(value: AppSettings) -> Self {
-        let smtp_password_configured = value
+pub(crate) fn effective_user_storage_quota_bytes(
+    settings: &AppSettings,
+    config: &crate::config::Config,
+) -> Option<u64> {
+    match settings.user_storage_quota_bytes {
+        None => config.user_storage_quota_bytes,
+        Some(0) => None,
+        Some(value) => u64::try_from(value).ok(),
+    }
+}
+
+pub(crate) fn stored_storage_quota_bytes(stored: Option<i64>) -> Option<u64> {
+    match stored {
+        None => None,
+        Some(0) => None,
+        Some(value) => u64::try_from(value).ok(),
+    }
+}
+
+pub(crate) fn effective_per_user_storage_quota_bytes(
+    user: &clipline_cloud_db::User,
+    settings: &AppSettings,
+    config: &crate::config::Config,
+) -> Option<u64> {
+    match user.storage_quota_bytes {
+        None | Some(0) => effective_user_storage_quota_bytes(settings, config),
+        Some(value) => u64::try_from(value).ok().filter(|quota| *quota > 0),
+    }
+}
+
+fn stored_user_storage_quota_bytes(settings: &AppSettings) -> Option<u64> {
+    stored_storage_quota_bytes(settings.user_storage_quota_bytes)
+}
+
+impl AdminSettingsResponse {
+    fn from_settings(settings: AppSettings, config: &crate::config::Config) -> Self {
+        let smtp_password_configured = settings
             .smtp_password
             .as_deref()
             .is_some_and(|password| !password.trim().is_empty());
+        let user_storage_quota_bytes = stored_user_storage_quota_bytes(&settings);
+        let user_storage_quota_env_fallback_bytes = if settings.user_storage_quota_bytes.is_none() {
+            config.user_storage_quota_bytes
+        } else {
+            None
+        };
+        Self {
+            owner_user_id: settings.owner_user_id,
+            allow_vod_uploads: settings.allow_vod_uploads,
+            vod_threshold_minutes: settings.vod_threshold_minutes,
+            about_text: settings.about_text,
+            smtp_enabled: settings.smtp_enabled,
+            smtp_host: settings.smtp_host,
+            smtp_port: settings.smtp_port,
+            smtp_tls_mode: settings.smtp_tls_mode,
+            smtp_username: settings.smtp_username,
+            smtp_password_configured,
+            smtp_from_email: settings.smtp_from_email,
+            smtp_from_name: settings.smtp_from_name,
+            user_storage_quota_bytes,
+            user_storage_quota_env_fallback_bytes,
+            updated_at: settings.updated_at,
+        }
+    }
+}
+
+impl From<AppSettings> for AdminSettingsResponse {
+    fn from(value: AppSettings) -> Self {
         Self {
             owner_user_id: value.owner_user_id,
             allow_vod_uploads: value.allow_vod_uploads,
@@ -499,9 +1151,14 @@ impl From<AppSettings> for AdminSettingsResponse {
             smtp_port: value.smtp_port,
             smtp_tls_mode: value.smtp_tls_mode,
             smtp_username: value.smtp_username,
-            smtp_password_configured,
+            smtp_password_configured: value
+                .smtp_password
+                .as_deref()
+                .is_some_and(|password| !password.trim().is_empty()),
             smtp_from_email: value.smtp_from_email,
             smtp_from_name: value.smtp_from_name,
+            user_storage_quota_bytes: stored_storage_quota_bytes(value.user_storage_quota_bytes),
+            user_storage_quota_env_fallback_bytes: None,
             updated_at: value.updated_at,
         }
     }
@@ -595,5 +1252,308 @@ impl From<AuditLogEntry> for AuditLogEntryResponse {
             metadata: value.metadata_json.map(|metadata| metadata.0),
             created_at: value.created_at,
         }
+    }
+}
+
+impl AdminGameCategoryResponse {
+    fn from_category(
+        value: GameCategory,
+        names: Vec<GameCategoryName>,
+        clip_counts: &std::collections::HashMap<String, i64>,
+    ) -> Self {
+        let grid_artwork_url = category_artwork_url(
+            &value.id,
+            "grid",
+            value.artwork_id,
+            value.artwork_thumb_url.as_deref(),
+        );
+        let video_artwork_url = category_artwork_url(
+            &value.id,
+            "video",
+            value.video_artwork_id,
+            value.video_artwork_thumb_url.as_deref(),
+        );
+        let icon_artwork_url = category_artwork_url(
+            &value.id,
+            "icon",
+            value.icon_artwork_id,
+            value.icon_artwork_thumb_url.as_deref(),
+        );
+        let reported_names = names
+            .into_iter()
+            .map(|name| AdminGameCategoryNameResponse {
+                clip_count: clip_counts
+                    .get(&name.reported_name.to_lowercase())
+                    .copied()
+                    .unwrap_or_default(),
+                id: name.id,
+                reported_name: name.reported_name,
+            })
+            .collect::<Vec<_>>();
+        let clip_count = reported_names.iter().map(|name| name.clip_count).sum();
+        Self {
+            id: value.id,
+            display_name: value.display_name,
+            steamgriddb_game_id: value.steamgriddb_game_id,
+            grid_artwork_id: value.artwork_id,
+            grid_artwork_url,
+            video_artwork_id: value.video_artwork_id,
+            video_artwork_url,
+            icon_artwork_id: value.icon_artwork_id,
+            icon_artwork_url,
+            clip_count,
+            reported_names,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+fn category_artwork_url(
+    category_id: &str,
+    slot: &str,
+    artwork_id: Option<i64>,
+    stored_url: Option<&str>,
+) -> Option<String> {
+    stored_url.zip(artwork_id).map(|(_, artwork_id)| {
+        format!("/api/v1/public/game-categories/{category_id}/artwork/{slot}?v={artwork_id}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn game_category_validation_trims_display_name() {
+        let display_name = validate_game_category_display_name(&UpsertGameCategoryRequest {
+            display_name: "  Grand Theft Auto V  ".to_string(),
+            steamgriddb_game_id: None,
+            grid_artwork_id: None,
+            video_artwork_id: None,
+            icon_artwork_id: None,
+        })
+        .expect("valid category");
+        assert_eq!(display_name, "Grand Theft Auto V");
+    }
+
+    #[test]
+    fn game_category_validation_rejects_empty_display_name() {
+        assert!(
+            validate_game_category_display_name(&UpsertGameCategoryRequest {
+                display_name: " ".to_string(),
+                steamgriddb_game_id: None,
+                grid_artwork_id: None,
+                video_artwork_id: None,
+                icon_artwork_id: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn category_artwork_urls_are_slot_specific_and_cache_versioned() {
+        assert_eq!(
+            category_artwork_url("category-1", "video", Some(98), Some("stored")),
+            Some("/api/v1/public/game-categories/category-1/artwork/video?v=98".to_string())
+        );
+        assert_eq!(category_artwork_url("category-1", "icon", None, None), None);
+    }
+
+    #[test]
+    fn steamgriddb_preview_uses_the_listed_thumbnail_without_another_lookup() {
+        let artwork = steamgriddb::ArtworkResult {
+            id: 42,
+            kind: "grid".to_string(),
+            score: 10,
+            style: "alternate".to_string(),
+            url: "https://cdn2.steamgriddb.com/grid.png".to_string(),
+            thumb: "https://cdn2.steamgriddb.com/thumb/grid.png?size=small".to_string(),
+        };
+        let preview_url = steamgriddb_artwork_preview_url(7, &artwork);
+        let parsed =
+            url::Url::parse(&format!("https://clipline.test{preview_url}")).expect("preview URL");
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(name, _)| name == "url")
+                .map(|(_, value)| value.into_owned()),
+            Some(artwork.thumb)
+        );
+    }
+
+    #[test]
+    fn admin_category_response_aggregates_names_and_uses_same_origin_artwork() {
+        let now = Utc::now();
+        let category = GameCategory {
+            id: "category-1".to_string(),
+            display_name: "Grand Theft Auto V".to_string(),
+            steamgriddb_game_id: Some(5258),
+            artwork_kind: Some("grid".to_string()),
+            artwork_id: Some(8842),
+            artwork_url: Some("https://cdn2.steamgriddb.com/grid.png".to_string()),
+            artwork_thumb_url: Some("https://cdn2.steamgriddb.com/grid-thumb.png".to_string()),
+            video_artwork_id: Some(8843),
+            video_artwork_url: Some("https://cdn2.steamgriddb.com/hero.png".to_string()),
+            video_artwork_thumb_url: Some(
+                "https://cdn2.steamgriddb.com/hero-thumb.png".to_string(),
+            ),
+            icon_artwork_id: Some(8844),
+            icon_artwork_url: Some("https://cdn2.steamgriddb.com/icon.png".to_string()),
+            icon_artwork_thumb_url: Some("https://cdn2.steamgriddb.com/icon-thumb.png".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        let names = vec![
+            GameCategoryName {
+                id: "name-1".to_string(),
+                category_id: category.id.clone(),
+                reported_name: "GTA5_Enhanced".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+            GameCategoryName {
+                id: "name-2".to_string(),
+                category_id: category.id.clone(),
+                reported_name: "Grand Theft Auto V".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+        let counts = std::collections::HashMap::from([
+            ("gta5_enhanced".to_string(), 3),
+            ("grand theft auto v".to_string(), 2),
+        ]);
+
+        let response = AdminGameCategoryResponse::from_category(category, names, &counts);
+
+        assert_eq!(response.clip_count, 5);
+        assert_eq!(response.reported_names[0].clip_count, 3);
+        assert_eq!(response.reported_names[1].clip_count, 2);
+        assert_eq!(
+            response.grid_artwork_url.as_deref(),
+            Some("/api/v1/public/game-categories/category-1/artwork/grid?v=8842")
+        );
+        assert_eq!(
+            response.video_artwork_url.as_deref(),
+            Some("/api/v1/public/game-categories/category-1/artwork/video?v=8843")
+        );
+        assert_eq!(
+            response.icon_artwork_url.as_deref(),
+            Some("/api/v1/public/game-categories/category-1/artwork/icon?v=8844")
+        );
+    }
+
+    fn sample_settings(user_storage_quota_bytes: Option<i64>) -> AppSettings {
+        AppSettings {
+            id: 1,
+            owner_user_id: None,
+            allow_vod_uploads: true,
+            vod_threshold_minutes: 30,
+            about_text: "About".to_string(),
+            smtp_enabled: false,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_tls_mode: "starttls".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_email: None,
+            smtp_from_name: None,
+            user_storage_quota_bytes,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn effective_user_storage_quota_prefers_settings_over_env() {
+        let settings = sample_settings(Some(2048));
+        let config = crate::config::Config::for_tests(
+            "sqlite:///:memory:".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            effective_user_storage_quota_bytes(&settings, &config),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn effective_user_storage_quota_treats_zero_as_disabled() {
+        let settings = sample_settings(Some(0));
+        let config = crate::config::Config::for_tests(
+            "sqlite:///:memory:".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        assert_eq!(effective_user_storage_quota_bytes(&settings, &config), None);
+    }
+
+    #[test]
+    fn settings_response_exposes_stored_quota_separately_from_env_fallback() {
+        let mut settings = sample_settings(None);
+        settings.user_storage_quota_bytes = None;
+        let mut config = crate::config::Config::for_tests(
+            "sqlite:///:memory:".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        config.user_storage_quota_bytes = Some(4096);
+        let response = AdminSettingsResponse::from_settings(settings, &config);
+        assert_eq!(response.user_storage_quota_bytes, None);
+        assert_eq!(response.user_storage_quota_env_fallback_bytes, Some(4096));
+    }
+
+    #[test]
+    fn stored_storage_quota_bytes_treats_zero_as_disabled() {
+        assert_eq!(stored_storage_quota_bytes(None), None);
+        assert_eq!(stored_storage_quota_bytes(Some(0)), None);
+        assert_eq!(stored_storage_quota_bytes(Some(4096)), Some(4096));
+    }
+
+    #[test]
+    fn effective_per_user_storage_quota_inherits_default_for_null_or_zero() {
+        let user = clipline_cloud_db::User {
+            id: "user-1".to_string(),
+            username: "user".to_string(),
+            display_name: None,
+            email: None,
+            bio: None,
+            avatar_key: None,
+            password_hash: "hash".to_string(),
+            role: "user".to_string(),
+            is_disabled: false,
+            storage_quota_bytes: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_login_at: None,
+        };
+        let settings = sample_settings(Some(1024));
+        let config = crate::config::Config::for_tests(
+            "sqlite:///:memory:".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        assert_eq!(
+            effective_per_user_storage_quota_bytes(&user, &settings, &config),
+            Some(1024)
+        );
+
+        let mut zero_user = user;
+        zero_user.storage_quota_bytes = Some(0);
+        assert_eq!(
+            effective_per_user_storage_quota_bytes(&zero_user, &settings, &config),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn settings_response_hides_zero_stored_quota() {
+        let settings = sample_settings(Some(0));
+        let config = crate::config::Config::for_tests(
+            "sqlite:///:memory:".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let response = AdminSettingsResponse::from_settings(settings, &config);
+        assert_eq!(response.user_storage_quota_bytes, None);
+        assert_eq!(response.user_storage_quota_env_fallback_bytes, None);
     }
 }

@@ -668,7 +668,8 @@ In v1, **private = application-level access control**, nothing more, and the pro
 ## 23. Configuration
 
 ```
-CLIPLINE_PUBLIC_URL                 # required for share links; warns if not HTTPS
+CLIPLINE_PUBLIC_URL                 # required fallback origin; warns if not HTTPS
+CLIPLINE_ADDITIONAL_PUBLIC_URLS     # optional extra CSRF origins when Origin ≠ request Host
 CLIPLINE_BIND_ADDR
 CLIPLINE_DATABASE_URL               # sqlite:///data/clipline.db (default) | postgres://...
 
@@ -698,7 +699,7 @@ CLIPLINE_SESSION_SECRET[_FILE]      # HMAC for CSRF tokens (NOT session validati
 CLIPLINE_LOG_LEVEL
 ```
 
-Config is validated at startup; the app fails loudly on invalid storage/DB settings. `local` requires `CLIPLINE_DATA_DIR`; `s3` requires endpoint, bucket, access key, secret key; `CLIPLINE_PUBLIC_URL` is required for share links.
+Config is validated at startup; the app fails loudly on invalid storage/DB settings. `local` requires `CLIPLINE_DATA_DIR`; `s3` requires endpoint, bucket, access key, secret key; `CLIPLINE_PUBLIC_URL` is the required fallback origin. Generated share/invite/discovery URLs follow the request `Host`. Optional `CLIPLINE_ADDITIONAL_PUBLIC_URLS` lists extra origins allowed for browser CSRF checks when `Origin` does not match that Host.
 
 ## 24. Deployment
 

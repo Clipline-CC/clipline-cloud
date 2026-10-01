@@ -1,13 +1,15 @@
 use chrono::{DateTime, Utc};
-use serde_json::json;
-use sqlx::{types::Json, Postgres, QueryBuilder, Sqlite};
+use sqlx::{Postgres, QueryBuilder, Sqlite};
+
+mod transactions;
 
 use crate::{
     db_execute, db_execute_rows, db_fetch_all, db_fetch_optional, now_utc, AppSettings,
-    AuditLogEntry, Clip, ClipComment, ClipMarker, Database, DbResult, DeviceToken, InvitationToken,
-    Job, NewAuditLogEntry, NewClip, NewClipComment, NewClipMarker, NewDeviceToken,
-    NewInvitationToken, NewJob, NewResetPasswordToken, NewSession, NewUploadPart, NewUploadSession,
-    NewUser, ResetPasswordToken, Session, UploadPart, UploadSession, User,
+    AuditLogEntry, Clip, ClipComment, ClipMarker, Database, DbResult, DeviceToken, GameCategory,
+    GameCategoryName, InvitationToken, Job, NewAuditLogEntry, NewClip, NewClipComment,
+    NewClipMarker, NewDeviceToken, NewGameCategory, NewGameCategoryName, NewInvitationToken,
+    NewJob, NewResetPasswordToken, NewSession, NewUploadPart, NewUploadSession, NewUser,
+    ResetPasswordToken, Session, UploadPart, UploadSession, User,
 };
 
 pub const DEFAULT_ABOUT_TEXT: &str = "Self-hosted clip sharing for Clipline. Upload clips from the desktop app, manage your own library, and share public links without relying on a hosted service.";
@@ -34,6 +36,7 @@ pub enum ClipSort {
 pub struct ClipListParams {
     pub owner_user_id: String,
     pub game: Option<String>,
+    pub game_category_id: Option<String>,
     pub source_type: Option<String>,
     pub visibility: Option<String>,
     pub status: Option<String>,
@@ -49,10 +52,17 @@ pub struct ClipListParams {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipListStats {
+    pub total: i64,
+    pub total_size_bytes: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PublicClipListParams {
     pub owner_user_id: Option<String>,
     pub game: Option<String>,
+    pub game_category_id: Option<String>,
     pub query: Option<String>,
     pub sort: ClipSort,
     pub limit: i64,
@@ -61,7 +71,14 @@ pub struct PublicClipListParams {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicGameSummary {
-    pub game: String,
+    pub category_id: String,
+    pub display_name: String,
+    pub clip_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameNameSummary {
+    pub game_name: String,
     pub clip_count: i64,
 }
 
@@ -71,6 +88,41 @@ pub struct BulkVisibilityUpdate {
     pub public_share_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeUploadOutcome {
+    Finalized,
+    AlreadyCompleted,
+    NotMutable,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateUploadBundleOutcome {
+    pub created_game_category: Option<NewGameCategory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortUploadOutcome {
+    Aborted,
+    AlreadyAborted,
+    NotMutable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeGameCategoryOutcome {
+    Merged,
+    SourceNotFound,
+    DestinationNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeparateGameCategoryNameOutcome {
+    Created(String),
+    CategoryNotFound,
+    NameNotFound,
+    NameNotInCategory,
+    AlreadySeparate,
+}
+
 #[derive(Clone)]
 pub struct Repositories {
     pub settings: AppSettingsRepository,
@@ -78,6 +130,7 @@ pub struct Repositories {
     pub sessions: SessionRepository,
     pub device_tokens: DeviceTokenRepository,
     pub clips: ClipRepository,
+    pub game_categories: GameCategoryRepository,
     pub clip_comments: ClipCommentRepository,
     pub clip_markers: ClipMarkerRepository,
     pub upload_sessions: UploadSessionRepository,
@@ -96,6 +149,7 @@ impl Repositories {
             sessions: SessionRepository::new(database.clone()),
             device_tokens: DeviceTokenRepository::new(database.clone()),
             clips: ClipRepository::new(database.clone()),
+            game_categories: GameCategoryRepository::new(database.clone()),
             clip_comments: ClipCommentRepository::new(database.clone()),
             clip_markers: ClipMarkerRepository::new(database.clone()),
             upload_sessions: UploadSessionRepository::new(database.clone()),
@@ -106,218 +160,259 @@ impl Repositories {
             invitation_tokens: InvitationTokenRepository::new(database),
         }
     }
+}
 
-    pub async fn bulk_soft_delete_clips_with_audit(
-        &self,
-        owner_user_id: &str,
-        clip_ids: &[String],
-        actor_user_id: Option<&str>,
-        ip_address: Option<&str>,
-    ) -> DbResult<usize> {
-        match &self.clips.database {
-            Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                for clip_id in clip_ids {
-                    let now = now_utc();
-                    let rows = sqlx::query(
-                        "UPDATE clips
-                         SET status = 'deleted', deleted_at = ?, updated_at = ?
-                         WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL",
-                    )
-                    .bind(now)
-                    .bind(now)
-                    .bind(clip_id)
-                    .bind(owner_user_id)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                    if rows != 1 {
-                        return Err(sqlx::Error::RowNotFound.into());
-                    }
+#[derive(Clone)]
+pub struct GameCategoryRepository {
+    pub(crate) database: Database,
+}
 
-                    let entry = bulk_audit_entry(
-                        actor_user_id,
-                        ip_address,
-                        "clip.deleted",
-                        clip_id,
-                        Json(json!({ "bulk": true })),
-                    );
-                    insert_audit_sqlite(&mut transaction, &entry).await?;
-                }
-                transaction.commit().await?;
-            }
-            Database::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                let update_sql = crate::postgres_placeholders(
-                    "UPDATE clips
-                     SET status = 'deleted', deleted_at = ?, updated_at = ?
-                     WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL",
-                );
-                for clip_id in clip_ids {
-                    let now = now_utc();
-                    let rows = sqlx::query(&update_sql)
-                        .bind(now)
-                        .bind(now)
-                        .bind(clip_id)
-                        .bind(owner_user_id)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
-                    if rows != 1 {
-                        return Err(sqlx::Error::RowNotFound.into());
-                    }
-
-                    let entry = bulk_audit_entry(
-                        actor_user_id,
-                        ip_address,
-                        "clip.deleted",
-                        clip_id,
-                        Json(json!({ "bulk": true })),
-                    );
-                    insert_audit_postgres(&mut transaction, &entry).await?;
-                }
-                transaction.commit().await?;
-            }
-        }
-
-        Ok(clip_ids.len())
+impl GameCategoryRepository {
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 
-    pub async fn bulk_set_visibility_with_audit(
-        &self,
-        owner_user_id: &str,
-        updates: &[BulkVisibilityUpdate],
-        visibility: &str,
-        actor_user_id: Option<&str>,
-        ip_address: Option<&str>,
-    ) -> DbResult<usize> {
-        match &self.clips.database {
-            Database::Sqlite(pool) => {
-                let mut transaction = pool.begin().await?;
-                for update in updates {
-                    let rows = sqlx::query(
-                        "UPDATE clips
-                         SET visibility = ?, public_share_id = ?, updated_at = ?
-                         WHERE id = ? AND owner_user_id = ? AND status = 'ready' AND deleted_at IS NULL",
-                    )
-                    .bind(visibility)
-                    .bind(update.public_share_id.as_deref())
-                    .bind(now_utc())
-                    .bind(&update.clip_id)
-                    .bind(owner_user_id)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                    if rows != 1 {
-                        return Err(sqlx::Error::RowNotFound.into());
-                    }
-
-                    let entry = bulk_audit_entry(
-                        actor_user_id,
-                        ip_address,
-                        "clip.visibility_changed",
-                        &update.clip_id,
-                        Json(json!({ "visibility": visibility, "bulk": true })),
-                    );
-                    insert_audit_sqlite(&mut transaction, &entry).await?;
-                }
-                transaction.commit().await?;
-            }
-            Database::Postgres(pool) => {
-                let mut transaction = pool.begin().await?;
-                let update_sql = crate::postgres_placeholders(
-                    "UPDATE clips
-                     SET visibility = ?, public_share_id = ?, updated_at = ?
-                     WHERE id = ? AND owner_user_id = ? AND status = 'ready' AND deleted_at IS NULL",
-                );
-                for update in updates {
-                    let rows = sqlx::query(&update_sql)
-                        .bind(visibility)
-                        .bind(update.public_share_id.as_deref())
-                        .bind(now_utc())
-                        .bind(&update.clip_id)
-                        .bind(owner_user_id)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
-                    if rows != 1 {
-                        return Err(sqlx::Error::RowNotFound.into());
-                    }
-
-                    let entry = bulk_audit_entry(
-                        actor_user_id,
-                        ip_address,
-                        "clip.visibility_changed",
-                        &update.clip_id,
-                        Json(json!({ "visibility": visibility, "bulk": true })),
-                    );
-                    insert_audit_postgres(&mut transaction, &entry).await?;
-                }
-                transaction.commit().await?;
-            }
-        }
-
-        Ok(updates.len())
+    pub async fn list(&self) -> DbResult<Vec<GameCategory>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            GameCategory,
+            "SELECT id, display_name, steamgriddb_game_id, artwork_kind, artwork_id,
+                    artwork_url, artwork_thumb_url,
+                    video_artwork_id, video_artwork_url, video_artwork_thumb_url,
+                    icon_artwork_id, icon_artwork_url, icon_artwork_thumb_url,
+                    created_at, updated_at
+             FROM game_categories
+             ORDER BY LOWER(display_name) ASC, display_name ASC, id ASC",
+            []
+        )?)
     }
-}
 
-fn bulk_audit_entry(
-    actor_user_id: Option<&str>,
-    ip_address: Option<&str>,
-    action: &str,
-    target_id: &str,
-    metadata: Json<serde_json::Value>,
-) -> NewAuditLogEntry {
-    let mut entry = NewAuditLogEntry::new(action);
-    entry.actor_user_id = actor_user_id.map(ToOwned::to_owned);
-    entry.target_type = Some("clip".to_string());
-    entry.target_id = Some(target_id.to_string());
-    entry.ip_address = ip_address.map(ToOwned::to_owned);
-    entry.metadata_json = Some(metadata);
-    entry
-}
+    pub async fn get(&self, id: &str) -> DbResult<Option<GameCategory>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            GameCategory,
+            "SELECT id, display_name, steamgriddb_game_id, artwork_kind, artwork_id,
+                    artwork_url, artwork_thumb_url,
+                    video_artwork_id, video_artwork_url, video_artwork_thumb_url,
+                    icon_artwork_id, icon_artwork_url, icon_artwork_thumb_url,
+                    created_at, updated_at
+             FROM game_categories WHERE id = ?",
+            [id]
+        )?)
+    }
 
-async fn insert_audit_sqlite(
-    transaction: &mut sqlx::Transaction<'_, Sqlite>,
-    entry: &NewAuditLogEntry,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO audit_log (id, actor_user_id, action, target_type, target_id, ip_address, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&entry.id)
-    .bind(entry.actor_user_id.as_deref())
-    .bind(&entry.action)
-    .bind(entry.target_type.as_deref())
-    .bind(entry.target_id.as_deref())
-    .bind(entry.ip_address.as_deref())
-    .bind(entry.metadata_json.as_ref())
-    .bind(entry.created_at)
-    .execute(&mut **transaction)
-    .await
-    .map(|_| ())
-}
+    pub async fn get_by_reported_name(&self, name: &str) -> DbResult<Option<GameCategory>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            GameCategory,
+            "SELECT c.id, c.display_name, c.steamgriddb_game_id, c.artwork_kind, c.artwork_id,
+                    c.artwork_url, c.artwork_thumb_url,
+                    c.video_artwork_id, c.video_artwork_url, c.video_artwork_thumb_url,
+                    c.icon_artwork_id, c.icon_artwork_url, c.icon_artwork_thumb_url,
+                    c.created_at, c.updated_at
+             FROM game_categories c
+             JOIN game_category_names n ON n.category_id = c.id
+             WHERE LOWER(n.reported_name) = LOWER(?)",
+            [name]
+        )?)
+    }
 
-async fn insert_audit_postgres(
-    transaction: &mut sqlx::Transaction<'_, Postgres>,
-    entry: &NewAuditLogEntry,
-) -> Result<(), sqlx::Error> {
-    let sql = crate::postgres_placeholders(
-        "INSERT INTO audit_log (id, actor_user_id, action, target_type, target_id, ip_address, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    );
-    sqlx::query(&sql)
-        .bind(&entry.id)
-        .bind(entry.actor_user_id.as_deref())
-        .bind(&entry.action)
-        .bind(entry.target_type.as_deref())
-        .bind(entry.target_id.as_deref())
-        .bind(entry.ip_address.as_deref())
-        .bind(entry.metadata_json.as_ref())
-        .bind(entry.created_at)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
+    pub async fn list_names(&self, category_id: &str) -> DbResult<Vec<GameCategoryName>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            GameCategoryName,
+            "SELECT id, category_id, reported_name, created_at, updated_at
+             FROM game_category_names
+             WHERE category_id = ?
+             ORDER BY LOWER(reported_name) ASC, reported_name ASC, id ASC",
+            [category_id]
+        )?)
+    }
+
+    pub async fn list_all_names(&self) -> DbResult<Vec<GameCategoryName>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            GameCategoryName,
+            "SELECT id, category_id, reported_name, created_at, updated_at
+             FROM game_category_names
+             ORDER BY LOWER(reported_name) ASC, reported_name ASC, id ASC",
+            []
+        )?)
+    }
+
+    pub async fn list_name_clip_counts(&self, category_id: &str) -> DbResult<Vec<(String, i64)>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            (String, i64),
+            "SELECT names.reported_name, CAST(COUNT(clips.id) AS BIGINT)
+             FROM game_category_names names
+             LEFT JOIN clips ON LOWER(clips.game_name) = LOWER(names.reported_name)
+             WHERE names.category_id = ?
+             GROUP BY names.id, names.reported_name
+             ORDER BY LOWER(names.reported_name) ASC, names.reported_name ASC, names.id ASC",
+            [category_id]
+        )?)
+    }
+
+    pub async fn get_name(&self, id: &str) -> DbResult<Option<GameCategoryName>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            GameCategoryName,
+            "SELECT id, category_id, reported_name, created_at, updated_at
+             FROM game_category_names WHERE id = ?",
+            [id]
+        )?)
+    }
+
+    pub async fn list_distinct_clip_names(&self) -> DbResult<Vec<String>> {
+        let rows = db_fetch_all!(
+            &self.database,
+            (String,),
+            "SELECT game_name
+             FROM clips
+             WHERE game_name IS NOT NULL AND TRIM(game_name) <> ''
+             GROUP BY game_name
+             ORDER BY MIN(created_at) ASC, game_name ASC",
+            []
+        )?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    pub async fn create(&self, new: &NewGameCategory) -> DbResult<GameCategory> {
+        db_execute!(
+            &self.database,
+            "INSERT INTO game_categories
+               (id, display_name, steamgriddb_game_id, artwork_kind, artwork_id,
+                artwork_url, artwork_thumb_url,
+                video_artwork_id, video_artwork_url, video_artwork_thumb_url,
+                icon_artwork_id, icon_artwork_url, icon_artwork_thumb_url,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                &new.id,
+                &new.display_name,
+                new.steamgriddb_game_id,
+                new.artwork_kind.as_deref(),
+                new.artwork_id,
+                new.artwork_url.as_deref(),
+                new.artwork_thumb_url.as_deref(),
+                new.video_artwork_id,
+                new.video_artwork_url.as_deref(),
+                new.video_artwork_thumb_url.as_deref(),
+                new.icon_artwork_id,
+                new.icon_artwork_url.as_deref(),
+                new.icon_artwork_thumb_url.as_deref(),
+                new.created_at,
+                new.updated_at
+            ]
+        )?;
+        Ok(self.get(&new.id).await?.ok_or(sqlx::Error::RowNotFound)?)
+    }
+
+    pub async fn create_name(&self, new: &NewGameCategoryName) -> DbResult<GameCategoryName> {
+        db_execute!(
+            &self.database,
+            "INSERT INTO game_category_names
+               (id, category_id, reported_name, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            [
+                &new.id,
+                &new.category_id,
+                &new.reported_name,
+                new.created_at,
+                new.updated_at
+            ]
+        )?;
+        Ok(self
+            .get_name(&new.id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?)
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+        update: &NewGameCategory,
+    ) -> DbResult<Option<GameCategory>> {
+        let affected = db_execute_rows!(
+            &self.database,
+            "UPDATE game_categories
+             SET display_name = ?, steamgriddb_game_id = ?, artwork_kind = ?,
+                 artwork_id = ?, artwork_url = ?, artwork_thumb_url = ?,
+                 video_artwork_id = ?, video_artwork_url = ?, video_artwork_thumb_url = ?,
+                 icon_artwork_id = ?, icon_artwork_url = ?, icon_artwork_thumb_url = ?,
+                 updated_at = ?
+             WHERE id = ?",
+            [
+                &update.display_name,
+                update.steamgriddb_game_id,
+                update.artwork_kind.as_deref(),
+                update.artwork_id,
+                update.artwork_url.as_deref(),
+                update.artwork_thumb_url.as_deref(),
+                update.video_artwork_id,
+                update.video_artwork_url.as_deref(),
+                update.video_artwork_thumb_url.as_deref(),
+                update.icon_artwork_id,
+                update.icon_artwork_url.as_deref(),
+                update.icon_artwork_thumb_url.as_deref(),
+                now_utc(),
+                id
+            ]
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
+    pub async fn apply_automatic_metadata_if_unchanged(
+        &self,
+        id: &str,
+        expected_updated_at: DateTime<Utc>,
+        update: &NewGameCategory,
+    ) -> DbResult<Option<GameCategory>> {
+        let affected = db_execute_rows!(
+            &self.database,
+            "UPDATE game_categories
+             SET steamgriddb_game_id = ?, artwork_kind = ?, artwork_id = ?,
+                 artwork_url = ?, artwork_thumb_url = ?,
+                 video_artwork_id = ?, video_artwork_url = ?, video_artwork_thumb_url = ?,
+                 icon_artwork_id = ?, icon_artwork_url = ?, icon_artwork_thumb_url = ?,
+                 updated_at = ?
+             WHERE id = ? AND updated_at = ?
+               AND steamgriddb_game_id IS NULL
+               AND artwork_id IS NULL AND video_artwork_id IS NULL AND icon_artwork_id IS NULL",
+            [
+                update.steamgriddb_game_id,
+                update.artwork_kind.as_deref(),
+                update.artwork_id,
+                update.artwork_url.as_deref(),
+                update.artwork_thumb_url.as_deref(),
+                update.video_artwork_id,
+                update.video_artwork_url.as_deref(),
+                update.video_artwork_thumb_url.as_deref(),
+                update.icon_artwork_id,
+                update.icon_artwork_url.as_deref(),
+                update.icon_artwork_thumb_url.as_deref(),
+                now_utc(),
+                id,
+                expected_updated_at
+            ]
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
+    pub async fn delete(&self, id: &str) -> DbResult<bool> {
+        Ok(db_execute_rows!(
+            &self.database,
+            "DELETE FROM game_categories WHERE id = ?",
+            [id]
+        )? > 0)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -333,6 +428,7 @@ pub struct UpdateAppSettings {
     pub smtp_password: Option<Option<String>>,
     pub smtp_from_email: Option<Option<String>>,
     pub smtp_from_name: Option<Option<String>>,
+    pub user_storage_quota_bytes: Option<Option<i64>>,
 }
 
 #[derive(Clone)]
@@ -352,7 +448,7 @@ impl AppSettingsRepository {
             AppSettings,
             "SELECT id, owner_user_id, allow_vod_uploads, vod_threshold_minutes, about_text,
                     smtp_enabled, smtp_host, smtp_port, smtp_tls_mode, smtp_username, smtp_password,
-                    smtp_from_email, smtp_from_name, created_at, updated_at
+                    smtp_from_email, smtp_from_name, user_storage_quota_bytes, created_at, updated_at
              FROM app_settings WHERE id = 1",
             []
         )?
@@ -371,6 +467,11 @@ impl AppSettingsRepository {
         let smtp_from_email = update.smtp_from_email.as_ref().and_then(Option::as_deref);
         let update_smtp_from_name = update.smtp_from_name.is_some();
         let smtp_from_name = update.smtp_from_name.as_ref().and_then(Option::as_deref);
+        let update_user_storage_quota_bytes = update.user_storage_quota_bytes.is_some();
+        let user_storage_quota_bytes = update
+            .user_storage_quota_bytes
+            .as_ref()
+            .and_then(|value| value.as_ref().copied());
         db_execute!(
             &self.database,
             "UPDATE app_settings
@@ -385,6 +486,7 @@ impl AppSettingsRepository {
                  smtp_password = CASE WHEN ? THEN ? ELSE smtp_password END,
                  smtp_from_email = CASE WHEN ? THEN ? ELSE smtp_from_email END,
                  smtp_from_name = CASE WHEN ? THEN ? ELSE smtp_from_name END,
+                 user_storage_quota_bytes = CASE WHEN ? THEN ? ELSE user_storage_quota_bytes END,
                  updated_at = ?
              WHERE id = 1",
             [
@@ -404,6 +506,8 @@ impl AppSettingsRepository {
                 smtp_from_email,
                 update_smtp_from_name,
                 smtp_from_name,
+                update_user_storage_quota_bytes,
+                user_storage_quota_bytes,
                 now_utc(),
             ]
         )?;
@@ -509,6 +613,34 @@ impl UserRepository {
              FROM users ORDER BY username ASC",
             []
         )?)
+    }
+
+    pub async fn get_many(&self, ids: &[String]) -> DbResult<Vec<User>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        const USER_SELECT: &str =
+            "SELECT id, username, display_name, email, bio, avatar_key, password_hash, role, is_disabled, storage_quota_bytes, created_at, updated_at, last_login_at FROM users WHERE id IN (";
+        match &self.database {
+            Database::Sqlite(pool) => {
+                let mut builder = QueryBuilder::<Sqlite>::new(USER_SELECT);
+                let mut separated = builder.separated(", ");
+                for id in ids {
+                    separated.push_bind(id);
+                }
+                separated.push_unseparated(")");
+                Ok(builder.build_query_as::<User>().fetch_all(pool).await?)
+            }
+            Database::Postgres(pool) => {
+                let mut builder = QueryBuilder::<Postgres>::new(USER_SELECT);
+                let mut separated = builder.separated(", ");
+                for id in ids {
+                    separated.push_bind(id);
+                }
+                separated.push_unseparated(")");
+                Ok(builder.build_query_as::<User>().fetch_all(pool).await?)
+            }
+        }
     }
 
     pub async fn count_all(&self) -> DbResult<i64> {
@@ -729,6 +861,15 @@ impl SessionRepository {
         Ok(())
     }
 
+    pub async fn delete_for_user(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "DELETE FROM sessions WHERE user_id = ?",
+            [user_id]
+        )?;
+        Ok(())
+    }
+
     pub async fn revoke_for_user_by_id(&self, user_id: &str, id: &str) -> DbResult<u64> {
         Ok(db_execute_rows!(
             &self.database,
@@ -773,6 +914,79 @@ impl DeviceTokenRepository {
         Ok(self.get(&new.id).await?.ok_or(sqlx::Error::RowNotFound)?)
     }
 
+    pub async fn create_if_under_active_limit(
+        &self,
+        new: &NewDeviceToken,
+        active_limit: i64,
+    ) -> DbResult<Option<DeviceToken>> {
+        let now = now_utc();
+        let inserted = match &self.database {
+            Database::Sqlite(pool) => sqlx::query(
+                "INSERT INTO device_tokens (id, user_id, name, token_hash, created_at, last_used_at, expires_at, revoked_at)
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                 WHERE (
+                   SELECT COUNT(*) FROM device_tokens
+                   WHERE user_id = ? AND revoked_at IS NULL
+                     AND (expires_at IS NULL OR expires_at > ?)
+                 ) < ?",
+            )
+            .bind(&new.id)
+            .bind(&new.user_id)
+            .bind(&new.name)
+            .bind(&new.token_hash)
+            .bind(new.created_at)
+            .bind(new.last_used_at)
+            .bind(new.expires_at)
+            .bind(new.revoked_at)
+            .bind(&new.user_id)
+            .bind(now)
+            .bind(active_limit)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            Database::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+                    .bind(&new.user_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                let active = sqlx::query_as::<_, (i64,)>(
+                    "SELECT COUNT(*) FROM device_tokens
+                     WHERE user_id = $1 AND revoked_at IS NULL
+                       AND (expires_at IS NULL OR expires_at > $2)",
+                )
+                .bind(&new.user_id)
+                .bind(now)
+                .fetch_one(&mut *transaction)
+                .await?
+                .0;
+                if active >= active_limit {
+                    return Ok(None);
+                }
+                sqlx::query(
+                    "INSERT INTO device_tokens (id, user_id, name, token_hash, created_at, last_used_at, expires_at, revoked_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(&new.id)
+                .bind(&new.user_id)
+                .bind(&new.name)
+                .bind(&new.token_hash)
+                .bind(new.created_at)
+                .bind(new.last_used_at)
+                .bind(new.expires_at)
+                .bind(new.revoked_at)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                1
+            }
+        };
+        if inserted == 0 {
+            return Ok(None);
+        }
+        self.get(&new.id).await
+    }
+
     pub async fn get(&self, id: &str) -> DbResult<Option<DeviceToken>> {
         Ok(db_fetch_optional!(
             &self.database,
@@ -801,6 +1015,20 @@ impl DeviceTokenRepository {
              FROM device_tokens WHERE user_id = ? ORDER BY created_at DESC",
             [user_id]
         )?)
+    }
+
+    pub async fn count_active_for_user(&self, user_id: &str) -> DbResult<i64> {
+        let now = now_utc();
+        Ok(db_fetch_optional!(
+            &self.database,
+            (i64,),
+            "SELECT COUNT(*) FROM device_tokens
+             WHERE user_id = ? AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?)",
+            [user_id, now]
+        )?
+        .map(|row| row.0)
+        .unwrap_or_default())
     }
 
     pub async fn touch(&self, id: &str) -> DbResult<()> {
@@ -834,6 +1062,15 @@ impl DeviceTokenRepository {
             &self.database,
             "UPDATE device_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
             [now_utc(), user_id]
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "DELETE FROM device_tokens WHERE user_id = ?",
+            [user_id]
         )?;
         Ok(())
     }
@@ -1014,6 +1251,35 @@ impl ClipRepository {
         }
     }
 
+    pub async fn stats_for_owner(&self, params: &ClipListParams) -> DbResult<ClipListStats> {
+        let row = match &self.database {
+            Database::Sqlite(pool) => {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "SELECT COUNT(*), CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT) FROM clips",
+                );
+                push_clip_list_filters_sqlite(&mut builder, params);
+                builder
+                    .build_query_as::<(i64, i64)>()
+                    .fetch_one(pool)
+                    .await?
+            }
+            Database::Postgres(pool) => {
+                let mut builder = QueryBuilder::<Postgres>::new(
+                    "SELECT COUNT(*), CAST(COALESCE(SUM(file_size_bytes), 0) AS BIGINT) FROM clips",
+                );
+                push_clip_list_filters_postgres(&mut builder, params);
+                builder
+                    .build_query_as::<(i64, i64)>()
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(ClipListStats {
+            total: row.0,
+            total_size_bytes: row.1,
+        })
+    }
+
     pub async fn list_public(&self, params: &PublicClipListParams) -> DbResult<Vec<Clip>> {
         match &self.database {
             Database::Sqlite(pool) => {
@@ -1042,24 +1308,50 @@ impl ClipRepository {
     pub async fn list_public_games(&self) -> DbResult<Vec<PublicGameSummary>> {
         let rows = db_fetch_all!(
             &self.database,
-            (String, i64),
-            "SELECT game, CAST(COUNT(*) AS BIGINT) AS clip_count
-             FROM (
-               SELECT COALESCE(NULLIF(TRIM(game_name), ''), NULLIF(TRIM(game_id), '')) AS game
-               FROM clips
-               WHERE visibility = 'public'
-                 AND status = 'ready'
-                 AND deleted_at IS NULL
-                 AND public_share_id IS NOT NULL
-             ) public_games
-             WHERE game IS NOT NULL
-             GROUP BY game
-             ORDER BY LOWER(game) ASC, game ASC",
+            (String, String, i64),
+            "SELECT category.id, category.display_name, CAST(COUNT(*) AS BIGINT) AS clip_count
+             FROM clips clip
+             JOIN game_category_names category_name
+               ON LOWER(category_name.reported_name) = LOWER(clip.game_name)
+             JOIN game_categories category ON category.id = category_name.category_id
+             WHERE clip.visibility = 'public'
+               AND clip.status = 'ready'
+               AND clip.deleted_at IS NULL
+               AND clip.public_share_id IS NOT NULL
+             GROUP BY category.id, category.display_name
+             ORDER BY LOWER(category.display_name) ASC, category.display_name ASC, category.id ASC",
             []
         )?;
         Ok(rows
             .into_iter()
-            .map(|(game, clip_count)| PublicGameSummary { game, clip_count })
+            .map(
+                |(category_id, display_name, clip_count)| PublicGameSummary {
+                    category_id,
+                    display_name,
+                    clip_count,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn list_game_names(&self) -> DbResult<Vec<GameNameSummary>> {
+        let rows = db_fetch_all!(
+            &self.database,
+            (String, i64),
+            "SELECT MIN(game_name), CAST(COUNT(*) AS BIGINT) AS clip_count
+             FROM clips
+             WHERE game_name IS NOT NULL AND TRIM(game_name) <> ''
+               AND deleted_at IS NULL AND status <> 'deleted'
+             GROUP BY LOWER(game_name)
+             ORDER BY LOWER(MIN(game_name)) ASC, MIN(game_name) ASC",
+            []
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(game_name, clip_count)| GameNameSummary {
+                game_name,
+                clip_count,
+            })
             .collect())
     }
 
@@ -1246,7 +1538,6 @@ impl ClipRepository {
         id: &str,
         title: &str,
         description: Option<&str>,
-        game_name: Option<&str>,
         game_id: Option<&str>,
         game_executable: Option<&str>,
         source_type: Option<&str>,
@@ -1256,13 +1547,12 @@ impl ClipRepository {
         db_execute!(
             &self.database,
             "UPDATE clips
-             SET title = ?, description = ?, game_name = ?, game_id = ?, game_executable = ?,
+             SET title = ?, description = ?, game_id = ?, game_executable = ?,
                  source_type = ?, recorded_at = ?, duration_ms = ?, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'",
             [
                 title,
                 description,
-                game_name,
                 game_id,
                 game_executable,
                 source_type,
@@ -1387,6 +1677,22 @@ impl ClipRepository {
     pub async fn delete(&self, id: &str) -> DbResult<()> {
         db_execute!(&self.database, "DELETE FROM clips WHERE id = ?", [id])?;
         Ok(())
+    }
+
+    pub async fn list_all_for_owner(&self, owner_user_id: &str) -> DbResult<Vec<Clip>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            Clip,
+            "SELECT
+               id, owner_user_id, client_clip_id, title, description, game_name, game_id, game_executable, source_type,
+               recorded_at, uploaded_at, duration_ms, file_size_bytes, width, height, fps, container,
+               video_codec, audio_codec, checksum_sha256, visibility, status, storage_backend, storage_key,
+               poster_key, thumbnail_key, public_share_id, view_count, created_at, updated_at, deleted_at
+             FROM clips
+             WHERE owner_user_id = ?
+             ORDER BY id ASC",
+            [owner_user_id]
+        )?)
     }
 }
 
@@ -1520,6 +1826,11 @@ fn push_clip_optional_filters_sqlite(
         builder.push_bind(game.clone());
         builder.push(")");
     }
+    if let Some(category_id) = &params.game_category_id {
+        builder.push(" AND EXISTS (SELECT 1 FROM game_category_names category_name WHERE category_name.category_id = ");
+        builder.push_bind(category_id.clone());
+        builder.push(" AND LOWER(category_name.reported_name) = LOWER(game_name))");
+    }
     if let Some(source_type) = &params.source_type {
         builder.push(" AND source_type = ");
         builder.push_bind(source_type.clone());
@@ -1559,8 +1870,10 @@ fn push_clip_optional_filters_sqlite(
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push_bind(pattern.clone());
+        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\')");
+        builder.push(" ESCAPE '\\'))");
     }
 }
 
@@ -1575,6 +1888,11 @@ fn push_clip_optional_filters_postgres(
         builder.push_bind(game.clone());
         builder.push(")");
     }
+    if let Some(category_id) = &params.game_category_id {
+        builder.push(" AND EXISTS (SELECT 1 FROM game_category_names category_name WHERE category_name.category_id = ");
+        builder.push_bind(category_id.clone());
+        builder.push(" AND LOWER(category_name.reported_name) = LOWER(game_name))");
+    }
     if let Some(source_type) = &params.source_type {
         builder.push(" AND source_type = ");
         builder.push_bind(source_type.clone());
@@ -1614,8 +1932,10 @@ fn push_clip_optional_filters_postgres(
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push_bind(pattern.clone());
+        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\')");
+        builder.push(" ESCAPE '\\'))");
     }
 }
 
@@ -1630,6 +1950,11 @@ fn push_public_clip_optional_filters_sqlite(
         builder.push_bind(game.clone());
         builder.push(")");
     }
+    if let Some(category_id) = &params.game_category_id {
+        builder.push(" AND EXISTS (SELECT 1 FROM game_category_names category_name WHERE category_name.category_id = ");
+        builder.push_bind(category_id.clone());
+        builder.push(" AND LOWER(category_name.reported_name) = LOWER(game_name))");
+    }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
         builder.push(" AND (LOWER(title) LIKE ");
@@ -1637,8 +1962,10 @@ fn push_public_clip_optional_filters_sqlite(
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push_bind(pattern.clone());
+        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\')");
+        builder.push(" ESCAPE '\\'))");
     }
 }
 
@@ -1653,6 +1980,11 @@ fn push_public_clip_optional_filters_postgres(
         builder.push_bind(game.clone());
         builder.push(")");
     }
+    if let Some(category_id) = &params.game_category_id {
+        builder.push(" AND EXISTS (SELECT 1 FROM game_category_names category_name WHERE category_name.category_id = ");
+        builder.push_bind(category_id.clone());
+        builder.push(" AND LOWER(category_name.reported_name) = LOWER(game_name))");
+    }
     if let Some(query) = &params.query {
         let pattern = escaped_like_pattern(query);
         builder.push(" AND (LOWER(title) LIKE ");
@@ -1660,8 +1992,10 @@ fn push_public_clip_optional_filters_postgres(
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_name, '')) LIKE ");
         builder.push_bind(pattern.clone());
         builder.push(" ESCAPE '\\' OR LOWER(COALESCE(game_id, '')) LIKE ");
+        builder.push_bind(pattern.clone());
+        builder.push(" ESCAPE '\\' OR EXISTS (SELECT 1 FROM game_category_names search_name JOIN game_categories search_category ON search_category.id = search_name.category_id WHERE LOWER(search_name.reported_name) = LOWER(game_name) AND LOWER(search_category.display_name) LIKE ");
         builder.push_bind(pattern);
-        builder.push(" ESCAPE '\\')");
+        builder.push(" ESCAPE '\\'))");
     }
 }
 
@@ -1714,11 +2048,12 @@ impl ClipCommentRepository {
     pub async fn create(&self, new: &NewClipComment) -> DbResult<ClipComment> {
         db_execute!(
             &self.database,
-            "INSERT INTO clip_comments (id, clip_id, user_id, body, created_at, updated_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO clip_comments (id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 &new.id,
                 &new.clip_id,
+                new.parent_comment_id.as_deref(),
                 &new.user_id,
                 &new.body,
                 new.created_at,
@@ -1734,7 +2069,7 @@ impl ClipCommentRepository {
         Ok(db_fetch_optional!(
             &self.database,
             ClipComment,
-            "SELECT id, clip_id, user_id, body, created_at, updated_at, deleted_at
+            "SELECT id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at
              FROM clip_comments WHERE id = ?",
             [id]
         )?)
@@ -1744,16 +2079,24 @@ impl ClipCommentRepository {
         Ok(db_fetch_all!(
             &self.database,
             ClipComment,
-            "SELECT id, clip_id, user_id, body, created_at, updated_at, deleted_at
+            "SELECT id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at
              FROM (
-               SELECT id, clip_id, user_id, body, created_at, updated_at, deleted_at
+               SELECT id, clip_id, parent_comment_id, user_id, body, created_at, updated_at, deleted_at
                FROM clip_comments
-               WHERE clip_id = ? AND deleted_at IS NULL
+               WHERE clip_id = ?
+                 AND deleted_at IS NULL
+                 AND (
+                   parent_comment_id IS NULL
+                   OR parent_comment_id IN (
+                     SELECT id FROM clip_comments
+                     WHERE clip_id = ? AND parent_comment_id IS NULL AND deleted_at IS NULL
+                   )
+                 )
                ORDER BY created_at DESC, id DESC
                LIMIT ?
              ) recent_comments
              ORDER BY created_at ASC, id ASC",
-            [clip_id, limit]
+            [clip_id, clip_id, limit]
         )?)
     }
 
@@ -1767,6 +2110,15 @@ impl ClipCommentRepository {
             [now, now, id]
         )?;
         Ok(rows_affected > 0)
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "DELETE FROM clip_comments WHERE user_id = ?",
+            [user_id]
+        )?;
+        Ok(())
     }
 }
 
@@ -1889,6 +2241,19 @@ impl UploadSessionRepository {
              FROM upload_sessions WHERE clip_id = ?
              ORDER BY created_at DESC, id DESC LIMIT 1",
             [clip_id]
+        )?)
+    }
+
+    pub async fn list_for_user(&self, user_id: &str) -> DbResult<Vec<UploadSession>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            UploadSession,
+            "SELECT id, clip_id, user_id, status, expected_size_bytes, received_size_bytes, part_size_bytes,
+                    storage_key, storage_upload_id, checksum_sha256, failure_reason, created_at, updated_at, completed_at, failed_at, expires_at
+             FROM upload_sessions
+             WHERE user_id = ?
+             ORDER BY created_at ASC, id ASC",
+            [user_id]
         )?)
     }
 
@@ -2016,6 +2381,23 @@ impl UploadSessionRepository {
         )?)
     }
 
+    pub async fn list_failed_with_reason(
+        &self,
+        reason: &str,
+        limit: i64,
+    ) -> DbResult<Vec<UploadSession>> {
+        Ok(db_fetch_all!(
+            &self.database,
+            UploadSession,
+            "SELECT id, clip_id, user_id, status, expected_size_bytes, received_size_bytes, part_size_bytes,
+                    storage_key, storage_upload_id, checksum_sha256, failure_reason, created_at, updated_at, completed_at, failed_at, expires_at
+             FROM upload_sessions
+             WHERE status = 'failed' AND failure_reason = ?
+             ORDER BY updated_at ASC, id ASC LIMIT ?",
+            [reason, limit]
+        )?)
+    }
+
     pub async fn delete(&self, id: &str) -> DbResult<()> {
         db_execute!(
             &self.database,
@@ -2030,6 +2412,15 @@ impl UploadSessionRepository {
             &self.database,
             "DELETE FROM upload_sessions WHERE clip_id = ?",
             [clip_id]
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "DELETE FROM upload_sessions WHERE user_id = ?",
+            [user_id]
         )?;
         Ok(())
     }
@@ -2099,7 +2490,8 @@ impl UploadPartRepository {
         Ok(db_fetch_optional!(
             &self.database,
             (i64,),
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM upload_parts WHERE upload_session_id = ?",
+            "SELECT CAST(COALESCE(SUM(size_bytes), 0) AS BIGINT)
+             FROM upload_parts WHERE upload_session_id = ?",
             [upload_session_id]
         )?
         .map(|row| row.0)
@@ -2161,6 +2553,63 @@ impl JobRepository {
         )?;
 
         Ok(self.get(&new.id).await?.ok_or(sqlx::Error::RowNotFound)?)
+    }
+
+    pub async fn create_if_absent_active(&self, new: &NewJob) -> DbResult<Job> {
+        match self.create(new).await {
+            Ok(job) => Ok(job),
+            Err(error) if error.is_unique_violation() => {
+                if let Some(job) = self
+                    .get_active_by_kind_and_target(
+                        &new.kind,
+                        new.target_type.as_deref(),
+                        new.target_id.as_deref(),
+                    )
+                    .await?
+                {
+                    return Ok(job);
+                }
+
+                // The conflicting job may have completed between the unique-index
+                // check and the lookup. In that case a fresh active job is valid.
+                self.create(new).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn get_active_by_kind_and_target(
+        &self,
+        kind: &str,
+        target_type: Option<&str>,
+        target_id: Option<&str>,
+    ) -> DbResult<Option<Job>> {
+        match target_id {
+            Some(target_id) => Ok(db_fetch_optional!(
+                &self.database,
+                Job,
+                "SELECT id, kind, status, target_type, target_id, attempts, max_attempts, next_run_at,
+                        locked_by, locked_at, last_error, created_at, updated_at
+                 FROM jobs
+                 WHERE kind = ?
+                   AND COALESCE(target_type, '') = COALESCE(?, '')
+                   AND target_id = ?
+                   AND status IN ('pending','running')
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                [kind, target_type, target_id]
+            )?),
+            None => Ok(db_fetch_optional!(
+                &self.database,
+                Job,
+                "SELECT id, kind, status, target_type, target_id, attempts, max_attempts, next_run_at,
+                        locked_by, locked_at, last_error, created_at, updated_at
+                 FROM jobs
+                 WHERE kind = ? AND target_id IS NULL
+                   AND status = 'pending'
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                [kind]
+            )?),
+        }
     }
 
     pub async fn get(&self, id: &str) -> DbResult<Option<Job>> {
@@ -2403,6 +2852,15 @@ impl JobRepository {
         db_execute!(&self.database, "DELETE FROM jobs WHERE id = ?", [id])?;
         Ok(())
     }
+
+    pub async fn delete_for_clip(&self, clip_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "DELETE FROM jobs WHERE target_type = 'clip' AND target_id = ?",
+            [clip_id]
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -2463,6 +2921,15 @@ impl AuditLogRepository {
              FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ?",
             [limit]
         )?)
+    }
+
+    pub async fn clear_actor(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "UPDATE audit_log SET actor_user_id = NULL WHERE actor_user_id = ?",
+            [user_id]
+        )?;
+        Ok(())
     }
 }
 
@@ -2562,15 +3029,17 @@ impl InvitationTokenRepository {
     pub async fn create(&self, new: &NewInvitationToken) -> DbResult<InvitationToken> {
         db_execute!(
             &self.database,
-            "INSERT INTO invitation_tokens (id, token_hash, role, created_by_user_id, created_at, expires_at, used_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO invitation_tokens (id, token_hash, claim_token_hash, role, created_by_user_id, created_at, expires_at, claimed_at, used_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 &new.id,
                 &new.token_hash,
+                new.claim_token_hash.as_deref(),
                 &new.role,
                 new.created_by_user_id.as_deref(),
                 new.created_at,
                 new.expires_at,
+                new.claimed_at,
                 new.used_at,
             ]
         )?;
@@ -2582,7 +3051,7 @@ impl InvitationTokenRepository {
         Ok(db_fetch_optional!(
             &self.database,
             InvitationToken,
-            "SELECT id, token_hash, role, created_by_user_id, created_at, expires_at, used_at
+            "SELECT id, token_hash, claim_token_hash, role, created_by_user_id, created_at, expires_at, claimed_at, used_at
              FROM invitation_tokens WHERE id = ?",
             [id]
         )?)
@@ -2592,20 +3061,59 @@ impl InvitationTokenRepository {
         Ok(db_fetch_optional!(
             &self.database,
             InvitationToken,
-            "SELECT id, token_hash, role, created_by_user_id, created_at, expires_at, used_at
+            "SELECT id, token_hash, claim_token_hash, role, created_by_user_id, created_at, expires_at, claimed_at, used_at
              FROM invitation_tokens WHERE token_hash = ?",
             [token_hash]
         )?)
     }
 
-    pub async fn mark_used_if_valid(
+    pub async fn get_by_claim_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> DbResult<Option<InvitationToken>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            InvitationToken,
+            "SELECT id, token_hash, claim_token_hash, role, created_by_user_id, created_at, expires_at, claimed_at, used_at
+             FROM invitation_tokens WHERE claim_token_hash = ?",
+            [token_hash]
+        )?)
+    }
+
+    pub async fn claim_if_valid(
+        &self,
+        id: &str,
+        claim_token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<bool> {
+        let rows = db_execute_rows!(
+            &self.database,
+            "UPDATE invitation_tokens
+             SET claim_token_hash = ?, claimed_at = ?
+             WHERE id = ?
+               AND claim_token_hash IS NULL
+               AND claimed_at IS NULL
+               AND used_at IS NULL
+               AND expires_at > ?",
+            [claim_token_hash, now, id, now]
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub async fn mark_claim_used_if_valid(
         &self,
         id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DbResult<bool> {
         let rows = db_execute_rows!(
             &self.database,
-            "UPDATE invitation_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL AND expires_at > ?",
+            "UPDATE invitation_tokens
+             SET used_at = ?
+             WHERE id = ?
+               AND claim_token_hash IS NOT NULL
+               AND claimed_at IS NOT NULL
+               AND used_at IS NULL
+               AND expires_at > ?",
             [now, id, now]
         )?;
         Ok(rows > 0)
@@ -2616,6 +3124,15 @@ impl InvitationTokenRepository {
             &self.database,
             "DELETE FROM invitation_tokens WHERE id = ?",
             [id]
+        )?;
+        Ok(())
+    }
+
+    pub async fn clear_created_by(&self, user_id: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "UPDATE invitation_tokens SET created_by_user_id = NULL WHERE created_by_user_id = ?",
+            [user_id]
         )?;
         Ok(())
     }
