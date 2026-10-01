@@ -30,6 +30,11 @@ tokens. The MinIO profile is for local S3 testing only: MinIO ports bind to `127
 are generated into the local secrets volume, and operators should use `docker-compose.s3.yml` with a
 real private bucket for production object storage.
 
+The MinIO profile builds its server and client from the upstream source commits pinned in
+`deploy/compose/minio/Dockerfile`, since the published community images were withdrawn. Keep the
+`minio/` directory alongside the Compose file when copying this profile. The first start downloads
+the Go build image and dependencies; subsequent starts reuse Docker's build cache.
+
 For production-style local disk deployments without a git clone, prefer
 `docker-compose.standalone.yml`. It avoids the `clipline-secrets` helper container and reads the
 session secret from `./secrets/session_secret.txt`.
