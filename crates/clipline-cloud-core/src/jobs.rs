@@ -763,6 +763,13 @@ impl JobRunner {
                     clip_id = %clip.id,
                     source_size_bytes = source_metadata.size_bytes,
                 );
+                // Ready clips only drift from their stored size when an earlier
+                // attempt replaced the source before recording it, so the source
+                // is already optimized; mark it so backfill does not lose track.
+                self.repositories
+                    .clips
+                    .record_video_optimization(&clip.id, "reconciled")
+                    .await?;
                 self.enqueue_media_refresh_jobs_best_effort(
                     &clip.id,
                     "jobs.optimize_video.refresh_enqueue_failed_after_reconcile",
@@ -2362,6 +2369,83 @@ mod tests {
         )
     }
 
+    async fn write_test_mp4(path: &std::path::Path, faststart: bool) {
+        let mut command = tokio::process::Command::new("ffmpeg");
+        command.args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=15",
+            "-t",
+            "0.5",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ]);
+        if faststart {
+            command.args(["-movflags", "+faststart"]);
+        }
+        assert!(command.arg(path).status().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn reconciled_optimize_video_records_an_outcome_for_backfill() {
+        let (temp_dir, repositories) = sqlite_repositories().await;
+        let storage = Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
+        storage.probe().await.expect("probe");
+        let user = repositories
+            .users
+            .create(&NewUser::new("admin", "hash", "admin"))
+            .await
+            .expect("user");
+        let source = temp_dir.path().join("source.mp4");
+        write_test_mp4(&source, false).await;
+        let source_size = fs::metadata(&source).await.unwrap().len() as i64;
+        let keys = MediaObjectKeys::generate().expect("keys");
+        storage
+            .put_file(&keys.source, &source, PutObjectMetadata::new("video/mp4"))
+            .await
+            .expect("put source");
+        // A source replaced before its new size was recorded.
+        let mut clip = NewClip::new(&user.id, "replaced source", "local");
+        clip.status = "ready".to_string();
+        clip.file_size_bytes = Some(source_size + 1);
+        clip.storage_key = Some(keys.source.as_str().to_string());
+        let clip = repositories.clips.create(&clip).await.expect("clip");
+        let job = enqueue_optimize_video(&repositories, &clip.id)
+            .await
+            .expect("enqueue optimize");
+
+        let runner = optimization_runner(
+            &repositories,
+            storage,
+            VideoOptimizationConfig {
+                enabled: true,
+                ..VideoOptimizationConfig::default()
+            },
+        );
+        assert!(runner.run_once().await.expect("run once"));
+
+        let job = repositories.jobs.get(&job.id).await.unwrap().unwrap();
+        assert_eq!(job.status, "succeeded", "{:?}", job.last_error);
+        let clip = repositories.clips.get(&clip.id).await.unwrap().unwrap();
+        assert_eq!(clip.file_size_bytes, Some(source_size));
+        assert_eq!(
+            repositories
+                .clips
+                .video_optimization_outcome(&clip.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("reconciled")
+        );
+    }
+
     fn second_box_type(bytes: &[u8]) -> &[u8] {
         let first = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
         &bytes[first + 4..first + 8]
@@ -2383,27 +2467,7 @@ mod tests {
                 .await
                 .expect("user");
             let source = temp_dir.path().join("source.mp4");
-            let mut command = tokio::process::Command::new("ffmpeg");
-            command.args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=size=320x180:rate=15",
-                "-t",
-                "0.5",
-                "-c:v",
-                "libx264",
-                "-threads",
-                "1",
-                "-pix_fmt",
-                "yuv420p",
-            ]);
-            if faststart {
-                command.args(["-movflags", "+faststart"]);
-            }
-            assert!(command.arg(&source).status().await.unwrap().success());
+            write_test_mp4(&source, faststart).await;
             let source_size = fs::metadata(&source).await.unwrap().len();
             let keys = MediaObjectKeys::generate().expect("keys");
             storage
