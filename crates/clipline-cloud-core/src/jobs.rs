@@ -762,13 +762,6 @@ impl JobRunner {
                     clip_id = %clip.id,
                     source_size_bytes = source_metadata.size_bytes,
                 );
-                // Ready clips only drift from their stored size when an earlier
-                // attempt replaced the source before recording it, so the source
-                // is already optimized; mark it so backfill does not lose track.
-                self.repositories
-                    .clips
-                    .record_video_optimization(&clip.id, "reconciled")
-                    .await?;
                 self.enqueue_media_refresh_jobs_best_effort(
                     &clip.id,
                     "jobs.optimize_video.refresh_enqueue_failed_after_reconcile",
@@ -1019,6 +1012,10 @@ impl JobRunner {
         Ok(())
     }
 
+    /// Ready clips only drift from their stored size when an earlier attempt
+    /// replaced the source before recording it, so the source is already
+    /// optimized. Metadata and outcome are written together: a matching size
+    /// without an outcome would make a retry encode the optimized source again.
     async fn refresh_source_metadata_from_storage(
         &self,
         clip: &Clip,
@@ -1031,8 +1028,7 @@ impl JobRunner {
             .probe_metadata(&self.storage, source_key)
             .await?;
         self.repositories
-            .clips
-            .update_source_metadata(
+            .record_optimized_source(
                 &clip.id,
                 i64::try_from(source_size_bytes).map_err(|_| {
                     JobRunnerError::Validation("source object is too large".to_string())
@@ -1045,6 +1041,7 @@ impl JobRunner {
                 metadata.fps,
                 metadata.video_codec.as_deref(),
                 metadata.audio_codec.as_deref(),
+                "reconciled",
             )
             .await?;
         Ok(())

@@ -1819,40 +1819,6 @@ impl ClipRepository {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_source_metadata(
-        &self,
-        id: &str,
-        file_size_bytes: i64,
-        checksum_sha256: &str,
-        container: Option<&str>,
-        duration_ms: Option<i64>,
-        width: Option<i64>,
-        height: Option<i64>,
-        fps: Option<f64>,
-        video_codec: Option<&str>,
-        audio_codec: Option<&str>,
-    ) -> DbResult<()> {
-        db_execute!(
-            &self.database,
-            UPDATE_SOURCE_METADATA_SQL,
-            [
-                file_size_bytes,
-                checksum_sha256,
-                container,
-                duration_ms,
-                width,
-                height,
-                fps,
-                video_codec,
-                audio_codec,
-                now_utc(),
-                id,
-            ]
-        )?;
-        Ok(())
-    }
-
     pub async fn set_media_artifact_keys(
         &self,
         id: &str,
