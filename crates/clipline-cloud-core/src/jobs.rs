@@ -7,7 +7,8 @@ use std::{
 use chrono::Duration as ChronoDuration;
 use clipline_cloud_db::{now_utc, Clip, Job, NewJob, Repositories, UploadSession};
 use clipline_cloud_storage::{
-    ByteRange, ObjectKey, ObjectSummary, PutObjectMetadata, SharedStorageBackend, StorageError,
+    ByteRange, ObjectKey, ObjectMetadata, ObjectSummary, PutObjectMetadata, SharedStorageBackend,
+    StorageError,
 };
 use rand::{rngs::OsRng, Rng};
 use sha2::{Digest, Sha256};
@@ -20,14 +21,15 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::media_processing::{
-    media_keys_for_clip, MediaProcessingError, MediaProcessor, ValidatedMediaMetadata,
-    VideoOptimizationSettings,
+    media_keys_for_clip, MediaProcessingError, MediaProcessor, OptimizedVideoCandidate,
+    ValidatedMediaMetadata, VideoOptimizationSettings,
 };
 
 pub const VALIDATE_OBJECT_KIND: &str = "validate_object";
 pub const REFRESH_ARTIFACTS_KIND: &str = "refresh_artifacts";
 pub const PROBE_METADATA_KIND: &str = "probe_metadata";
 pub const OPTIMIZE_VIDEO_KIND: &str = "optimize_video";
+pub const OPTIMIZE_VIDEO_BACKFILL_KIND: &str = "optimize_video_backfill";
 pub const THUMBNAIL_KIND: &str = "thumbnail";
 pub const POSTER_KIND: &str = "poster";
 pub const CLEANUP_SESSION_KIND: &str = "cleanup_session";
@@ -37,6 +39,8 @@ const CLEANUP_SESSION_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CLEANUP_CLIP_BATCH_SIZE: i64 = 100;
 const CLEANUP_CLIP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CLEANUP_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
+const OPTIMIZE_VIDEO_BACKFILL_INTERVAL: Duration = Duration::from_secs(30);
+const OPTIMIZE_VIDEO_BACKFILL_CURSOR: &str = "optimize_video_backfill";
 const MEDIA_OBJECT_PREFIX: &str = "objects/media/";
 const MISSING_SOURCE_FAILURE_REASON: &str = "ready clip source object is missing";
 
@@ -58,6 +62,8 @@ pub struct VideoOptimizationConfig {
     pub settings: VideoOptimizationSettings,
     pub min_savings_percent: u8,
     pub keep_original: bool,
+    /// Also optimize clips that were ready before optimization was enabled.
+    pub backfill: bool,
 }
 
 impl Default for VideoOptimizationConfig {
@@ -67,6 +73,7 @@ impl Default for VideoOptimizationConfig {
             settings: VideoOptimizationSettings::default(),
             min_savings_percent: 5,
             keep_original: false,
+            backfill: false,
         }
     }
 }
@@ -165,6 +172,29 @@ pub async fn ensure_cleanup_clip_sweep(
     enqueue_cleanup_clip_sweep(repositories, now_utc())
         .await
         .map(Some)
+}
+
+pub async fn ensure_optimize_video_backfill(
+    repositories: &Repositories,
+) -> Result<Option<Job>, JobRunnerError> {
+    if repositories
+        .jobs
+        .count_active_global_kind(OPTIMIZE_VIDEO_BACKFILL_KIND)
+        .await?
+        > 0
+    {
+        return Ok(None);
+    }
+    enqueue_optimize_video_backfill(repositories, now_utc())
+        .await
+        .map(Some)
+}
+
+pub async fn enqueue_optimize_video_backfill(
+    repositories: &Repositories,
+    next_run_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Job, JobRunnerError> {
+    enqueue_global_job(repositories, OPTIMIZE_VIDEO_BACKFILL_KIND, next_run_at).await
 }
 
 pub async fn enqueue_cleanup_session_sweep(
@@ -395,6 +425,7 @@ impl JobRunner {
             REFRESH_ARTIFACTS_KIND => self.refresh_artifacts(job).await,
             PROBE_METADATA_KIND => self.probe_metadata(job).await,
             OPTIMIZE_VIDEO_KIND => self.optimize_video(job).await,
+            OPTIMIZE_VIDEO_BACKFILL_KIND => self.backfill_optimize_video(job).await,
             THUMBNAIL_KIND => self.generate_thumbnail(job).await,
             POSTER_KIND => self.generate_poster(job).await,
             CLEANUP_SESSION_KIND => self.cleanup_sessions(job).await,
@@ -457,6 +488,15 @@ impl JobRunner {
         }
         if job.kind == OPTIMIZE_VIDEO_KIND {
             if let Some(clip_id) = job.target_id.as_deref() {
+                // Marking the failure keeps backfill from retrying a clip forever.
+                if let Err(error) = self
+                    .repositories
+                    .clips
+                    .record_video_optimization(clip_id, "failed")
+                    .await
+                {
+                    warn!(event = "jobs.optimize_video.failure_record_failed", clip_id = %clip_id, error = %error);
+                }
                 self.enqueue_media_refresh_jobs_best_effort(
                     clip_id,
                     "jobs.optimize_video.refresh_enqueue_failed_after_dead",
@@ -495,6 +535,14 @@ impl JobRunner {
                 enqueue_cleanup_clip_sweep(
                     &self.repositories,
                     now + chrono_duration(CLEANUP_CLIP_INTERVAL),
+                )
+                .await?;
+                Ok(true)
+            }
+            OPTIMIZE_VIDEO_BACKFILL_KIND => {
+                enqueue_optimize_video_backfill(
+                    &self.repositories,
+                    now + chrono_duration(OPTIMIZE_VIDEO_BACKFILL_INTERVAL),
                 )
                 .await?;
                 Ok(true)
@@ -723,9 +771,7 @@ impl JobRunner {
                 return Ok(());
             }
         }
-        let candidate_key = optimized_candidate_key(&source_key)?;
-        let original_key = original_source_key(&source_key)?;
-        let candidate = self
+        let encoded = self
             .media_processor
             .optimize_video(
                 &self.storage,
@@ -733,6 +779,67 @@ impl JobRunner {
                 &self.config.video_optimization.settings,
             )
             .await?;
+        if is_meaningfully_smaller(
+            encoded.size_bytes,
+            source_metadata.size_bytes,
+            self.config.video_optimization.min_savings_percent,
+        ) {
+            return self
+                .activate_video_candidate(
+                    &clip,
+                    &source_key,
+                    &source_metadata,
+                    encoded,
+                    "reencoded",
+                )
+                .await;
+        }
+        let encoded_size = encoded.size_bytes;
+        drop(encoded);
+
+        // Re-encoding did not pay off, but a tail-indexed source still stalls
+        // playback start and seeks; moving the index forward is lossless.
+        if let Some(remuxed) = self
+            .media_processor
+            .remux_faststart(&self.storage, &source_key)
+            .await?
+        {
+            return self
+                .activate_video_candidate(
+                    &clip,
+                    &source_key,
+                    &source_metadata,
+                    remuxed,
+                    "faststart_remux",
+                )
+                .await;
+        }
+
+        info!(
+            event = "jobs.optimize_video.skipped",
+            clip_id = %clip.id,
+            original_size_bytes = source_metadata.size_bytes,
+            candidate_size_bytes = encoded_size,
+            min_savings_percent = self.config.video_optimization.min_savings_percent,
+        );
+        self.repositories
+            .clips
+            .record_video_optimization(&clip.id, "skipped")
+            .await?;
+        self.enqueue_media_refresh_jobs(&clip.id).await?;
+        Ok(())
+    }
+
+    async fn activate_video_candidate(
+        &self,
+        clip: &Clip,
+        source_key: &ObjectKey,
+        source_metadata: &ObjectMetadata,
+        candidate: OptimizedVideoCandidate,
+        outcome: &'static str,
+    ) -> Result<(), JobRunnerError> {
+        let candidate_key = optimized_candidate_key(source_key)?;
+        let original_key = original_source_key(source_key)?;
         let candidate_size = candidate.size_bytes;
         let candidate_checksum = candidate.checksum_sha256.clone();
         let mut candidate_metadata = PutObjectMetadata::new("video/mp4");
@@ -752,23 +859,6 @@ impl JobRunner {
                 .get_object(&candidate_key, Some(ByteRange::new(0, Some(0))))
                 .await?;
 
-            if !is_meaningfully_smaller(
-                candidate_size,
-                source_metadata.size_bytes,
-                self.config.video_optimization.min_savings_percent,
-            ) {
-                delete_if_present(&self.storage, &candidate_key).await?;
-                info!(
-                    event = "jobs.optimize_video.skipped",
-                    clip_id = %clip.id,
-                    original_size_bytes = source_metadata.size_bytes,
-                    candidate_size_bytes = candidate_size,
-                    min_savings_percent = self.config.video_optimization.min_savings_percent,
-                );
-                self.enqueue_media_refresh_jobs(&clip.id).await?;
-                return Ok(());
-            }
-
             if self.config.video_optimization.keep_original
                 && !self.storage.object_exists(&original_key).await?
             {
@@ -779,11 +869,11 @@ impl JobRunner {
                     .or_else(|| clip.checksum_sha256.clone())
                 {
                     Some(checksum) => checksum,
-                    None => sha256_object_hex(&self.storage, &source_key).await?,
+                    None => sha256_object_hex(&self.storage, source_key).await?,
                 };
                 metadata.checksum_sha256 = Some(checksum);
                 self.storage
-                    .copy_object(&source_key, &original_key, metadata)
+                    .copy_object(source_key, &original_key, metadata)
                     .await?;
             }
 
@@ -803,7 +893,7 @@ impl JobRunner {
             let mut source_put_metadata = PutObjectMetadata::new("video/mp4");
             source_put_metadata.checksum_sha256 = Some(candidate_checksum.clone());
             self.storage
-                .copy_object(&candidate_key, &source_key, source_put_metadata)
+                .copy_object(&candidate_key, source_key, source_put_metadata)
                 .await?;
             if self
                 .repositories
@@ -814,12 +904,12 @@ impl JobRunner {
                     clip.deleted_at.is_some() || clip.status == "deleted"
                 })
             {
-                delete_if_present(&self.storage, &source_key).await?;
+                delete_if_present(&self.storage, source_key).await?;
                 delete_if_present(&self.storage, &candidate_key).await?;
                 delete_if_present(&self.storage, &original_key).await?;
                 return Ok(());
             }
-            let stored_source = self.storage.head_object(&source_key).await?;
+            let stored_source = self.storage.head_object(source_key).await?;
             if stored_source.size_bytes != candidate_size {
                 return Err(JobRunnerError::Validation(format!(
                     "optimized source size mismatch: expected {}, got {}",
@@ -843,6 +933,10 @@ impl JobRunner {
                     candidate.metadata.audio_codec.as_deref(),
                 )
                 .await?;
+            self.repositories
+                .clips
+                .record_video_optimization(&clip.id, outcome)
+                .await?;
             if let Err(error) = delete_if_present(&self.storage, &candidate_key).await {
                 warn!(
                     event = "jobs.optimize_video.candidate_cleanup_failed_after_activation",
@@ -859,6 +953,7 @@ impl JobRunner {
             info!(
                 event = "jobs.optimize_video.replaced",
                 clip_id = %clip.id,
+                outcome,
                 original_size_bytes = source_metadata.size_bytes,
                 optimized_size_bytes = candidate_size,
                 checksum_sha256 = %candidate_checksum,
@@ -879,6 +974,54 @@ impl JobRunner {
         }
 
         activation_result
+    }
+
+    async fn backfill_optimize_video(&self, job: &Job) -> Result<(), JobRunnerError> {
+        if job.target_type.is_some() || job.target_id.is_some() {
+            return Err(JobRunnerError::InvalidJob(
+                "optimize_video_backfill requires a global job target".to_string(),
+            ));
+        }
+        if !self.config.video_optimization.enabled || !self.config.video_optimization.backfill {
+            return Ok(());
+        }
+
+        // Feeding one clip at a time leaves encode capacity for new uploads.
+        if self
+            .repositories
+            .jobs
+            .count_active_kind(OPTIMIZE_VIDEO_KIND)
+            .await?
+            == 0
+        {
+            let cursor = self
+                .repositories
+                .jobs
+                .sweep_cursor(OPTIMIZE_VIDEO_BACKFILL_CURSOR)
+                .await?;
+            let Some(clip) = self
+                .repositories
+                .clips
+                .next_unoptimized_ready_source_after(cursor.as_deref().unwrap_or(""))
+                .await?
+            else {
+                info!(event = "jobs.optimize_video_backfill.completed");
+                return Ok(());
+            };
+            enqueue_optimize_video(&self.repositories, &clip.id).await?;
+            self.repositories
+                .jobs
+                .set_sweep_cursor(OPTIMIZE_VIDEO_BACKFILL_CURSOR, Some(&clip.id))
+                .await?;
+            info!(event = "jobs.optimize_video_backfill.enqueued", clip_id = %clip.id);
+        }
+
+        enqueue_optimize_video_backfill(
+            &self.repositories,
+            now_utc() + chrono_duration(OPTIMIZE_VIDEO_BACKFILL_INTERVAL),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn refresh_source_metadata_from_storage(
@@ -2177,6 +2320,15 @@ mod tests {
             .expect("get job")
             .expect("job exists");
         assert_eq!(job.status, "dead");
+        assert_eq!(
+            repositories
+                .clips
+                .video_optimization_outcome(&clip.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("failed")
+        );
         let mut queued_kinds = repositories
             .jobs
             .list_due(now_utc() + chrono::Duration::seconds(1), 10)
@@ -2187,6 +2339,212 @@ mod tests {
             .collect::<Vec<_>>();
         queued_kinds.sort();
         assert_eq!(queued_kinds, vec![REFRESH_ARTIFACTS_KIND.to_string()]);
+    }
+
+    fn optimization_runner(
+        repositories: &Repositories,
+        storage: Arc<LocalStorage>,
+        video_optimization: VideoOptimizationConfig,
+    ) -> JobRunner {
+        JobRunner::new(
+            repositories.clone(),
+            storage,
+            JobRunnerConfig {
+                runner_id: "test-runner".to_string(),
+                poll_interval: Duration::from_millis(10),
+                concurrency: 4,
+                lock_timeout: Duration::from_secs(60),
+                retry_base_delay: Duration::from_millis(1),
+                retry_max_delay: Duration::from_millis(10),
+                video_optimization,
+                media_processing: crate::media_processing::MediaProcessingConfig::default(),
+            },
+        )
+    }
+
+    fn second_box_type(bytes: &[u8]) -> &[u8] {
+        let first = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        &bytes[first + 4..first + 8]
+    }
+
+    #[tokio::test]
+    async fn optimize_video_moves_tail_index_forward_when_reencode_does_not_pay_off() {
+        for (faststart, min_savings_percent, expected_outcome) in [
+            (false, 100, "faststart_remux"),
+            (true, 100, "skipped"),
+            (false, 0, "reencoded"),
+        ] {
+            let (temp_dir, repositories) = sqlite_repositories().await;
+            let storage = Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
+            storage.probe().await.expect("probe");
+            let user = repositories
+                .users
+                .create(&NewUser::new("admin", "hash", "admin"))
+                .await
+                .expect("user");
+            let source = temp_dir.path().join("source.mp4");
+            let mut command = tokio::process::Command::new("ffmpeg");
+            command.args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=15",
+                "-t",
+                "0.5",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ]);
+            if faststart {
+                command.args(["-movflags", "+faststart"]);
+            }
+            assert!(command.arg(&source).status().await.unwrap().success());
+            let source_size = fs::metadata(&source).await.unwrap().len();
+            let keys = MediaObjectKeys::generate().expect("keys");
+            storage
+                .put_file(&keys.source, &source, PutObjectMetadata::new("video/mp4"))
+                .await
+                .expect("put source");
+            let mut clip = NewClip::new(&user.id, "tail indexed", "local");
+            clip.status = "ready".to_string();
+            clip.file_size_bytes = Some(source_size as i64);
+            clip.storage_key = Some(keys.source.as_str().to_string());
+            let clip = repositories.clips.create(&clip).await.expect("clip");
+            let job = enqueue_optimize_video(&repositories, &clip.id)
+                .await
+                .expect("enqueue optimize");
+
+            // Requiring 100% savings makes every re-encode "not worth it".
+            let runner = optimization_runner(
+                &repositories,
+                storage.clone(),
+                VideoOptimizationConfig {
+                    enabled: true,
+                    min_savings_percent,
+                    ..VideoOptimizationConfig::default()
+                },
+            );
+            assert!(runner.run_once().await.expect("run once"));
+
+            let job = repositories.jobs.get(&job.id).await.unwrap().unwrap();
+            assert_eq!(job.status, "succeeded", "{:?}", job.last_error);
+            assert_eq!(
+                repositories
+                    .clips
+                    .video_optimization_outcome(&clip.id)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_outcome)
+            );
+            let stored = storage.get_object(&keys.source, None).await.unwrap();
+            assert_eq!(second_box_type(&stored.bytes), b"moov");
+            let clip = repositories.clips.get(&clip.id).await.unwrap().unwrap();
+            assert_eq!(clip.file_size_bytes, Some(stored.bytes.len() as i64));
+            assert_eq!(clip.audio_codec, None);
+            assert!(!storage
+                .object_exists(&optimized_candidate_key(&keys.source).unwrap())
+                .await
+                .unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_feeds_unoptimized_ready_clips_one_at_a_time() {
+        let (temp_dir, repositories) = sqlite_repositories().await;
+        let storage = Arc::new(LocalStorage::new(temp_dir.path().join("storage")));
+        let user = repositories
+            .users
+            .create(&NewUser::new("admin", "hash", "admin"))
+            .await
+            .expect("user");
+        let mut clips = Vec::new();
+        for title in ["optimized", "first", "second"] {
+            let mut clip = NewClip::new(&user.id, title, "local");
+            clip.status = "ready".to_string();
+            clip.storage_key = Some(
+                MediaObjectKeys::generate()
+                    .unwrap()
+                    .source
+                    .as_str()
+                    .to_string(),
+            );
+            clips.push(repositories.clips.create(&clip).await.expect("clip"));
+        }
+        repositories
+            .clips
+            .record_video_optimization(&clips[0].id, "reencoded")
+            .await
+            .unwrap();
+        repositories
+            .clips
+            .record_video_optimization("missing-clip", "failed")
+            .await
+            .expect("missing clips record nothing");
+        let backfill = ensure_optimize_video_backfill(&repositories)
+            .await
+            .unwrap()
+            .expect("backfill job");
+        let runner = optimization_runner(
+            &repositories,
+            storage,
+            VideoOptimizationConfig {
+                enabled: true,
+                backfill: true,
+                ..VideoOptimizationConfig::default()
+            },
+        );
+        let active_optimize_targets = || async {
+            let mut targets = Vec::new();
+            for clip in &clips {
+                if repositories
+                    .jobs
+                    .get_active_by_kind_and_target(
+                        OPTIMIZE_VIDEO_KIND,
+                        Some("clip"),
+                        Some(&clip.id),
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    targets.push(clip.title.clone());
+                }
+            }
+            targets
+        };
+
+        runner.backfill_optimize_video(&backfill).await.unwrap();
+        assert_eq!(active_optimize_targets().await, vec!["first"]);
+        // An optimization in flight holds the backfill back.
+        runner.backfill_optimize_video(&backfill).await.unwrap();
+        assert_eq!(active_optimize_targets().await, vec!["first"]);
+
+        for (finished, next) in [(1, vec!["second"]), (2, Vec::<&str>::new())] {
+            let job = repositories
+                .jobs
+                .get_active_by_kind_and_target(
+                    OPTIMIZE_VIDEO_KIND,
+                    Some("clip"),
+                    Some(&clips[finished].id),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            repositories.jobs.delete(&job.id).await.unwrap();
+            repositories
+                .clips
+                .record_video_optimization(&clips[finished].id, "skipped")
+                .await
+                .unwrap();
+            runner.backfill_optimize_video(&backfill).await.unwrap();
+            assert_eq!(active_optimize_targets().await, next);
+        }
     }
 
     #[tokio::test]

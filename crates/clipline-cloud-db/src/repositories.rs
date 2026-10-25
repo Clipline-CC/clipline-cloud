@@ -1553,6 +1553,43 @@ impl ClipRepository {
         )?)
     }
 
+    /// Next ready clip after `after` whose source has never been through optimization.
+    pub async fn next_unoptimized_ready_source_after(&self, after: &str) -> DbResult<Option<Clip>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            Clip,
+            CLIP_SELECT_SQL.to_string()
+                + " WHERE status = 'ready' AND deleted_at IS NULL AND storage_key IS NOT NULL
+                AND id > ? AND NOT EXISTS (
+                  SELECT 1 FROM clip_video_optimizations WHERE clip_video_optimizations.clip_id = clips.id
+                ) ORDER BY id ASC LIMIT 1",
+            [after]
+        )?)
+    }
+
+    /// Records the final optimization outcome; a clip that no longer exists records nothing.
+    pub async fn record_video_optimization(&self, id: &str, outcome: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            "INSERT INTO clip_video_optimizations (clip_id, outcome, completed_at)
+             SELECT id, ?, ? FROM clips WHERE id = ?
+             ON CONFLICT(clip_id) DO UPDATE SET
+               outcome = excluded.outcome, completed_at = excluded.completed_at",
+            [outcome, now_utc(), id]
+        )?;
+        Ok(())
+    }
+
+    pub async fn video_optimization_outcome(&self, id: &str) -> DbResult<Option<String>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (String,),
+            "SELECT outcome FROM clip_video_optimizations WHERE clip_id = ?",
+            [id]
+        )?
+        .map(|row| row.0))
+    }
+
     pub async fn storage_key_is_referenced(&self, key: &str) -> DbResult<bool> {
         Ok(db_fetch_optional!(
             &self.database,
@@ -3185,6 +3222,17 @@ impl JobRepository {
             "SELECT COUNT(*) FROM jobs
              WHERE kind = ? AND status IN ('pending','running')
                AND target_type IS NULL AND target_id IS NULL",
+            [kind]
+        )?
+        .map(|row| row.0)
+        .unwrap_or_default())
+    }
+
+    pub async fn count_active_kind(&self, kind: &str) -> DbResult<i64> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (i64,),
+            "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('pending','running')",
             [kind]
         )?
         .map(|row| row.0)
