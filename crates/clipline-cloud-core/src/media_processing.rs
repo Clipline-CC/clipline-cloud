@@ -397,10 +397,10 @@ impl MediaProcessor {
                 os("1"),
                 os("-i"),
                 input_path.as_os_str().to_os_string(),
+                // Keep every stream; ffmpeg fails rather than dropping one the
+                // MP4 muxer cannot store, which leaves the source untouched.
                 os("-map"),
-                os("0:v:0"),
-                os("-map"),
-                os("0:a?"),
+                os("0"),
                 os("-c"),
                 os("copy"),
                 os("-movflags"),
@@ -1363,11 +1363,30 @@ mod tests {
             bytes.resize(payload_len + 8, 0);
             bytes
         }
-        let mut large_mdat = 1_u32.to_be_bytes().to_vec();
-        large_mdat.extend_from_slice(b"mdat");
-        large_mdat.extend_from_slice(&24_u64.to_be_bytes());
-        large_mdat.resize(24, 0);
+        // A 64-bit-sized box the walker has to skip using its extended size.
+        let mut large_free = 1_u32.to_be_bytes().to_vec();
+        large_free.extend_from_slice(b"free");
+        large_free.extend_from_slice(&40_u64.to_be_bytes());
+        large_free.resize(40, 0);
         let cases = [
+            (
+                [
+                    mp4_box(b"ftyp", 16),
+                    large_free.clone(),
+                    mp4_box(b"moov", 32),
+                ]
+                .concat(),
+                true,
+            ),
+            (
+                [
+                    mp4_box(b"ftyp", 16),
+                    large_free.clone(),
+                    mp4_box(b"mdat", 64),
+                ]
+                .concat(),
+                false,
+            ),
             (
                 [
                     mp4_box(b"ftyp", 16),
@@ -1385,10 +1404,6 @@ mod tests {
                     mp4_box(b"moov", 32),
                 ]
                 .concat(),
-                false,
-            ),
-            (
-                [mp4_box(b"ftyp", 16), large_mdat, mp4_box(b"moov", 32)].concat(),
                 false,
             ),
             (mp4_box(b"ftyp", 16), false),
@@ -1717,5 +1732,90 @@ assert libc.ptrace(0, 0, 0, 0) == -1 and ctypes.get_errno() == errno.EPERM
         assert!(candidate.size_bytes > 0);
         assert_eq!(processor.source_cache.lock().await.len(), 1);
         assert!(storage.object_exists(&keys.thumbnail).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn faststart_remux_keeps_every_stream_and_skips_front_indexed_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let subtitles = dir.path().join("subs.srt");
+        fs::write(&subtitles, "1\n00:00:00,000 --> 00:00:00,400\nhi\n")
+            .await
+            .unwrap();
+        let source = dir.path().join("tail-indexed.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=15",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880",
+            ])
+            .arg("-i")
+            .arg(&subtitles)
+            .args([
+                "-map", "0", "-map", "1", "-map", "2", "-map", "3", "-t", "0.5", "-c:v", "libx264",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-c:s", "mov_text", "-threads", "1",
+            ])
+            .arg(&source)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert!(!moov_precedes_mdat(&source).await.unwrap());
+        let stream_count = |path: PathBuf| async move {
+            let output = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=index",
+                    "-of",
+                    "csv=p=0",
+                ])
+                .arg(path)
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap().lines().count()
+        };
+        assert_eq!(stream_count(source.clone()).await, 4);
+
+        let storage: SharedStorageBackend = Arc::new(LocalStorage::new(dir.path().join("objects")));
+        let keys = clipline_cloud_storage::MediaObjectKeys::generate().unwrap();
+        storage
+            .put_file(&keys.source, &source, PutObjectMetadata::new("video/mp4"))
+            .await
+            .unwrap();
+        let processor = MediaProcessor::default();
+        let remuxed = processor
+            .remux_faststart(&storage, &keys.source)
+            .await
+            .unwrap()
+            .expect("tail-indexed source is remuxed");
+        assert!(moov_precedes_mdat(remuxed.path()).await.unwrap());
+        assert_eq!(stream_count(remuxed.path().to_path_buf()).await, 4);
+
+        storage
+            .put_file(
+                &keys.source,
+                remuxed.path(),
+                PutObjectMetadata::new("video/mp4"),
+            )
+            .await
+            .unwrap();
+        assert!(processor
+            .remux_faststart(&storage, &keys.source)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
