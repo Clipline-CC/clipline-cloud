@@ -494,6 +494,7 @@ mod tests {
                 "auth_password_attempts",
                 "clip_comments",
                 "clip_markers",
+                "clip_video_optimizations",
                 "clips",
                 "device_tokens",
                 "game_categories",

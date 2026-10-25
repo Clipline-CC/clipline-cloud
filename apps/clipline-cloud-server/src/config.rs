@@ -407,6 +407,11 @@ impl Config {
             optional(source, "CLIPLINE_VIDEO_OPTIMIZATION_KEEP_ORIGINAL"),
             false,
         )?;
+        let video_optimization_backfill = parse_bool(
+            "CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL",
+            optional(source, "CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL"),
+            false,
+        )?;
         let public_media_mode = parse_public_media_mode(
             optional(source, "CLIPLINE_PUBLIC_MEDIA_MODE")
                 .unwrap_or_else(|| "presigned".to_string()),
@@ -514,6 +519,7 @@ impl Config {
                 min_savings_percent: u8::try_from(video_optimization_min_savings_percent)
                     .expect("validated optimization savings percent fits u8"),
                 keep_original: video_optimization_keep_original,
+                backfill: video_optimization_backfill,
             },
             public_media_mode,
             public_read_url_ttl: Duration::from_secs(public_read_url_ttl_seconds),
@@ -1156,6 +1162,7 @@ mod tests {
         );
         assert_eq!(config.video_optimization.min_savings_percent, 5);
         assert!(!config.video_optimization.keep_original);
+        assert!(!config.video_optimization.backfill);
         assert_eq!(config.public_media_mode, PublicMediaMode::Presigned);
         assert_eq!(
             config.public_read_url_ttl,
@@ -1429,6 +1436,7 @@ mod tests {
             "CLIPLINE_VIDEO_OPTIMIZATION_KEEP_ORIGINAL",
             "true".to_string(),
         );
+        env.insert("CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL", "true".to_string());
 
         let config = Config::from_source(&env).expect("config");
 
@@ -1438,6 +1446,7 @@ mod tests {
         assert_eq!(config.video_optimization.settings.max_width, Some(1280));
         assert_eq!(config.video_optimization.min_savings_percent, 10);
         assert!(config.video_optimization.keep_original);
+        assert!(config.video_optimization.backfill);
     }
 
     #[test]

@@ -31,7 +31,8 @@ use axum::{
     Router,
 };
 use clipline_cloud_core::jobs::{
-    ensure_cleanup_clip_sweep, ensure_cleanup_session_sweep, JobRunner, JobRunnerConfig,
+    ensure_cleanup_clip_sweep, ensure_cleanup_session_sweep, ensure_optimize_video_backfill,
+    JobRunner, JobRunnerConfig,
 };
 use clipline_cloud_db::{Database, Repositories};
 use clipline_cloud_storage::{LocalStorage, S3Storage, S3StorageConfig, SharedStorageBackend};
@@ -364,6 +365,11 @@ async fn start_job_runner(
     ensure_cleanup_clip_sweep(&repositories)
         .await
         .context("failed to schedule cleanup clip sweep")?;
+    if config.video_optimization.enabled && config.video_optimization.backfill {
+        ensure_optimize_video_backfill(&repositories)
+            .await
+            .context("failed to schedule video optimization backfill")?;
+    }
 
     let (job_shutdown_tx, job_shutdown_rx) = watch::channel(false);
     let job_runner = JobRunner::new(
@@ -422,6 +428,7 @@ fn log_config_summary(config: &Config) {
         video_optimization_max_width = ?config.video_optimization.settings.max_width,
         video_optimization_min_savings_percent = config.video_optimization.min_savings_percent,
         video_optimization_keep_original = config.video_optimization.keep_original,
+        video_optimization_backfill = config.video_optimization.backfill,
         public_media_mode = config.public_media_mode.as_str(),
         public_read_url_ttl_seconds = config.public_read_url_ttl.as_secs(),
         max_active_upload_sessions_per_user = config.max_active_upload_sessions_per_user,

@@ -429,3 +429,127 @@ async fn postgres_activity_throttling_and_history_retention() {
         assert_touch_and_retention(db).await;
     }
 }
+
+async fn assert_video_optimization_markers(db: Database) {
+    let repos = Repositories::new(db);
+    let owner = repos
+        .users
+        .create(&NewUser::new("marker-owner", "hash", "user"))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for title in ["first", "second", "processing"] {
+        let mut clip = NewClip::new(&owner.id, title, "local");
+        clip.status = if title == "processing" {
+            "processing"
+        } else {
+            "ready"
+        }
+        .into();
+        clip.storage_key = Some(format!("objects/media/{title}/source.mp4"));
+        ids.push(repos.clips.create(&clip).await.unwrap().id);
+    }
+    let next = || {
+        let repos = repos.clone();
+        async move {
+            repos
+                .clips
+                .next_unoptimized_ready_source()
+                .await
+                .unwrap()
+                .map(|clip| clip.title)
+        }
+    };
+
+    assert_eq!(next().await.as_deref(), Some("first"));
+    repos
+        .clips
+        .record_video_optimization(&ids[0], "skipped")
+        .await
+        .unwrap();
+    repos
+        .clips
+        .record_video_optimization(&ids[0], "reencoded")
+        .await
+        .unwrap();
+    assert_eq!(
+        repos
+            .clips
+            .video_optimization_outcome(&ids[0])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("reencoded")
+    );
+    assert_eq!(next().await.as_deref(), Some("second"));
+    repos
+        .record_optimized_source(
+            &ids[1],
+            1234,
+            "optimized-checksum",
+            Some("mp4"),
+            Some(5000),
+            Some(1920),
+            Some(1080),
+            Some(60.0),
+            Some("h264"),
+            Some("aac"),
+            "reencoded",
+        )
+        .await
+        .unwrap();
+    let second = repos.clips.get(&ids[1]).await.unwrap().unwrap();
+    assert_eq!(second.file_size_bytes, Some(1234));
+    assert_eq!(
+        second.checksum_sha256.as_deref(),
+        Some("optimized-checksum")
+    );
+    assert_eq!(second.audio_codec.as_deref(), Some("aac"));
+    assert_eq!(
+        repos
+            .clips
+            .video_optimization_outcome(&ids[1])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("reencoded")
+    );
+    assert_eq!(next().await, None, "processing clips are not backfilled");
+
+    repos
+        .clips
+        .record_video_optimization("no-such-clip", "failed")
+        .await
+        .unwrap();
+    assert_eq!(
+        repos
+            .clips
+            .video_optimization_outcome("no-such-clip")
+            .await
+            .unwrap(),
+        None
+    );
+    repos.clips.delete(&ids[0]).await.unwrap();
+    assert_eq!(
+        repos
+            .clips
+            .video_optimization_outcome(&ids[0])
+            .await
+            .unwrap(),
+        None,
+        "markers are removed with their clip"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_video_optimization_markers() {
+    let (_temp, db) = sqlite_test_database().await;
+    assert_video_optimization_markers(db).await;
+}
+
+#[tokio::test]
+async fn postgres_video_optimization_markers() {
+    if let Some(db) = postgres_test_database().await {
+        assert_video_optimization_markers(db).await;
+    }
+}

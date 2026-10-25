@@ -311,6 +311,10 @@ deployments. Browser-based direct uploads also require bucket CORS that allows `
 Video optimization is disabled by default. When enabled, completed uploads remain playable as soon as
 they pass validation, then an `optimize_video` job tries to create a single smaller browser MP4. It
 only replaces `source.mp4` after the candidate validates and meets the configured savings threshold.
+When the re-encode does not save enough, a source whose MP4 index (`moov`) sits after the media data
+is still losslessly remuxed with the index first, so browsers can start playback and seek without
+first fetching the end of the file. Encodes run one at a time per server; a 1080p encode peaks near
+400 MiB of memory.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -320,11 +324,18 @@ only replaces `source.mp4` after the candidate validates and meets the configure
 | `CLIPLINE_VIDEO_OPTIMIZATION_MAX_WIDTH` | `0` | Optional max width; `0`/unset keeps source resolution |
 | `CLIPLINE_VIDEO_OPTIMIZATION_MIN_SAVINGS_PERCENT` | `5` | Candidate must save at least this percentage before replacement |
 | `CLIPLINE_VIDEO_OPTIMIZATION_KEEP_ORIGINAL` | `false` | Store `original-source.mp4` under the clip media token for early testing |
+| `CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL` | `false` | Also optimize clips that were already ready, one at a time, oldest first |
 
 Only enable this on a deployment with enough worker CPU headroom. The default retention path deletes
 the uploaded original after successful replacement; use
 `CLIPLINE_VIDEO_OPTIMIZATION_KEEP_ORIGINAL=true` temporarily while evaluating quality/storage
 tradeoffs.
+
+Optimization normally runs only for new uploads. Set `CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL=true`
+(with optimization `on`) to work through the existing library: the server queues one clip at a time
+and records each clip's outcome, so restarts resume where they left off and no clip is processed
+twice. Leave it off if this deployment already ran optimization on its library, since the backfill
+cannot tell those clips apart and would re-encode them.
 
 The Docker smoke harness can exercise the optimization path with `RUN_VIDEO_OPTIMIZATION=1`. It
 uses smoke-specific CRF/max-width/min-savings settings, uploads a compressible fixture, waits for

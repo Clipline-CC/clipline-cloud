@@ -5,6 +5,7 @@ use sqlx::{types::Json, Postgres, Sqlite};
 use super::{
     AbortUploadOutcome, BulkVisibilityUpdate, CreateUploadBundleOutcome, FinalizeUploadOutcome,
     MergeGameCategoryOutcome, Repositories, SeparateGameCategoryNameOutcome,
+    RECORD_VIDEO_OPTIMIZATION_SQL, UPDATE_SOURCE_METADATA_SQL,
 };
 use crate::{
     now_utc, Database, DbResult, NewAuditLogEntry, NewClip, NewClipMarker, NewGameCategory,
@@ -906,6 +907,78 @@ impl Repositories {
                     .await?;
                 sqlx::query("DELETE FROM clips WHERE id = $1")
                     .bind(clip_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Points a clip at its optimized source and records the outcome in one
+    /// transaction, so a retry never mistakes an optimized source for an
+    /// unprocessed one and encodes it again.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_optimized_source(
+        &self,
+        id: &str,
+        file_size_bytes: i64,
+        checksum_sha256: &str,
+        container: Option<&str>,
+        duration_ms: Option<i64>,
+        width: Option<i64>,
+        height: Option<i64>,
+        fps: Option<f64>,
+        video_codec: Option<&str>,
+        audio_codec: Option<&str>,
+        outcome: &str,
+    ) -> DbResult<()> {
+        let now = now_utc();
+        match &self.clips.database {
+            Database::Sqlite(pool) => {
+                let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+                sqlx::query(UPDATE_SOURCE_METADATA_SQL)
+                    .bind(file_size_bytes)
+                    .bind(checksum_sha256)
+                    .bind(container)
+                    .bind(duration_ms)
+                    .bind(width)
+                    .bind(height)
+                    .bind(fps)
+                    .bind(video_codec)
+                    .bind(audio_codec)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(RECORD_VIDEO_OPTIMIZATION_SQL)
+                    .bind(outcome)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+            }
+            Database::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(&crate::postgres_placeholders(UPDATE_SOURCE_METADATA_SQL))
+                    .bind(file_size_bytes)
+                    .bind(checksum_sha256)
+                    .bind(container)
+                    .bind(duration_ms)
+                    .bind(width)
+                    .bind(height)
+                    .bind(fps)
+                    .bind(video_codec)
+                    .bind(audio_codec)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(&crate::postgres_placeholders(RECORD_VIDEO_OPTIMIZATION_SQL))
+                    .bind(outcome)
+                    .bind(now)
+                    .bind(id)
                     .execute(&mut *transaction)
                     .await?;
                 transaction.commit().await?;

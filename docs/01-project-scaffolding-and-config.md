@@ -85,6 +85,7 @@ CLIPLINE_VIDEO_OPTIMIZATION_PRESET  # default veryfast; x264 preset
 CLIPLINE_VIDEO_OPTIMIZATION_MAX_WIDTH # optional; 0/unset disables resize
 CLIPLINE_VIDEO_OPTIMIZATION_MIN_SAVINGS_PERCENT # default 5
 CLIPLINE_VIDEO_OPTIMIZATION_KEEP_ORIGINAL # false; stores original-source.mp4 for active clips
+CLIPLINE_VIDEO_OPTIMIZATION_BACKFILL # false; also optimizes clips that were ready before enabling
 CLIPLINE_MAX_ACTIVE_UPLOAD_SESSIONS_PER_USER
 CLIPLINE_USER_STORAGE_QUOTA_BYTES   # optional; 0/unset disables
 CLIPLINE_GLOBAL_STORAGE_WARNING_THRESHOLD_BYTES # optional; 0/unset disables

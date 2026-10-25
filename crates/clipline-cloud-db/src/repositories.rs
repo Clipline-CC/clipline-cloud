@@ -1553,6 +1553,40 @@ impl ClipRepository {
         )?)
     }
 
+    /// Oldest ready clip whose source has never been through optimization.
+    pub async fn next_unoptimized_ready_source(&self) -> DbResult<Option<Clip>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            Clip,
+            CLIP_SELECT_SQL.to_string()
+                + " WHERE status = 'ready' AND deleted_at IS NULL AND storage_key IS NOT NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM clip_video_optimizations WHERE clip_video_optimizations.clip_id = clips.id
+                ) ORDER BY id ASC LIMIT 1",
+            []
+        )?)
+    }
+
+    /// Records the final optimization outcome; a clip that no longer exists records nothing.
+    pub async fn record_video_optimization(&self, id: &str, outcome: &str) -> DbResult<()> {
+        db_execute!(
+            &self.database,
+            RECORD_VIDEO_OPTIMIZATION_SQL,
+            [outcome, now_utc(), id]
+        )?;
+        Ok(())
+    }
+
+    pub async fn video_optimization_outcome(&self, id: &str) -> DbResult<Option<String>> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (String,),
+            "SELECT outcome FROM clip_video_optimizations WHERE clip_id = ?",
+            [id]
+        )?
+        .map(|row| row.0))
+    }
+
     pub async fn storage_key_is_referenced(&self, key: &str) -> DbResult<bool> {
         Ok(db_fetch_optional!(
             &self.database,
@@ -1785,51 +1819,6 @@ impl ClipRepository {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn update_source_metadata(
-        &self,
-        id: &str,
-        file_size_bytes: i64,
-        checksum_sha256: &str,
-        container: Option<&str>,
-        duration_ms: Option<i64>,
-        width: Option<i64>,
-        height: Option<i64>,
-        fps: Option<f64>,
-        video_codec: Option<&str>,
-        audio_codec: Option<&str>,
-    ) -> DbResult<()> {
-        db_execute!(
-            &self.database,
-            "UPDATE clips
-             SET file_size_bytes = ?,
-                 checksum_sha256 = ?,
-                 container = COALESCE(?, container),
-                 duration_ms = COALESCE(?, duration_ms),
-                 width = COALESCE(?, width),
-                 height = COALESCE(?, height),
-                 fps = COALESCE(?, fps),
-                 video_codec = COALESCE(?, video_codec),
-                 audio_codec = COALESCE(?, audio_codec),
-                 updated_at = ?
-             WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'",
-            [
-                file_size_bytes,
-                checksum_sha256,
-                container,
-                duration_ms,
-                width,
-                height,
-                fps,
-                video_codec,
-                audio_codec,
-                now_utc(),
-                id,
-            ]
-        )?;
-        Ok(())
-    }
-
     pub async fn set_media_artifact_keys(
         &self,
         id: &str,
@@ -1879,6 +1868,25 @@ impl ClipRepository {
         )?)
     }
 }
+
+pub(crate) const UPDATE_SOURCE_METADATA_SQL: &str = "UPDATE clips
+  SET file_size_bytes = ?,
+      checksum_sha256 = ?,
+      container = COALESCE(?, container),
+      duration_ms = COALESCE(?, duration_ms),
+      width = COALESCE(?, width),
+      height = COALESCE(?, height),
+      fps = COALESCE(?, fps),
+      video_codec = COALESCE(?, video_codec),
+      audio_codec = COALESCE(?, audio_codec),
+      updated_at = ?
+  WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'";
+
+pub(crate) const RECORD_VIDEO_OPTIMIZATION_SQL: &str =
+    "INSERT INTO clip_video_optimizations (clip_id, outcome, completed_at)
+  SELECT id, ?, ? FROM clips WHERE id = ?
+  ON CONFLICT(clip_id) DO UPDATE SET
+    outcome = excluded.outcome, completed_at = excluded.completed_at";
 
 const CLIP_SELECT_SQL: &str = "SELECT
   id, owner_user_id, client_clip_id, title, description, game_name, game_id, game_executable, source_type,
@@ -3185,6 +3193,17 @@ impl JobRepository {
             "SELECT COUNT(*) FROM jobs
              WHERE kind = ? AND status IN ('pending','running')
                AND target_type IS NULL AND target_id IS NULL",
+            [kind]
+        )?
+        .map(|row| row.0)
+        .unwrap_or_default())
+    }
+
+    pub async fn count_active_kind(&self, kind: &str) -> DbResult<i64> {
+        Ok(db_fetch_optional!(
+            &self.database,
+            (i64,),
+            "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('pending','running')",
             [kind]
         )?
         .map(|row| row.0)
