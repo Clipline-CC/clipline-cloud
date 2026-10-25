@@ -1553,17 +1553,17 @@ impl ClipRepository {
         )?)
     }
 
-    /// Next ready clip after `after` whose source has never been through optimization.
-    pub async fn next_unoptimized_ready_source_after(&self, after: &str) -> DbResult<Option<Clip>> {
+    /// Oldest ready clip whose source has never been through optimization.
+    pub async fn next_unoptimized_ready_source(&self) -> DbResult<Option<Clip>> {
         Ok(db_fetch_optional!(
             &self.database,
             Clip,
             CLIP_SELECT_SQL.to_string()
                 + " WHERE status = 'ready' AND deleted_at IS NULL AND storage_key IS NOT NULL
-                AND id > ? AND NOT EXISTS (
+                AND NOT EXISTS (
                   SELECT 1 FROM clip_video_optimizations WHERE clip_video_optimizations.clip_id = clips.id
                 ) ORDER BY id ASC LIMIT 1",
-            [after]
+            []
         )?)
     }
 
@@ -1571,10 +1571,7 @@ impl ClipRepository {
     pub async fn record_video_optimization(&self, id: &str, outcome: &str) -> DbResult<()> {
         db_execute!(
             &self.database,
-            "INSERT INTO clip_video_optimizations (clip_id, outcome, completed_at)
-             SELECT id, ?, ? FROM clips WHERE id = ?
-             ON CONFLICT(clip_id) DO UPDATE SET
-               outcome = excluded.outcome, completed_at = excluded.completed_at",
+            RECORD_VIDEO_OPTIMIZATION_SQL,
             [outcome, now_utc(), id]
         )?;
         Ok(())
@@ -1838,18 +1835,7 @@ impl ClipRepository {
     ) -> DbResult<()> {
         db_execute!(
             &self.database,
-            "UPDATE clips
-             SET file_size_bytes = ?,
-                 checksum_sha256 = ?,
-                 container = COALESCE(?, container),
-                 duration_ms = COALESCE(?, duration_ms),
-                 width = COALESCE(?, width),
-                 height = COALESCE(?, height),
-                 fps = COALESCE(?, fps),
-                 video_codec = COALESCE(?, video_codec),
-                 audio_codec = COALESCE(?, audio_codec),
-                 updated_at = ?
-             WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'",
+            UPDATE_SOURCE_METADATA_SQL,
             [
                 file_size_bytes,
                 checksum_sha256,
@@ -1916,6 +1902,25 @@ impl ClipRepository {
         )?)
     }
 }
+
+pub(crate) const UPDATE_SOURCE_METADATA_SQL: &str = "UPDATE clips
+  SET file_size_bytes = ?,
+      checksum_sha256 = ?,
+      container = COALESCE(?, container),
+      duration_ms = COALESCE(?, duration_ms),
+      width = COALESCE(?, width),
+      height = COALESCE(?, height),
+      fps = COALESCE(?, fps),
+      video_codec = COALESCE(?, video_codec),
+      audio_codec = COALESCE(?, audio_codec),
+      updated_at = ?
+  WHERE id = ? AND deleted_at IS NULL AND status <> 'deleted'";
+
+pub(crate) const RECORD_VIDEO_OPTIMIZATION_SQL: &str =
+    "INSERT INTO clip_video_optimizations (clip_id, outcome, completed_at)
+  SELECT id, ?, ? FROM clips WHERE id = ?
+  ON CONFLICT(clip_id) DO UPDATE SET
+    outcome = excluded.outcome, completed_at = excluded.completed_at";
 
 const CLIP_SELECT_SQL: &str = "SELECT
   id, owner_user_id, client_clip_id, title, description, game_name, game_id, game_executable, source_type,

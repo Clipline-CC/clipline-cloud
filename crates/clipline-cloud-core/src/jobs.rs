@@ -40,7 +40,6 @@ const CLEANUP_CLIP_BATCH_SIZE: i64 = 100;
 const CLEANUP_CLIP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const CLEANUP_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 const OPTIMIZE_VIDEO_BACKFILL_INTERVAL: Duration = Duration::from_secs(30);
-const OPTIMIZE_VIDEO_BACKFILL_CURSOR: &str = "optimize_video_backfill";
 const MEDIA_OBJECT_PREFIX: &str = "objects/media/";
 const MISSING_SOURCE_FAILURE_REASON: &str = "ready clip source object is missing";
 
@@ -924,8 +923,7 @@ impl JobRunner {
                 )));
             }
             self.repositories
-                .clips
-                .update_source_metadata(
+                .record_optimized_source(
                     &clip.id,
                     i64::try_from(candidate_size).map_err(|_| {
                         JobRunnerError::Validation("optimized source is too large".to_string())
@@ -938,11 +936,8 @@ impl JobRunner {
                     candidate.metadata.fps,
                     candidate.metadata.video_codec.as_deref(),
                     candidate.metadata.audio_codec.as_deref(),
+                    outcome,
                 )
-                .await?;
-            self.repositories
-                .clips
-                .record_video_optimization(&clip.id, outcome)
                 .await?;
             if let Err(error) = delete_if_present(&self.storage, &candidate_key).await {
                 warn!(
@@ -1001,25 +996,18 @@ impl JobRunner {
             .await?
             == 0
         {
-            let cursor = self
-                .repositories
-                .jobs
-                .sweep_cursor(OPTIMIZE_VIDEO_BACKFILL_CURSOR)
-                .await?;
+            // No cursor: a clip whose job ended without an outcome (for example
+            // because optimization was switched off) is picked up again.
             let Some(clip) = self
                 .repositories
                 .clips
-                .next_unoptimized_ready_source_after(cursor.as_deref().unwrap_or(""))
+                .next_unoptimized_ready_source()
                 .await?
             else {
                 info!(event = "jobs.optimize_video_backfill.completed");
                 return Ok(());
             };
             enqueue_optimize_video(&self.repositories, &clip.id).await?;
-            self.repositories
-                .jobs
-                .set_sweep_cursor(OPTIMIZE_VIDEO_BACKFILL_CURSOR, Some(&clip.id))
-                .await?;
             info!(event = "jobs.optimize_video_backfill.enqueued", clip_id = %clip.id);
         }
 
@@ -2586,6 +2574,16 @@ mod tests {
         runner.backfill_optimize_video(&backfill).await.unwrap();
         assert_eq!(active_optimize_targets().await, vec!["first"]);
         // An optimization in flight holds the backfill back.
+        runner.backfill_optimize_video(&backfill).await.unwrap();
+        assert_eq!(active_optimize_targets().await, vec!["first"]);
+        // A job that ends without an outcome leaves its clip eligible again.
+        let unfinished = repositories
+            .jobs
+            .get_active_by_kind_and_target(OPTIMIZE_VIDEO_KIND, Some("clip"), Some(&clips[1].id))
+            .await
+            .unwrap()
+            .unwrap();
+        repositories.jobs.delete(&unfinished.id).await.unwrap();
         runner.backfill_optimize_video(&backfill).await.unwrap();
         assert_eq!(active_optimize_targets().await, vec!["first"]);
 

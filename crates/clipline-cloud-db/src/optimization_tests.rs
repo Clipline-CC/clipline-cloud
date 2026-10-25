@@ -449,19 +449,19 @@ async fn assert_video_optimization_markers(db: Database) {
         clip.storage_key = Some(format!("objects/media/{title}/source.mp4"));
         ids.push(repos.clips.create(&clip).await.unwrap().id);
     }
-    let next = |after: &'static str| {
+    let next = || {
         let repos = repos.clone();
         async move {
             repos
                 .clips
-                .next_unoptimized_ready_source_after(after)
+                .next_unoptimized_ready_source()
                 .await
                 .unwrap()
                 .map(|clip| clip.title)
         }
     };
 
-    assert_eq!(next("").await.as_deref(), Some("first"));
+    assert_eq!(next().await.as_deref(), Some("first"));
     repos
         .clips
         .record_video_optimization(&ids[0], "skipped")
@@ -481,13 +481,40 @@ async fn assert_video_optimization_markers(db: Database) {
             .as_deref(),
         Some("reencoded")
     );
-    assert_eq!(next("").await.as_deref(), Some("second"));
+    assert_eq!(next().await.as_deref(), Some("second"));
     repos
-        .clips
-        .record_video_optimization(&ids[1], "failed")
+        .record_optimized_source(
+            &ids[1],
+            1234,
+            "optimized-checksum",
+            Some("mp4"),
+            Some(5000),
+            Some(1920),
+            Some(1080),
+            Some(60.0),
+            Some("h264"),
+            Some("aac"),
+            "reencoded",
+        )
         .await
         .unwrap();
-    assert_eq!(next("").await, None, "processing clips are not backfilled");
+    let second = repos.clips.get(&ids[1]).await.unwrap().unwrap();
+    assert_eq!(second.file_size_bytes, Some(1234));
+    assert_eq!(
+        second.checksum_sha256.as_deref(),
+        Some("optimized-checksum")
+    );
+    assert_eq!(second.audio_codec.as_deref(), Some("aac"));
+    assert_eq!(
+        repos
+            .clips
+            .video_optimization_outcome(&ids[1])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("reencoded")
+    );
+    assert_eq!(next().await, None, "processing clips are not backfilled");
 
     repos
         .clips
